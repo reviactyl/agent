@@ -9,11 +9,11 @@ import (
 	"emperror.dev/errors"
 	"github.com/gin-gonic/gin"
 
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/router/middleware"
-	"github.com/pterodactyl/wings/server"
-	"github.com/pterodactyl/wings/server/installer"
-	"github.com/pterodactyl/wings/server/transfer"
+	"github.com/reviactyl/wings/environment"
+	"github.com/reviactyl/wings/router/middleware"
+	"github.com/reviactyl/wings/server"
+	"github.com/reviactyl/wings/server/installer"
+	"github.com/reviactyl/wings/server/transfer"
 )
 
 // Data passed over to initiate a server transfer.

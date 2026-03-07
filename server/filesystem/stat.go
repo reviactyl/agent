@@ -8,7 +8,7 @@ import (
 
 	"github.com/gabriel-vasile/mimetype"
 
-	"github.com/pterodactyl/wings/internal/ufs"
+	"github.com/reviactyl/wings/internal/ufs"
 )
 
 type Stat struct {

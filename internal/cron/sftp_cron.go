@@ -7,10 +7,10 @@ import (
 	"emperror.dev/errors"
 	"gorm.io/gorm"
 
-	"github.com/pterodactyl/wings/internal/database"
-	"github.com/pterodactyl/wings/internal/models"
-	"github.com/pterodactyl/wings/server"
-	"github.com/pterodactyl/wings/system"
+	"github.com/reviactyl/wings/internal/database"
+	"github.com/reviactyl/wings/internal/models"
+	"github.com/reviactyl/wings/server"
+	"github.com/reviactyl/wings/system"
 )
 
 type sftpCron struct {

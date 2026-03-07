@@ -1,4 +1,4 @@
-module github.com/pterodactyl/wings
+module github.com/reviactyl/wings
 
 go 1.24.0
 

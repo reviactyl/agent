@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   wings:
-    image: ghcr.io/pterodactyl/wings:latest
+    image: ghcr.io/reviactyl/wings:latest
     restart: always
     networks:
       - wings0

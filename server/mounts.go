@@ -6,8 +6,8 @@ import (
 
 	"github.com/apex/log"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/environment"
+	"github.com/reviactyl/wings/config"
+	"github.com/reviactyl/wings/environment"
 )
 
 // To avoid confusion when working with mounts, assume that a server.Mount has not been properly

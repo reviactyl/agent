@@ -22,9 +22,9 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: |
-          GOARCH=amd64 go build -o dist/wings_linux_amd64 -v -trimpath -ldflags="-s -w -X github.com/pterodactyl/wings/system.Version=${{ github.ref_name }}" github.com/pterodactyl/wings
+          GOARCH=amd64 go build -o dist/wings_linux_amd64 -v -trimpath -ldflags="-s -w -X github.com/reviactyl/wings/system.Version=${{ github.ref_name }}" github.com/reviactyl/wings
           chmod 755 dist/wings_linux_amd64
-          GOARCH=arm64 go build -o dist/wings_linux_arm64 -v -trimpath -ldflags="-s -w -X github.com/pterodactyl/wings/system.Version=${{ github.ref_name }}" github.com/pterodactyl/wings
+          GOARCH=arm64 go build -o dist/wings_linux_arm64 -v -trimpath -ldflags="-s -w -X github.com/reviactyl/wings/system.Version=${{ github.ref_name }}" github.com/reviactyl/wings
           chmod 755 dist/wings_linux_arm64
 
       - name: Create release branch
@@ -32,8 +32,8 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           BRANCH=release/${{ env.VERSION }}
-          git config --local user.email "ci@pterodactyl.io"
-          git config --local user.name "Pterodactyl CI"
+          git config --local user.email "ci@reviactyl.app"
+          git config --local user.name "Reviactyl CI"
           git checkout -b $BRANCH
           git push -u origin $BRANCH
           sed -i "s/var Version = \".*\"/var Version = \"${VERSION:1}\"/" system/const.go
