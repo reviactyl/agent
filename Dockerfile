@@ -23,6 +23,6 @@ COPY --from=builder /etc/mime.types /etc/mime.types
 COPY --from=builder /app/wings /usr/bin/
 
 ENTRYPOINT ["/usr/bin/wings"]
-CMD ["--config", "/etc/pterodactyl/config.yml"]
+CMD ["--config", "/etc/reviactyl/config.yml"]
 
 EXPOSE 8080 2022

@@ -14,16 +14,18 @@ services:
       TZ: "UTC"
       WINGS_UID: 988
       WINGS_GID: 988
-      WINGS_USERNAME: pterodactyl
+      WINGS_USERNAME: reviactyl
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "/var/lib/docker/containers/:/var/lib/docker/containers/"
-      - "/etc/pterodactyl/:/etc/pterodactyl/"
-      - "/var/lib/pterodactyl/:/var/lib/pterodactyl/"
-      - "/var/log/pterodactyl/:/var/log/pterodactyl/"
-      - "/tmp/pterodactyl/:/tmp/pterodactyl/"
+      - "/etc/reviactyl/:/etc/reviactyl/"
+      - "/var/lib/reviactyl/:/var/lib/reviactyl/"
+      - "/var/log/reviactyl/:/var/log/reviactyl/"
+      - "/tmp/reviactyl/:/tmp/reviactyl/"
       - "/etc/ssl/certs:/etc/ssl/certs:ro"
       - "/run/wings:/run/wings"
+      # you may need /var/lib/pterodactyl if you are upgrading from an pterodactyl wings
+      - "/var/lib/pterodactyl/:/var/lib/pterodactyl/"
       # you may need /srv/daemon-data if you are upgrading from an old daemon
       #- "/srv/daemon-data/:/srv/daemon-data/"
       # Required for ssl if you use let's encrypt. uncomment to use.

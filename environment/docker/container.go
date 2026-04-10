@@ -156,7 +156,7 @@ func (e *Environment) Create() error {
 	a := e.Configuration.Allocations()
 	evs := e.Configuration.EnvironmentVariables()
 	for i, v := range evs {
-		// Convert 127.0.0.1 to the pterodactyl0 network interface if the environment is Docker
+		// Convert 127.0.0.1 to the reviactyl0 network interface if the environment is Docker
 		// so that the server operates as expected.
 		if v == "SERVER_IP=127.0.0.1" {
 			evs[i] = "SERVER_IP=" + cfg.Docker.Network.Interface
@@ -170,7 +170,7 @@ func (e *Environment) Create() error {
 	for key := range confLabels {
 		labels[key] = confLabels[key]
 	}
-	labels["Service"] = "Pterodactyl"
+	labels["Service"] = "Reviactyl"
 	labels["ContainerType"] = "server_process"
 
 	conf := &container.Config{
