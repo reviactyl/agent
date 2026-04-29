@@ -9,7 +9,7 @@ import (
 	"emperror.dev/errors"
 	. "github.com/franela/goblin"
 
-	"github.com/reviactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 func TestFilesystem_Path(t *testing.T) {

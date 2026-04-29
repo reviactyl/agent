@@ -14,9 +14,9 @@ import (
 	"github.com/mholt/archives"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/remote"
-	"github.com/reviactyl/wings/server/filesystem"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 var format = archives.CompressedArchive{
@@ -28,7 +28,7 @@ var format = archives.CompressedArchive{
 type AdapterType string
 
 const (
-	LocalBackupAdapter AdapterType = "wings"
+	LocalBackupAdapter AdapterType = "agent"
 	S3BackupAdapter    AdapterType = "s3"
 )
 

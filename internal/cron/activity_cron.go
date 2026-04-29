@@ -6,10 +6,10 @@ import (
 
 	"emperror.dev/errors"
 
-	"github.com/reviactyl/wings/internal/database"
-	"github.com/reviactyl/wings/internal/models"
-	"github.com/reviactyl/wings/server"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/internal/database"
+	"github.com/reviactyl/agent/internal/models"
+	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/system"
 )
 
 type activityCron struct {

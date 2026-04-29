@@ -17,8 +17,8 @@ import (
 	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v3"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 // The file parsing options that are available for a server configuration file.
@@ -108,7 +108,7 @@ type ConfigurationFile struct {
 	Parser   ConfigurationParser            `json:"parser"`
 	Replace  []ConfigurationFileReplacement `json:"replace"`
 
-	// Tracks Wings' configuration so that we can quickly get values
+	// Tracks Agent' configuration so that we can quickly get values
 	// out of it when variables request it.
 	configuration []byte
 }

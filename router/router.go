@@ -5,10 +5,10 @@ import (
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/remote"
-	"github.com/reviactyl/wings/router/middleware"
-	wserver "github.com/reviactyl/wings/server"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/router/middleware"
+	wserver "github.com/reviactyl/agent/server"
 )
 
 // Configure configures the routing infrastructure for this daemon instance.

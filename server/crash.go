@@ -8,8 +8,8 @@ import (
 
 	"emperror.dev/errors"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/environment"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
 )
 
 type CrashHandler struct {
@@ -40,7 +40,7 @@ func (cd *CrashHandler) SetLastCrash(t time.Time) {
 // This function assumes it is called under circumstances where a crash is suspected
 // of occurring. It will not do anything to determine if it was actually a crash, just
 // look at the exit state and check if it meets the criteria of being called a crash
-// by Wings.
+// by Agent.
 //
 // If the server is determined to have crashed, the process will be restarted and the
 // counter for the server will be incremented.

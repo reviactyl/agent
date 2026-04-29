@@ -11,10 +11,10 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 
-	"github.com/reviactyl/wings/environment"
-	"github.com/reviactyl/wings/events"
-	"github.com/reviactyl/wings/remote"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/events"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/system"
 )
 
 type Metadata struct {
@@ -150,7 +150,7 @@ func (e *Environment) ExitState() (uint32, bool, error) {
 	c, err := e.ContainerInspect(context.Background())
 	if err != nil {
 		// I'm not entirely sure how this can happen to be honest. I tried deleting a
-		// container _while_ a server was running and wings gracefully saw the crash and
+		// container _while_ a server was running and agent gracefully saw the crash and
 		// created a new container for it.
 		//
 		// However, someone reported an error in Discord about this scenario happening,

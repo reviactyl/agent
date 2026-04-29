@@ -12,9 +12,9 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/server"
-	"github.com/reviactyl/wings/server/filesystem"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 const (
@@ -40,7 +40,7 @@ type Handler struct {
 func NewHandler(sc *ssh.ServerConn, srv *server.Server) (*Handler, error) {
 	uuid, ok := sc.Permissions.Extensions["user"]
 	if !ok {
-		return nil, errors.New("sftp: mismatched Wings and Panel versions — Panel 1.10 is required for this version of Wings.")
+		return nil, errors.New("sftp: mismatched Agent and Panel versions — Panel 1.10 is required for this version of Agent.")
 	}
 
 	events := eventHandler{

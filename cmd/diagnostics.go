@@ -23,10 +23,10 @@ import (
 	"github.com/docker/docker/pkg/parsers/operatingsystem"
 	"github.com/spf13/cobra"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/environment"
-	"github.com/reviactyl/wings/loggers/cli"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/loggers/cli"
+	"github.com/reviactyl/agent/system"
 )
 
 const (
@@ -45,7 +45,7 @@ var diagnosticsArgs struct {
 func newDiagnosticsCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "diagnostics",
-		Short: "Collect and report information about this Wings instance to assist in debugging.",
+		Short: "Collect and report information about this Agent instance to assist in debugging.",
 		PreRun: func(cmd *cobra.Command, args []string) {
 			initConfig()
 			log.SetHandler(cli.Default)
@@ -59,9 +59,9 @@ func newDiagnosticsCommand() *cobra.Command {
 	return command
 }
 
-// diagnosticsCmdRun collects diagnostics about wings, its configuration and the node.
+// diagnosticsCmdRun collects diagnostics about agent, its configuration and the node.
 // We collect:
-// - wings and docker versions
+// - agent and docker versions
 // - relevant parts of daemon configuration
 // - the docker debug output
 // - running docker containers
@@ -95,9 +95,9 @@ func diagnosticsCmdRun(*cobra.Command, []string) {
 	dockerVersion, dockerInfo, dockerErr := getDockerInfo()
 
 	output := &strings.Builder{}
-	fmt.Fprintln(output, "Reviactyl Wings - Diagnostics Report")
+	fmt.Fprintln(output, "Reviactyl Agent - Diagnostics Report")
 	printHeader(output, "Versions")
-	fmt.Fprintln(output, "               Wings:", system.Version)
+	fmt.Fprintln(output, "               Agent:", system.Version)
 	if dockerErr == nil {
 		fmt.Fprintln(output, "              Docker:", dockerVersion.Version)
 	}
@@ -108,7 +108,7 @@ func diagnosticsCmdRun(*cobra.Command, []string) {
 		fmt.Fprintln(output, "                  OS:", os)
 	}
 
-	printHeader(output, "Wings Configuration")
+	printHeader(output, "Agent Configuration")
 	if err := config.FromFile(config.DefaultLocation); err != nil {
 	}
 	cfg := config.Get()
@@ -165,11 +165,11 @@ func diagnosticsCmdRun(*cobra.Command, []string) {
 		fmt.Fprint(output, "Couldn't list containers: ", err)
 	}
 
-	printHeader(output, "Latest Wings Logs")
+	printHeader(output, "Latest Agent Logs")
 	if diagnosticsArgs.IncludeLogs {
-		p := "/var/log/reviactyl/wings.log"
+		p := "/var/log/reviactyl/agent.log"
 		if cfg != nil {
-			p = path.Join(cfg.System.LogDirectory, "wings.log")
+			p = path.Join(cfg.System.LogDirectory, "agent.log")
 		}
 		if c, err := exec.Command("tail", "-n", strconv.Itoa(diagnosticsArgs.LogLines), p).Output(); err != nil {
 			fmt.Fprintln(output, "No logs found or an error occurred.")

@@ -18,9 +18,9 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/environment"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/system"
 )
 
 var ErrNotAttached = errors.Sentinel("not attached to instance")
@@ -304,7 +304,7 @@ func (e *Environment) SendCommand(c string) error {
 
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
-	// stop and Wings will think it has crashed and attempt to restart it.
+	// stop and Agent will think it has crashed and attempt to restart it.
 	if e.meta.Stop.Type == "command" && c == e.meta.Stop.Value {
 		e.SetState(environment.ProcessStoppingState)
 	}

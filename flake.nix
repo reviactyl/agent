@@ -1,5 +1,5 @@
 {
-  description = "Wings";
+  description = "Agent";
 
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts";

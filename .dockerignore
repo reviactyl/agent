@@ -33,8 +33,8 @@
 /coverage.out
 
 # The built executable
-wings
-wings.exe
+agent
+agent.exe
 
 # IDE/Editor files (VS Code)
 /.vscode
@@ -53,4 +53,4 @@ Dockerfile
 CHANGELOG.md
 Makefile
 README.md
-wings-api.paw
+agent-api.paw

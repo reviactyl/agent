@@ -11,9 +11,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/remote"
-	"github.com/reviactyl/wings/server"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/server"
 )
 
 // AttachRequestID attaches a unique ID to the incoming HTTP request so that any
@@ -175,8 +175,8 @@ func RequireAuthorization() gin.HandlerFunc {
 			return
 		}
 
-		// All requests to Wings must be authorized with the authentication token present in
-		// the Wings configuration file. Remeber, all requests to Wings come from the Panel
+		// All requests to Agent must be authorized with the authentication token present in
+		// the Agent configuration file. Remeber, all requests to Agent come from the Panel
 		// backend, or using a signed JWT for temporary authentication.
 		if subtle.ConstantTimeCompare([]byte(auth[1]), []byte(config.Get().Token.Token)) != 1 {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "You are not authorized to access this endpoint."})

@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/reviactyl/wings/cmd"
+	"github.com/reviactyl/agent/cmd"
 )
 
 func main() {

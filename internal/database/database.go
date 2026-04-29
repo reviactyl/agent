@@ -9,9 +9,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/internal/models"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/internal/models"
+	"github.com/reviactyl/agent/system"
 )
 
 var (
@@ -19,13 +19,13 @@ var (
 	db *gorm.DB
 )
 
-// Initialize configures the local SQLite database for Wings and ensures that the models have
+// Initialize configures the local SQLite database for Agent and ensures that the models have
 // been fully migrated.
 func Initialize() error {
 	if !o.SwapIf(true) {
 		panic("database: attempt to initialize more than once during application lifecycle")
 	}
-	p := filepath.Join(config.Get().System.RootDirectory, "wings.db")
+	p := filepath.Join(config.Get().System.RootDirectory, "agent.db")
 	instance, err := gorm.Open(sqlite.Open(p), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})

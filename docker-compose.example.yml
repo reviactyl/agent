@@ -1,11 +1,11 @@
 version: '3.8'
 
 services:
-  wings:
-    image: ghcr.io/reviactyl/wings:latest
+  agent:
+    image: ghcr.io/reviactyl/agent:latest
     restart: always
     networks:
-      - wings0
+      - agent0
     ports:
       - "8080:8080"
       - "2022:2022"
@@ -23,8 +23,8 @@ services:
       - "/var/log/reviactyl/:/var/log/reviactyl/"
       - "/tmp/reviactyl/:/tmp/reviactyl/"
       - "/etc/ssl/certs:/etc/ssl/certs:ro"
-      - "/run/wings:/run/wings"
-      # you may need /var/lib/pterodactyl if you are upgrading from an pterodactyl wings
+      - "/run/agent:/run/agent"
+      # you may need /var/lib/pterodactyl if you are upgrading from an pterodactyl agent
       - "/var/lib/pterodactyl/:/var/lib/pterodactyl/"
       # you may need /srv/daemon-data if you are upgrading from an old daemon
       #- "/srv/daemon-data/:/srv/daemon-data/"
@@ -32,11 +32,11 @@ services:
       #- "/etc/letsencrypt/:/etc/letsencrypt/"
 
 networks:
-  wings0:
-    name: wings0
+  agent0:
+    name: agent0
     driver: bridge
     ipam:
       config:
         - subnet: "172.21.0.0/16"
     driver_opts:
-      com.docker.network.bridge.name: wings0
+      com.docker.network.bridge.name: agent0

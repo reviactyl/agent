@@ -3,7 +3,7 @@ package server
 import (
 	"sync"
 
-	"github.com/reviactyl/wings/environment"
+	"github.com/reviactyl/agent/environment"
 )
 
 type EggConfiguration struct {

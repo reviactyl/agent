@@ -18,10 +18,10 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/environment"
-	"github.com/reviactyl/wings/remote"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/system"
 )
 
 // Install executes the installation stack for a server process. Bubbles any
@@ -441,7 +441,7 @@ func (ip *InstallationProcess) Execute() (string, error) {
 
 	// Ensure the root directory for the server exists properly before attempting
 	// to trigger the reinstall of the server. It is possible the directory would
-	// not exist when this runs if Wings boots with a missing directory and a user
+	// not exist when this runs if Agent boots with a missing directory and a user
 	// triggers a reinstall before trying to start the server.
 	if err := ip.Server.EnsureDataDirectoryExists(); err != nil {
 		return "", err

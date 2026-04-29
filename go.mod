@@ -1,4 +1,4 @@
-module github.com/reviactyl/wings
+module github.com/reviactyl/agent
 
 go 1.24.0
 

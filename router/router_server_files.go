@@ -18,13 +18,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/internal/models"
-	"github.com/reviactyl/wings/router/downloader"
-	"github.com/reviactyl/wings/router/middleware"
-	"github.com/reviactyl/wings/router/tokens"
-	"github.com/reviactyl/wings/server"
-	"github.com/reviactyl/wings/server/filesystem"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/internal/models"
+	"github.com/reviactyl/agent/router/downloader"
+	"github.com/reviactyl/agent/router/middleware"
+	"github.com/reviactyl/agent/router/tokens"
+	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 // getServerFileContents returns the contents of a file on the server.
@@ -452,7 +452,7 @@ func postServerDecompressFiles(c *gin.Context) {
 	if err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
 			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The archive provided is in a format Wings does not understand."})
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The archive provided is in a format Agent does not understand."})
 			return
 		}
 		middleware.CaptureAndAbort(c, err)

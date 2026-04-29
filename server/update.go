@@ -3,9 +3,9 @@ package server
 import (
 	"time"
 
-	"github.com/reviactyl/wings/environment/docker"
+	"github.com/reviactyl/agent/environment/docker"
 
-	"github.com/reviactyl/wings/environment"
+	"github.com/reviactyl/agent/environment"
 )
 
 // SyncWithEnvironment updates the environment for the server to match any of

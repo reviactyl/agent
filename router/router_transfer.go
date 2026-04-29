@@ -18,11 +18,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/reviactyl/wings/router/middleware"
-	"github.com/reviactyl/wings/router/tokens"
-	"github.com/reviactyl/wings/server"
-	"github.com/reviactyl/wings/server/installer"
-	"github.com/reviactyl/wings/server/transfer"
+	"github.com/reviactyl/agent/router/middleware"
+	"github.com/reviactyl/agent/router/tokens"
+	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/installer"
+	"github.com/reviactyl/agent/server/transfer"
 )
 
 // postTransfers .

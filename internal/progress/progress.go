@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/system"
 )
 
 // Progress is used to track the progress of any I/O operation that are being

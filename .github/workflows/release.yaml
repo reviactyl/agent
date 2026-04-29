@@ -23,10 +23,10 @@ jobs:
           CGO_ENABLED: 0
           VERSION: ${{ github.ref_name }}
         run: |
-          GOARCH=amd64 go build -o dist/wings_linux_amd64 -v -trimpath -ldflags="-s -w -X github.com/reviactyl/wings/system.Version=${VERSION:1}" github.com/reviactyl/wings
-          chmod 755 dist/wings_linux_amd64
-          GOARCH=arm64 go build -o dist/wings_linux_arm64 -v -trimpath -ldflags="-s -w -X github.com/reviactyl/wings/system.Version=${VERSION:1}" github.com/reviactyl/wings
-          chmod 755 dist/wings_linux_arm64
+          GOARCH=amd64 go build -o dist/agent_linux_amd64 -v -trimpath -ldflags="-s -w -X github.com/reviactyl/agent/system.Version=${VERSION:1}" github.com/reviactyl/agent
+          chmod 755 dist/agent_linux_amd64
+          GOARCH=arm64 go build -o dist/agent_linux_arm64 -v -trimpath -ldflags="-s -w -X github.com/reviactyl/agent/system.Version=${VERSION:1}" github.com/reviactyl/agent
+          chmod 755 dist/agent_linux_arm64
 
       - name: Create release branch
         env:

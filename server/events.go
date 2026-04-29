@@ -1,8 +1,8 @@
 package server
 
 import (
-	"github.com/reviactyl/wings/events"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/events"
+	"github.com/reviactyl/agent/system"
 )
 
 // Defines all the possible output events for a server.

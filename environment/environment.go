@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/reviactyl/wings/events"
+	"github.com/reviactyl/agent/events"
 )
 
 const (

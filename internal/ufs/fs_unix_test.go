@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/reviactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 type testUnixFS struct {

@@ -4,8 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/reviactyl/wings/environment"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/system"
 )
 
 // ResourceUsage defines the current resource usage for a given server instance. If a server is offline you

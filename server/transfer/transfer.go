@@ -7,8 +7,8 @@ import (
 	"github.com/apex/log"
 	"github.com/mitchellh/colorstring"
 
-	"github.com/reviactyl/wings/server"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/system"
 )
 
 // Status represents the current status of a transfer.

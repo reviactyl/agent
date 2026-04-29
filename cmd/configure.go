@@ -16,7 +16,7 @@ import (
 	"github.com/AlecAivazis/survey/v2/terminal"
 	"github.com/spf13/cobra"
 
-	"github.com/reviactyl/wings/config"
+	"github.com/reviactyl/agent/config"
 )
 
 var configureArgs struct {
@@ -32,7 +32,7 @@ var nodeIdRegex = regexp.MustCompile(`^(\d+)$`)
 
 var configureCmd = &cobra.Command{
 	Use:   "configure",
-	Short: "Use a token to configure wings automatically",
+	Short: "Use a token to configure agent automatically",
 	Run:   configureCmdRun,
 }
 
@@ -162,7 +162,7 @@ func configureCmdRun(cmd *cobra.Command, args []string) {
 		panic(err)
 	}
 
-	fmt.Println("Successfully configured wings.")
+	fmt.Println("Successfully configured agent.")
 }
 
 func getRequest() (*http.Request, error) {

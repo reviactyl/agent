@@ -8,10 +8,10 @@ import (
 
 	"emperror.dev/errors"
 
-	"github.com/reviactyl/wings/events"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/events"
+	"github.com/reviactyl/agent/system"
 
-	"github.com/reviactyl/wings/server"
+	"github.com/reviactyl/agent/server"
 )
 
 // RegisterListenerEvents will setup the server event listeners and expiration

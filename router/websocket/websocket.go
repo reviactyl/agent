@@ -15,15 +15,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/reviactyl/wings/internal/models"
+	"github.com/reviactyl/agent/internal/models"
 
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/system"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/environment"
-	"github.com/reviactyl/wings/environment/docker"
-	"github.com/reviactyl/wings/router/tokens"
-	"github.com/reviactyl/wings/server"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/environment/docker"
+	"github.com/reviactyl/agent/router/tokens"
+	"github.com/reviactyl/agent/server"
 )
 
 const (

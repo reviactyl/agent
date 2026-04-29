@@ -36,8 +36,8 @@
 /coverage.out
 
 # The built executable
-wings
-wings.exe
+agent
+agent.exe
 
 # IDE/Editor files (VS Code)
 /.vscode

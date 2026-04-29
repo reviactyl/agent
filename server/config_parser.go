@@ -5,7 +5,7 @@ import (
 
 	"github.com/gammazero/workerpool"
 
-	"github.com/reviactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 // UpdateConfigurationFiles updates all the defined configuration files for

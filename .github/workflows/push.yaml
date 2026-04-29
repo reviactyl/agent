@@ -41,10 +41,10 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-          SRC_PATH: github.com/reviactyl/wings
+          SRC_PATH: github.com/reviactyl/agent
         run: |
-          go build -v -trimpath -ldflags="-s -w -X ${SRC_PATH}/system.Version=dev-${GITHUB_SHA:0:7}" -o dist/wings ${SRC_PATH}
-          go build -v -trimpath -ldflags="-X ${SRC_PATH}/system.Version=dev-${GITHUB_SHA:0:7}" -o dist/wings_debug ${SRC_PATH}
+          go build -v -trimpath -ldflags="-s -w -X ${SRC_PATH}/system.Version=dev-${GITHUB_SHA:0:7}" -o dist/agent ${SRC_PATH}
+          go build -v -trimpath -ldflags="-X ${SRC_PATH}/system.Version=dev-${GITHUB_SHA:0:7}" -o dist/agent_debug ${SRC_PATH}
           chmod 755 dist/*
 
       - name: go test
@@ -65,12 +65,12 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ (github.ref == 'refs/heads/develop' || github.event_name == 'pull_request') && matrix.go == '1.24.11' }}
         with:
-          name: wings_linux_${{ matrix.goarch }}
-          path: dist/wings
+          name: agent_linux_${{ matrix.goarch }}
+          path: dist/agent
 
       - name: Upload Debug Artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ (github.ref == 'refs/heads/develop' || github.event_name == 'pull_request') && matrix.go == '1.24.11' }}
         with:
-          name: wings_linux_${{ matrix.goarch }}_debug
-          path: dist/wings_debug
+          name: agent_linux_${{ matrix.goarch }}_debug
+          path: dist/agent_debug

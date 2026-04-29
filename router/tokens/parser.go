@@ -5,7 +5,7 @@ import (
 
 	"github.com/gbrlsnchs/jwt/v3"
 
-	"github.com/reviactyl/wings/config"
+	"github.com/reviactyl/agent/config"
 )
 
 type TokenData interface {

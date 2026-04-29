@@ -10,9 +10,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/reviactyl/wings/router/middleware"
-	"github.com/reviactyl/wings/router/tokens"
-	"github.com/reviactyl/wings/server/backup"
+	"github.com/reviactyl/agent/router/middleware"
+	"github.com/reviactyl/agent/router/tokens"
+	"github.com/reviactyl/agent/server/backup"
 )
 
 // Handle a download request for a server backup.

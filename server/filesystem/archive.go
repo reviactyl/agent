@@ -16,9 +16,9 @@ import (
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/internal/progress"
-	"github.com/reviactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/internal/progress"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 const memory = 4 * 1024

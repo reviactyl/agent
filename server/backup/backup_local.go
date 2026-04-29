@@ -9,9 +9,9 @@ import (
 	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/remote"
-	"github.com/reviactyl/wings/server/filesystem"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 type LocalBackup struct {

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/reviactyl/wings/internal/progress"
-	"github.com/reviactyl/wings/server/filesystem"
+	"github.com/reviactyl/agent/internal/progress"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 // Archive returns an archive that can be used to stream the contents of the

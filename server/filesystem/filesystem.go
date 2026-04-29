@@ -17,8 +17,8 @@ import (
 	"github.com/gabriel-vasile/mimetype"
 	ignore "github.com/sabhiram/go-gitignore"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 type Filesystem struct {
@@ -239,7 +239,7 @@ func (fs *Filesystem) Chown(p string) error {
 		return nil
 	}
 
-	// This walker is probably some of the most efficient code in Wings. It has
+	// This walker is probably some of the most efficient code in Agent. It has
 	// an internally re-used buffer for listing directory entries and doesn't
 	// need to check if every individual path it touches is safe as the code
 	// doesn't traverse symlinks, is immune to symlink timing attacks, and

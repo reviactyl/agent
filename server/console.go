@@ -7,8 +7,8 @@ import (
 
 	"github.com/mitchellh/colorstring"
 
-	"github.com/reviactyl/wings/config"
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/system"
 )
 
 // appName is a local cache variable to avoid having to make expensive copies of
@@ -18,7 +18,7 @@ var appName string
 var appNameSync sync.Once
 
 // PublishConsoleOutputFromDaemon sends output to the server console formatted
-// to appear correctly as being sent from Wings.
+// to appear correctly as being sent from Agent.
 func (s *Server) PublishConsoleOutputFromDaemon(data string) {
 	appNameSync.Do(func() {
 		appName = config.Get().AppName

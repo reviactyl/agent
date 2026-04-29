@@ -10,7 +10,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 
-	"github.com/reviactyl/wings/config"
+	"github.com/reviactyl/agent/config"
 )
 
 var (

@@ -11,13 +11,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/reviactyl/wings/internal/models"
+	"github.com/reviactyl/agent/internal/models"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/cenkalti/backoff/v4"
 
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/system"
 )
 
 type Client interface {
@@ -105,7 +105,7 @@ func (c *client) requestOnce(ctx context.Context, method, path string, body io.R
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", fmt.Sprintf("Reviactyl Wings/v%s (id:%s)", system.Version, c.tokenId))
+	req.Header.Set("User-Agent", fmt.Sprintf("Reviactyl Agent/v%s (id:%s)", system.Version, c.tokenId))
 	req.Header.Set("Accept", "application/vnd.reviactyl.v26+json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s.%s", c.tokenId, c.token))

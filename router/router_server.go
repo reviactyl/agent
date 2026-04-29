@@ -10,11 +10,11 @@ import (
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 
-	"github.com/reviactyl/wings/router/downloader"
-	"github.com/reviactyl/wings/router/middleware"
-	"github.com/reviactyl/wings/router/tokens"
-	"github.com/reviactyl/wings/server"
-	"github.com/reviactyl/wings/server/transfer"
+	"github.com/reviactyl/agent/router/downloader"
+	"github.com/reviactyl/agent/router/middleware"
+	"github.com/reviactyl/agent/router/tokens"
+	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/transfer"
 )
 
 // Returns a single server from the collection of servers.
@@ -188,7 +188,7 @@ func postServerReinstall(c *gin.Context) {
 	c.Status(http.StatusAccepted)
 }
 
-// Deletes a server from the wings daemon and dissociate its objects.
+// Deletes a server from the agent daemon and dissociate its objects.
 func deleteServer(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 

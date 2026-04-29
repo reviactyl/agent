@@ -1,7 +1,7 @@
 package server
 
 import (
-	"github.com/reviactyl/wings/system"
+	"github.com/reviactyl/agent/system"
 )
 
 // Sftp returns the SFTP connection bag for the server instance. This bag tracks
