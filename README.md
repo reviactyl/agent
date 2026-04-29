@@ -6,7 +6,7 @@
 
 # Reviactyl Agent
  ![CalVer Badge](https://img.shields.io/badge/calver-YY.MM.MICRO-22bfda)
-[![Go Report Card](https://goreportcard.com/badge/github.com/pterodactyl/agent)](https://goreportcard.com/report/github.com/pterodactyl/agent)
+[![Go Report Card](https://goreportcard.com/badge/github.com/reviactyl/agent)](https://goreportcard.com/report/github.com/reviactyl/agent)
 
 Agent is Reviactyl's server control plane, built for the rapidly changing gaming industry and designed to be
 highly performant and secure. Agent provides an HTTP API allowing you to interface directly with running server
