@@ -20,9 +20,10 @@ dependencies, and allowing users to authenticate with the same credentials they 
 I would like to extend my sincere thanks to the following sponsors for helping fund Reviactyl's development.
 [Interested in becoming a sponsor?](https://github.com/sponsors/reviactyl)
 
-| Company                                                                           | About                                                                                                                                                                                                                                           |
-|-----------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [**Tietokettu**](https://tietokettu.net/)                         | Tietokettu is a company that provides network and server services founded in 2019. Our goal is to create affordable and functional solutions for old ones.                                                                                                 |
+|                      **Company**                      |                                                                          **About**                                                                         |
+|:-----------------------------------------------------:|:----------------------------------------------------------------------------------------------------------------------------------------------------------:|
+|       [**Tietokettu**](https://tietokettu.net/)       | Tietokettu is a company that provides network and server services founded in 2019. Our goal is to create affordable and functional solutions for old ones. |
+| [**CloudExa-Hosting**](https://cloudexa-hosting.com/) |   CloudExa Provides fast, reliable cloud hosting built for gaming, delivering smooth performance and scalable solutions for game servers and enterprises.  |
 
 
 ## Reporting Issues
