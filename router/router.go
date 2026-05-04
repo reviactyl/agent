@@ -53,6 +53,7 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	// This request does not need the AuthorizationMiddleware as the panel should never call it
 	// and requests are authenticated through a JWT the panel issues to the other daemon.
 	router.POST("/api/transfers", postTransfers)
+	router.GET("/api/agent", getAgent)
 
 	// All the routes beyond this mount will use an authorization middleware
 	// and will not be accessible without the correct Authorization header provided.
