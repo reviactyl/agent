@@ -81,7 +81,7 @@ func postServerRestoreBackup(c *gin.Context) {
 		return
 	}
 	if data.Adapter == backup.S3BackupAdapter && data.DownloadUrl == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The download_url field is required when the backup adapter is set to S3."})
+		middleware.RespondError(c, http.StatusBadRequest, "The download_url field is required when the backup adapter is set to S3.")
 		return
 	}
 
@@ -150,9 +150,7 @@ func postServerRestoreBackup(c *gin.Context) {
 	// Don't allow content types that we know are going to give us problems.
 	if res.Header.Get("Content-Type") == "" || !strings.Contains("application/x-gzip application/gzip", res.Header.Get("Content-Type")) {
 		_ = res.Body.Close()
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "The provided backup link is not a supported content type. \"" + res.Header.Get("Content-Type") + "\" is not application/x-gzip.",
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "The provided backup link is not a supported content type. \""+res.Header.Get("Content-Type")+"\" is not application/x-gzip.")
 		return
 	}
 
@@ -180,9 +178,7 @@ func deleteServerBackup(c *gin.Context) {
 	if err != nil {
 		// Just return from the function at this point if the backup was not located.
 		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "The requested backup was not found on this server.",
-			})
+			middleware.RespondError(c, http.StatusNotFound, "The requested backup was not found on this server.")
 			return
 		}
 		middleware.CaptureAndAbort(c, err)

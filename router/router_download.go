@@ -29,9 +29,7 @@ func getDownloadBackup(c *gin.Context) {
 
 	// Get the server using the UUID from the token.
 	if _, ok := manager.Get(token.ServerUuid); !ok || !token.IsUniqueRequest() {
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-			"error": "The requested resource was not found on this server.",
-		})
+		middleware.RespondError(c, http.StatusNotFound, "The requested resource was not found on this server.")
 		return
 	}
 
@@ -46,9 +44,7 @@ func getDownloadBackup(c *gin.Context) {
 	b, st, err := backup.LocateLocal(client, token.BackupUuid)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "The requested backup was not found on this server.",
-			})
+			middleware.RespondError(c, http.StatusNotFound, "The requested backup was not found on this server.")
 			return
 		}
 
@@ -83,9 +79,7 @@ func getDownloadFile(c *gin.Context) {
 
 	s, ok := manager.Get(token.ServerUuid)
 	if !ok || !token.IsUniqueRequest() {
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-			"error": "The requested resource was not found on this server.",
-		})
+		middleware.RespondError(c, http.StatusNotFound, "The requested resource was not found on this server.")
 		return
 	}
 
@@ -96,9 +90,7 @@ func getDownloadFile(c *gin.Context) {
 	}
 	defer f.Close()
 	if st.IsDir() {
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-			"error": "The requested resource was not found on this server.",
-		})
+		middleware.RespondError(c, http.StatusNotFound, "The requested resource was not found on this server.")
 		return
 	}
 

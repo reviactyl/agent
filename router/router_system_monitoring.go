@@ -75,7 +75,7 @@ func getSystemMonitoring(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, snapshot)
+	middleware.RespondSuccess(c, http.StatusOK, snapshot)
 }
 
 // collectSystemSnapshot collects current system resource usage.
@@ -84,11 +84,11 @@ func collectSystemSnapshot() (*SystemMonitoringSnapshot, error) {
 	defer cancel()
 
 	var (
-		cpuPercent  []float64
-		cpuPerCore  []float64
-		cpuErr      error
-		cpuCoreErr  error
-		wg          sync.WaitGroup
+		cpuPercent []float64
+		cpuPerCore []float64
+		cpuErr     error
+		cpuCoreErr error
+		wg         sync.WaitGroup
 	)
 	wg.Add(2)
 	go func() {
@@ -159,10 +159,30 @@ func collectSystemSnapshot() (*SystemMonitoringSnapshot, error) {
 			Free:         memInfo.Free,
 			Available:    memInfo.Available,
 			UsagePercent: memInfo.UsedPercent,
-			SwapTotal:    func() uint64 { if swapInfo != nil { return swapInfo.Total }; return 0 }(),
-			SwapUsed:     func() uint64 { if swapInfo != nil { return swapInfo.Used }; return 0 }(),
-			SwapFree:     func() uint64 { if swapInfo != nil { return swapInfo.Free }; return 0 }(),
-			SwapPercent:  func() float64 { if swapInfo != nil { return swapInfo.UsedPercent }; return 0 }(),
+			SwapTotal: func() uint64 {
+				if swapInfo != nil {
+					return swapInfo.Total
+				}
+				return 0
+			}(),
+			SwapUsed: func() uint64 {
+				if swapInfo != nil {
+					return swapInfo.Used
+				}
+				return 0
+			}(),
+			SwapFree: func() uint64 {
+				if swapInfo != nil {
+					return swapInfo.Free
+				}
+				return 0
+			}(),
+			SwapPercent: func() float64 {
+				if swapInfo != nil {
+					return swapInfo.UsedPercent
+				}
+				return 0
+			}(),
 		},
 		Disk: DiskStats{
 			Total:        diskInfo.Total,

@@ -19,7 +19,7 @@ import (
 
 // Returns a single server from the collection of servers.
 func getServer(c *gin.Context) {
-	c.JSON(http.StatusOK, ExtractServer(c).ToAPIResponse())
+	middleware.RespondSuccess(c, http.StatusOK, ExtractServer(c).ToAPIResponse())
 }
 
 // Returns the logs for a given server instance.
@@ -39,7 +39,7 @@ func getServerLogs(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": out})
+	middleware.RespondSuccess(c, http.StatusOK, gin.H{"data": out})
 }
 
 // Handles a request to control the power state of a server. If the action being passed
@@ -63,9 +63,7 @@ func postServerPower(c *gin.Context) {
 	}
 
 	if !data.Action.IsValid() {
-		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
-			"error": "The power action provided was not valid, should be one of \"stop\", \"start\", \"restart\", \"kill\"",
-		})
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "The power action provided was not valid, should be one of \"stop\", \"start\", \"restart\", \"kill\"")
 		return
 	}
 
@@ -76,9 +74,7 @@ func postServerPower(c *gin.Context) {
 	// We don't really care about any of the other actions at this point, they'll all result
 	// in the process being stopped, which should have happened anyways if the server is suspended.
 	if (data.Action == server.PowerActionStart || data.Action == server.PowerActionRestart) && s.IsSuspended() {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "Cannot start or restart a server that is suspended.",
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "Cannot start or restart a server that is suspended.")
 		return
 	}
 
@@ -112,9 +108,7 @@ func postServerCommands(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	} else if !running {
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
-			"error": "Cannot send commands to a stopped server instance.",
-		})
+		middleware.RespondError(c, http.StatusBadGateway, "Cannot send commands to a stopped server instance.")
 		return
 	}
 
@@ -173,9 +167,7 @@ func postServerReinstall(c *gin.Context) {
 	s := ExtractServer(c)
 
 	if s.ExecutingPowerAction() {
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-			"error": "Cannot execute server reinstall event while another power action is running.",
-		})
+		middleware.RespondError(c, http.StatusConflict, "Cannot execute server reinstall event while another power action is running.")
 		return
 	}
 

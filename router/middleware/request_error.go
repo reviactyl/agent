@@ -90,7 +90,7 @@ func (re *RequestError) Abort(c *gin.Context, status int) {
 	// Now abort the request with the error message and include the unique request
 	// ID that was present to make things super easy on people who don't know how
 	// or cannot view the response headers (where X-Request-Id would be present).
-	c.AbortWithStatusJSON(status, gin.H{"error": re.msg, "request_id": reqId})
+	RespondError(c, status, re.msg)
 }
 
 // Cause returns the underlying error.

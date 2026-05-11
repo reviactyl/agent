@@ -26,11 +26,11 @@ func getSystemInformation(c *gin.Context) {
 	}
 
 	if c.Query("v") == "2" {
-		c.JSON(http.StatusOK, i)
+		middleware.RespondSuccess(c, http.StatusOK, i)
 		return
 	}
 
-	c.JSON(http.StatusOK, struct {
+	middleware.RespondSuccess(c, http.StatusOK, struct {
 		Architecture  string `json:"architecture"`
 		CPUCount      int    `json:"cpu_count"`
 		KernelVersion string `json:"kernel_version"`
@@ -53,7 +53,7 @@ func getAllServers(c *gin.Context) {
 	for i, v := range servers {
 		out[i] = v.ToAPIResponse()
 	}
-	c.JSON(http.StatusOK, out)
+	middleware.RespondSuccess(c, http.StatusOK, out)
 }
 
 // Creates a new server on the agent daemon and begins the installation process
@@ -69,9 +69,7 @@ func postCreateServer(c *gin.Context) {
 	install, err := installer.New(c.Request.Context(), manager, details)
 	if err != nil {
 		if installer.IsValidationError(err) {
-			c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
-				"error": "The data provided in the request could not be validated.",
-			})
+			middleware.RespondError(c, http.StatusUnprocessableEntity, "The data provided in the request could not be validated.")
 			return
 		}
 
@@ -123,7 +121,7 @@ func postUpdateConfiguration(c *gin.Context) {
 	cfg := config.Get()
 
 	if cfg.IgnorePanelConfigUpdates {
-		c.JSON(http.StatusOK, postUpdateConfigurationResponse{
+		middleware.RespondSuccess(c, http.StatusOK, postUpdateConfigurationResponse{
 			Applied: false,
 		})
 		return
@@ -152,7 +150,7 @@ func postUpdateConfiguration(c *gin.Context) {
 	// Since we wrote it to the disk successfully now update the global configuration
 	// state to use this new configuration struct.
 	config.Set(cfg)
-	c.JSON(http.StatusOK, postUpdateConfigurationResponse{
+	middleware.RespondSuccess(c, http.StatusOK, postUpdateConfigurationResponse{
 		Applied: true,
 	})
 }
@@ -189,5 +187,5 @@ func postDeauthorizeUser(c *gin.Context) {
 }
 
 func getAgent(c *gin.Context) {
-	c.JSON(http.StatusOK, true)
+	middleware.RespondSuccess(c, http.StatusOK, true)
 }
