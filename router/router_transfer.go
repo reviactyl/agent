@@ -30,7 +30,9 @@ func postTransfers(c *gin.Context) {
 	auth := strings.SplitN(c.GetHeader("Authorization"), " ", 2)
 	if len(auth) != 2 || auth[0] != "Bearer" {
 		c.Header("WWW-Authenticate", "Bearer")
-		middleware.RespondError(c, http.StatusUnauthorized, "The required authorization heads were not present in the request.")
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"error": "The required authorization heads were not present in the request.",
+		})
 		return
 	}
 
@@ -252,13 +254,17 @@ func deleteTransfer(c *gin.Context) {
 	s := ExtractServer(c)
 
 	if !s.IsTransferring() {
-		middleware.RespondError(c, http.StatusConflict, "Server is not currently being transferred.")
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "Server is not currently being transferred.",
+		})
 		return
 	}
 
 	trnsfr := transfer.Incoming().Get(s.ID())
 	if trnsfr == nil {
-		middleware.RespondError(c, http.StatusConflict, "Server is not currently being transferred.")
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "Server is not currently being transferred.",
+		})
 		return
 	}
 

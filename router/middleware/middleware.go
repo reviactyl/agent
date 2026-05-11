@@ -76,12 +76,12 @@ func CaptureErrors() gin.HandlerFunc {
 			status = c.Writer.Status()
 		}
 		if err.Error() == io.EOF.Error() {
-			RespondError(c, http.StatusBadRequest, "The data passed in the request was not in a parsable format. Please try again.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The data passed in the request was not in a parsable format. Please try again."})
 			return
 		}
 		captured := NewError(err.Err)
 		if status, msg := captured.asFilesystemError(); msg != "" {
-			RespondError(c, status, msg)
+			c.AbortWithStatusJSON(status, gin.H{"error": msg, "request_id": c.Writer.Header().Get("X-Request-Id")})
 			return
 		}
 		captured.Abort(c, status)

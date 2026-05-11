@@ -41,7 +41,9 @@ func getServerFileContents(c *gin.Context) {
 	//
 	// @see https://github.com/pterodactyl/panel/issues/4059
 	if st.Mode()&os.ModeNamedPipe != 0 {
-		middleware.RespondError(c, http.StatusBadRequest, "Cannot open files of this type.")
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Cannot open files of this type.",
+		})
 		return
 	}
 
@@ -79,7 +81,7 @@ func getServerListDirectory(c *gin.Context) {
 	if stats, err := s.Filesystem().ListDirectory(dir); err != nil {
 		middleware.CaptureAndAbort(c, err)
 	} else {
-		middleware.RespondSuccess(c, http.StatusOK, stats)
+		c.JSON(http.StatusOK, stats)
 	}
 }
 
@@ -102,7 +104,9 @@ func putServerRenameFiles(c *gin.Context) {
 	}
 
 	if len(data.Files) == 0 {
-		middleware.RespondError(c, http.StatusUnprocessableEntity, "No files to move or rename were provided.")
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "No files to move or rename were provided.",
+		})
 		return
 	}
 
@@ -141,7 +145,9 @@ func putServerRenameFiles(c *gin.Context) {
 
 	if err := g.Wait(); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			middleware.RespondError(c, http.StatusBadRequest, "Cannot move or rename file, destination already exists.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Cannot move or rename file, destination already exists.",
+			})
 			return
 		}
 
@@ -190,7 +196,9 @@ func postServerDeleteFiles(c *gin.Context) {
 	}
 
 	if len(data.Files) == 0 {
-		middleware.RespondError(c, http.StatusUnprocessableEntity, "No files were specified for deletion.")
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "No files were specified for deletion.",
+		})
 		return
 	}
 
@@ -233,13 +241,17 @@ func postServerWriteFile(c *gin.Context) {
 
 	// A content length of -1 means the actual length is unknown.
 	if c.Request.ContentLength == -1 {
-		middleware.RespondError(c, http.StatusBadRequest, "Missing Content-Length")
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Missing Content-Length",
+		})
 		return
 	}
 
 	if err := s.Filesystem().Write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
-			middleware.RespondError(c, http.StatusBadRequest, "Cannot write file, name conflicts with an existing directory by the same name.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Cannot write file, name conflicts with an existing directory by the same name.",
+			})
 			return
 		}
 
@@ -256,7 +268,7 @@ func postServerWriteFile(c *gin.Context) {
 // with the current progress for everything.
 func getServerPullingFiles(c *gin.Context) {
 	s := ExtractServer(c)
-	middleware.RespondSuccess(c, http.StatusOK, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"downloads": downloader.ByServer(s.ID()),
 	})
 }
@@ -285,7 +297,9 @@ func postServerPullRemoteFile(c *gin.Context) {
 	u, err := url.Parse(data.URL)
 	if err != nil {
 		if e, ok := err.(*url.Error); ok {
-			middleware.RespondError(c, http.StatusBadRequest, "An error occurred while parsing that URL: "+e.Err.Error())
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "An error occurred while parsing that URL: " + e.Err.Error(),
+			})
 			return
 		}
 		middleware.CaptureAndAbort(c, err)
@@ -298,7 +312,9 @@ func postServerPullRemoteFile(c *gin.Context) {
 	}
 	// Do not allow more than three simultaneous remote file downloads at one time.
 	if len(downloader.ByServer(s.ID())) >= 3 {
-		middleware.RespondError(c, http.StatusBadRequest, "This server has reached its limit of 3 simultaneous remote file downloads at once. Please wait for one to complete before trying again.")
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "This server has reached its limit of 3 simultaneous remote file downloads at once. Please wait for one to complete before trying again.",
+		})
 		return
 	}
 
@@ -323,7 +339,7 @@ func postServerPullRemoteFile(c *gin.Context) {
 		go func() {
 			_ = download()
 		}()
-		middleware.RespondSuccess(c, http.StatusAccepted, gin.H{
+		c.JSON(http.StatusAccepted, gin.H{
 			"identifier": dl.Identifier,
 		})
 		return
@@ -339,7 +355,7 @@ func postServerPullRemoteFile(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	middleware.RespondSuccess(c, http.StatusOK, &st)
+	c.JSON(http.StatusOK, &st)
 }
 
 // Stops a remote file download if it exists and belongs to this server.
@@ -366,7 +382,9 @@ func postServerCreateDirectory(c *gin.Context) {
 
 	if err := s.Filesystem().CreateDirectory(data.Name, data.Path); err != nil {
 		if err.Error() == "not a directory" {
-			middleware.RespondError(c, http.StatusBadRequest, "Part of the path being created is not a directory (ENOTDIR).")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Part of the path being created is not a directory (ENOTDIR).",
+			})
 			return
 		}
 
@@ -390,12 +408,16 @@ func postServerCompressFiles(c *gin.Context) {
 	}
 
 	if len(data.Files) == 0 {
-		middleware.RespondError(c, http.StatusUnprocessableEntity, "No files were passed through to be compressed.")
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "No files were passed through to be compressed.",
+		})
 		return
 	}
 
 	if !s.Filesystem().HasSpaceAvailable(true) {
-		middleware.RespondError(c, http.StatusConflict, "This server does not have enough available disk space to generate a compressed archive.")
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "This server does not have enough available disk space to generate a compressed archive.",
+		})
 		return
 	}
 
@@ -405,7 +427,7 @@ func postServerCompressFiles(c *gin.Context) {
 		return
 	}
 
-	middleware.RespondSuccess(c, http.StatusOK, &filesystem.Stat{
+	c.JSON(http.StatusOK, &filesystem.Stat{
 		FileInfo: f,
 		Mimetype: "application/tar+gzip",
 	})
@@ -430,7 +452,7 @@ func postServerDecompressFiles(c *gin.Context) {
 	if err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
 			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
-			middleware.RespondError(c, http.StatusBadRequest, "The archive provided is in a format Agent does not understand.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The archive provided is in a format Agent does not understand."})
 			return
 		}
 		middleware.CaptureAndAbort(c, err)
@@ -444,7 +466,9 @@ func postServerDecompressFiles(c *gin.Context) {
 		// a file like this.
 		if strings.Contains(err.Error(), "text file busy") {
 			lg.WithField("error", errors.WithStackIf(err)).Warn("failed to decompress file: text file busy")
-			middleware.RespondError(c, http.StatusBadRequest, "One or more files this archive is attempting to overwrite are currently in use by another process. Please try again.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "One or more files this archive is attempting to overwrite are currently in use by another process. Please try again.",
+			})
 			return
 		}
 		middleware.CaptureAndAbort(c, err)
@@ -474,7 +498,9 @@ func postServerChmodFile(c *gin.Context) {
 	}
 
 	if len(data.Files) == 0 {
-		middleware.RespondError(c, http.StatusUnprocessableEntity, "No files to chmod were provided.")
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "No files to chmod were provided.",
+		})
 		return
 	}
 
@@ -509,7 +535,9 @@ func postServerChmodFile(c *gin.Context) {
 
 	if err := g.Wait(); err != nil {
 		if errors.Is(err, errInvalidFileMode) {
-			middleware.RespondError(c, http.StatusBadRequest, "Invalid file mode.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid file mode.",
+			})
 			return
 		}
 
@@ -531,19 +559,25 @@ func postServerUploadFiles(c *gin.Context) {
 
 	s, ok := manager.Get(token.ServerUuid)
 	if !ok || !token.IsUniqueRequest() {
-		middleware.RespondError(c, http.StatusNotFound, "The requested resource was not found on this server.")
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"error": "The requested resource was not found on this server.",
+		})
 		return
 	}
 
 	form, err := c.MultipartForm()
 	if err != nil {
-		middleware.RespondError(c, http.StatusBadRequest, "Failed to get multipart form data from request.")
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Failed to get multipart form data from request.",
+		})
 		return
 	}
 
 	headers, ok := form.File["files"]
 	if !ok {
-		middleware.RespondError(c, http.StatusBadRequest, "No files were found on the request body.")
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "No files were found on the request body.",
+		})
 		return
 	}
 
@@ -554,7 +588,9 @@ func postServerUploadFiles(c *gin.Context) {
 	var totalSize int64
 	for _, header := range headers {
 		if header.Size > maxFileSizeBytes {
-			middleware.RespondError(c, http.StatusBadRequest, "File "+header.Filename+" is larger than the maximum file upload size of "+strconv.FormatInt(maxFileSize, 10)+" MB.")
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "File " + header.Filename + " is larger than the maximum file upload size of " + strconv.FormatInt(maxFileSize, 10) + " MB.",
+			})
 			return
 		}
 		totalSize += header.Size

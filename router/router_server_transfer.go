@@ -36,7 +36,9 @@ func postServerTransfer(c *gin.Context) {
 	// There will be another endpoint for resetting this value either by deleting the
 	// server, or by canceling the transfer.
 	if s.IsTransferring() {
-		middleware.RespondError(c, http.StatusConflict, "A transfer is already in progress for this server.")
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A transfer is already in progress for this server.",
+		})
 		return
 	}
 
@@ -108,13 +110,17 @@ func deleteServerTransfer(c *gin.Context) {
 	s := ExtractServer(c)
 
 	if !s.IsTransferring() {
-		middleware.RespondError(c, http.StatusConflict, "Server is not currently being transferred.")
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "Server is not currently being transferred.",
+		})
 		return
 	}
 
 	trnsfr := transfer.Outgoing().Get(s.ID())
 	if trnsfr == nil {
-		middleware.RespondError(c, http.StatusConflict, "Server is not currently being transferred.")
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "Server is not currently being transferred.",
+		})
 		return
 	}
 

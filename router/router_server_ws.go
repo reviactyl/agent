@@ -39,7 +39,10 @@ func getServerWebsocket(c *gin.Context) {
 	//  is that we can both scope things to the user before authentication, and also
 	//  verify that the JWT provided by the panel is assigned to the same user.
 	if s.Websockets().Len() >= 30 {
-		middleware.RespondError(c, http.StatusBadRequest, "Too many open websocket connections.")
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Too many open websocket connections.",
+		})
+
 		return
 	}
 
