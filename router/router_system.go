@@ -187,7 +187,3 @@ func postDeauthorizeUser(c *gin.Context) {
 
 	c.Status(http.StatusNoContent)
 }
-
-func getAgent(c *gin.Context) {
-	c.JSON(http.StatusOK, true)
-}
