@@ -31,6 +31,9 @@ const (
 	Xml        = "xml"
 )
 
+// maxTextScanTokenSize bounds how large a single line the "file" parser will buffer.
+const maxTextScanTokenSize = 64 * 1024 * 1024
+
 type ReplaceValue struct {
 	value     []byte
 	valueType jsonparser.ValueType
@@ -474,6 +477,7 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 	b := bytes.NewBuffer(nil)
 	s := bufio.NewScanner(file)
+	s.Buffer(make([]byte, 0, 64*1024), maxTextScanTokenSize)
 	var replaced bool
 	for s.Scan() {
 		line := s.Bytes()
@@ -491,6 +495,9 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 			b.Write(line)
 		}
 		b.WriteByte('\n')
+	}
+	if err := s.Err(); err != nil {
+		return errors.Wrap(err, "parser: failed to scan text file for configuration update")
 	}
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
