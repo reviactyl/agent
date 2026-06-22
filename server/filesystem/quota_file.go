@@ -24,12 +24,15 @@ func (f *quotaFile) Write(p []byte) (int, error) {
 		return f.File.Write(p)
 	}
 
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	off, err := f.File.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return 0, err
 	}
 
-	return f.writeAt(p, off, func() (int, error) {
+	return f.writeAtLocked(p, off, func() (int, error) {
 		return f.File.Write(p)
 	})
 }
@@ -39,15 +42,15 @@ func (f *quotaFile) WriteAt(p []byte, off int64) (int, error) {
 		return f.File.WriteAt(p, off)
 	}
 
-	return f.writeAt(p, off, func() (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.writeAtLocked(p, off, func() (int, error) {
 		return f.File.WriteAt(p, off)
 	})
 }
 
-func (f *quotaFile) writeAt(p []byte, off int64, write func() (int, error)) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
+func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)) (int, error) {
 	previousSize := f.size
 	if growth := off + int64(len(p)) - previousSize; growth > 0 {
 		if err := f.fs.reserveDisk(growth); err != nil {
