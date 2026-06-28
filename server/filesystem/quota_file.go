@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"io"
+	"math"
 	"sync"
 
 	"github.com/pterodactyl/wings/internal/ufs"
@@ -52,19 +53,26 @@ func (f *quotaFile) WriteAt(p []byte, off int64) (int, error) {
 
 func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)) (int, error) {
 	previousSize := f.size
-	if growth := off + int64(len(p)) - previousSize; growth > 0 {
+	end, ok := quotaWriteEnd(off, len(p))
+	if !ok {
+		return 0, newFilesystemError(ErrCodeDiskSpace, nil)
+	}
+	if growth := end - previousSize; growth > 0 {
 		if err := f.fs.reserveDisk(growth); err != nil {
 			return 0, err
 		}
 	}
 
 	n, err := write()
-	writtenEnd := off + int64(n)
-	if writtenEnd > previousSize {
-		f.size = writtenEnd
+	writtenEnd := previousSize
+	if n > 0 {
+		writtenEnd, _ = quotaWriteEnd(off, n)
+		if writtenEnd > previousSize {
+			f.size = writtenEnd
+		}
 	}
 
-	if reserved := off + int64(len(p)) - previousSize; reserved > 0 {
+	if reserved := end - previousSize; reserved > 0 {
 		actual := int64(0)
 		if writtenEnd > previousSize {
 			actual = writtenEnd - previousSize
@@ -75,6 +83,13 @@ func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)
 	}
 
 	return n, err
+}
+
+func quotaWriteEnd(off int64, size int) (int64, bool) {
+	if size < 0 || off > math.MaxInt64-int64(size) {
+		return 0, false
+	}
+	return off + int64(size), true
 }
 
 func (f *quotaFile) ReadFrom(r io.Reader) (int64, error) {

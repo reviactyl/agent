@@ -172,6 +172,23 @@ func TestFilesystem_Touch(t *testing.T) {
 			g.Assert(fs.CachedUsage()).Equal(int64(4))
 		})
 
+		g.It("does not reset disk usage after a failed huge-offset write", func() {
+			const usage = int64(5 * 1024 * 1024)
+			fs.SetDiskLimit(10 * 1024 * 1024)
+			fs.unixFS.SetUsage(usage)
+
+			f, err := fs.Touch("quota.txt", ufs.O_RDWR|ufs.O_TRUNC)
+			g.Assert(err).IsNil()
+
+			n, err := f.WriteAt([]byte("x"), math.MaxInt64)
+			g.Assert(err).IsNotNil()
+			g.Assert(n).Equal(0)
+
+			err = f.Close()
+			g.Assert(err).IsNil()
+			g.Assert(fs.CachedUsage()).Equal(usage)
+		})
+
 		g.AfterEach(func() {
 			_ = fs.TruncateRootDirectory()
 		})
