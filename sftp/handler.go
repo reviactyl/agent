@@ -37,9 +37,14 @@ type Handler struct {
 
 type quotaWriterAt struct {
 	io.WriterAt
+	server *server.Server
 }
 
 func (w quotaWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if w.server != nil && w.server.IsInProtectedState() {
+		return 0, sftp.ErrSSHFxPermissionDenied
+	}
+
 	n, err := w.WriterAt.WriteAt(p, off)
 	if filesystem.IsErrorCode(err, filesystem.ErrCodeDiskSpace) {
 		return n, ErrSSHQuotaExceeded
@@ -153,7 +158,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		event = server.ActivitySftpCreate
 	}
 	h.events.MustLog(event, FileAction{Entity: request.Filepath})
-	return quotaWriterAt{WriterAt: f}, nil
+	return quotaWriterAt{WriterAt: f, server: h.server}, nil
 }
 
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
@@ -308,7 +313,7 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 // Determines if a user has permission to perform a specific action on the SFTP server. These
 // permissions are defined and returned by the Panel API.
 func (h *Handler) can(permission string) bool {
-	if h.server.IsSuspended() {
+	if h.server.IsSuspended() || h.server.IsInProtectedState() {
 		return false
 	}
 	for _, p := range h.permissions {
