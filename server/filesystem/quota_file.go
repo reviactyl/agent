@@ -5,7 +5,7 @@ import (
 	"math"
 	"sync"
 
-	"github.com/pterodactyl/wings/internal/ufs"
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 type quotaFile struct {

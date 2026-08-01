@@ -7,7 +7,7 @@ import (
 
 	pkgsftp "github.com/pkg/sftp"
 
-	"github.com/pterodactyl/wings/server"
+	"github.com/reviactyl/agent/server"
 )
 
 type writeAtFunc func([]byte, int64) (int, error)
