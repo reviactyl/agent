@@ -83,6 +83,8 @@ func (c backupTestRemoteClient) SendActivityLogs(context.Context, []models.Activ
 	return nil
 }
 
+func (c backupTestRemoteClient) SetCredentials(_, _ string) {}
+
 type backupTestEnvironment struct{}
 
 func (backupTestEnvironment) Type() string { return "test" }
