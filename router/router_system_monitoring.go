@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,11 +45,22 @@ type MemoryStats struct {
 }
 
 type DiskStats struct {
+	Total        uint64           `json:"total_bytes"`
+	Used         uint64           `json:"used_bytes"`
+	Free         uint64           `json:"free_bytes"`
+	UsagePercent float64          `json:"usage_percent"`
+	Path         string           `json:"path"`
+	Partitions   []PartitionStats `json:"partitions,omitempty"`
+}
+
+type PartitionStats struct {
+	Mountpoint   string  `json:"mountpoint"`
+	Device       string  `json:"device"`
+	Filesystem   string  `json:"filesystem"`
 	Total        uint64  `json:"total_bytes"`
 	Used         uint64  `json:"used_bytes"`
 	Free         uint64  `json:"free_bytes"`
 	UsagePercent float64 `json:"usage_percent"`
-	Path         string  `json:"path"`
 }
 
 type NetworkStatsDetails struct {
@@ -67,15 +79,62 @@ type RuntimeStats struct {
 
 var startTime = time.Now()
 
+// snapshotCacheTTL is the minimum age a snapshot must reach before it is
+// recollected. The panel polls every second while each collection takes
+// >=200ms (CPU delta sampling), so concurrent polls would otherwise queue.
+var snapshotCacheTTL = 750 * time.Millisecond
+
+var (
+	lastSnapshotMu sync.Mutex
+	lastSnapshot   *SystemMonitoringSnapshot
+	lastSnapshotAt time.Time
+)
+
 // getSystemMonitoring returns live system monitoring data
 func getSystemMonitoring(c *gin.Context) {
-	snapshot, err := collectSystemSnapshot()
+	snapshot, err := cachedSystemSnapshot()
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, snapshot)
+}
+
+// ignoredMountPrefixes are mount point prefixes excluded from the disk
+// partition report (e.g. "/snap" to hide loop-mounted snap packages).
+var ignoredMountPrefixes = []string{"/snap"}
+
+// ignoredMountPoint reports whether the mount point matches any ignore prefix.
+func ignoredMountPoint(mountpoint string) bool {
+	for _, prefix := range ignoredMountPrefixes {
+		if prefix != "" && strings.HasPrefix(mountpoint, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// cachedSystemSnapshot returns the last snapshot if it is younger than
+// snapshotCacheTTL, deduplicating overlapping poll requests.
+func cachedSystemSnapshot() (*SystemMonitoringSnapshot, error) {
+	lastSnapshotMu.Lock()
+	defer lastSnapshotMu.Unlock()
+
+	if lastSnapshot != nil && time.Since(lastSnapshotAt) < snapshotCacheTTL {
+		return lastSnapshot, nil
+	}
+
+	snapshot, err := collectSystemSnapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	lastSnapshot = snapshot
+	lastSnapshotAt = time.Now()
+
+	return snapshot, nil
 }
 
 // collectSystemSnapshot collects current system resource usage.
@@ -126,6 +185,28 @@ func collectSystemSnapshot() (*SystemMonitoringSnapshot, error) {
 		diskInfo = &disk.UsageStat{Path: "/"}
 	}
 
+	// Per-partition disk stats (non-fatal — pseudo filesystems report 0 total and are skipped).
+	partitions, _ := disk.PartitionsWithContext(ctx, false)
+	var partitionStats []PartitionStats
+	for _, partition := range partitions {
+		if ignoredMountPoint(partition.Mountpoint) {
+			continue
+		}
+		usage, err := disk.UsageWithContext(ctx, partition.Mountpoint)
+		if err != nil || usage.Total == 0 {
+			continue
+		}
+		partitionStats = append(partitionStats, PartitionStats{
+			Mountpoint:   partition.Mountpoint,
+			Device:       partition.Device,
+			Filesystem:   partition.Fstype,
+			Total:        usage.Total,
+			Used:         usage.Used,
+			Free:         usage.Free,
+			UsagePercent: usage.UsedPercent,
+		})
+	}
+
 	// Network Stats
 	netStats, err := psnet.IOCountersWithContext(ctx, false)
 	var netInfo NetworkStatsDetails
@@ -170,6 +251,7 @@ func collectSystemSnapshot() (*SystemMonitoringSnapshot, error) {
 			Free:         diskInfo.Free,
 			UsagePercent: diskInfo.UsedPercent,
 			Path:         diskInfo.Path,
+			Partitions:   partitionStats,
 		},
 		Network: netInfo,
 		Runtime: runtimeInfo,
