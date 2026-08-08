@@ -12,9 +12,9 @@ services:
     tty: true
     environment:
       TZ: "UTC"
-      WINGS_UID: 988
-      WINGS_GID: 988
-      WINGS_USERNAME: reviactyl
+      AGENT_UID: 988
+      AGENT_GID: 988
+      AGENT_USERNAME: reviactyl
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "/var/lib/docker/containers/:/var/lib/docker/containers/"

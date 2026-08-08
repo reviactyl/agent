@@ -167,7 +167,7 @@ func parseDockerRegistryReference(registry string) (string, string, bool) {
 	hasPath := strings.Contains(registry, "/")
 	ref := registry
 	if !hasPath {
-		ref += "/wings"
+		ref += "/agent"
 	}
 
 	named, err := reference.ParseNormalizedNamed(ref)

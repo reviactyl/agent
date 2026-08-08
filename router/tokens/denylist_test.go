@@ -15,13 +15,13 @@ type denylistable interface {
 func resetDenylistState(t *testing.T, bootTime time.Time) {
 	t.Helper()
 
-	originalBootTime := wingsBootTime
-	wingsBootTime = bootTime
+	originalBootTime := agentBootTime
+	agentBootTime = bootTime
 	denylist.Clear()
 	userDenylist.Clear()
 
 	t.Cleanup(func() {
-		wingsBootTime = originalBootTime
+		agentBootTime = originalBootTime
 		denylist.Clear()
 		userDenylist.Clear()
 	})

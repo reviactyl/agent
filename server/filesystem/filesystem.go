@@ -171,7 +171,7 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 
 	// Ensure the parent directories exist and are owned by the server user
 	// before creating the file. Touch would create any missing parents
-	// implicitly, but as the user Wings runs as; creating them here lets us
+	// implicitly, but as the user Agent runs as; creating them here lets us
 	// chown the ones we add.
 	if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
@@ -232,7 +232,7 @@ func (fs *Filesystem) chownFile(name string) error {
 
 // mkdirAll creates the directory p along with any missing parents, chowning
 // every directory it creates to the server user so they are not left owned by
-// the user Wings runs as.
+// the user Agent runs as.
 func (fs *Filesystem) mkdirAll(p string, mode ufs.FileMode) error {
 	created, err := fs.unixFS.MkdirAll(p, mode)
 	if err != nil {

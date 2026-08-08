@@ -13,7 +13,7 @@ import (
 // connect to the socket since they may have been marked as denied already and therefore
 // could be invalid at this point.
 //
-// By doing this we make it so that a user who gets disconnected from Agent due to a Agent
+// By doing this we make it so that a user who gets disconnected from Agent due to an Agent
 // reboot just needs to request a new token as if their old token had expired naturally.
 var agentBootTime = time.Now()
 
@@ -47,7 +47,7 @@ func DenyForServer(s string, u string) {
 	userDenylist.Store(strings.Join([]string{s, u}, ":"), time.Now())
 }
 
-// Checks if a user-bound JWT has been denied because it was issued before Wings
+// Checks if a user-bound JWT has been denied because it was issued before Agent
 // booted, or before the Panel revoked the user's access to a server.
 func isDenylisted(payload *jwt.Payload, serverUUID, userUUID string) bool {
 	// A token without all of the claims needed to check revocation cannot be
@@ -56,7 +56,7 @@ func isDenylisted(payload *jwt.Payload, serverUUID, userUUID string) bool {
 		return true
 	}
 
-	if payload.IssuedAt.Time.Before(wingsBootTime) {
+	if payload.IssuedAt.Time.Before(agentBootTime) {
 		return true
 	}
 
