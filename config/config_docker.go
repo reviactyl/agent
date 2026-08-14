@@ -92,6 +92,13 @@ type DockerConfiguration struct {
 		Percent int64 `default:"100" json:"percent" yaml:"percent"`
 	} `json:"cpu_burst" yaml:"cpu_burst"`
 
+	// CpuShares is the relative CFS weight of server containers when the host is
+	// fully saturated, it limits nothing on an idle host. Zero leaves containers
+	// at the engine default. Wings historically set 1024, which cgroup v2 converts
+	// to less than half of the default weight, set that value to restore the old
+	// bias towards host system services.
+	CpuShares int64 `default:"0" json:"cpu_shares" yaml:"cpu_shares"`
+
 	// Overhead controls the memory overhead given to all containers to circumvent certain
 	// software such as the JVM not staying below the maximum memory limit.
 	Overhead Overhead `json:"overhead" yaml:"overhead"`
