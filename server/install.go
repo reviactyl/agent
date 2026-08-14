@@ -20,6 +20,7 @@ import (
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/environment/docker"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/system"
 )
@@ -477,6 +478,8 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
 		return "", err
 	}
+
+	docker.SetCpuBurst(ctx, ip.client, r.ID, hostConf.Resources.CPUQuota)
 
 	// Process the install event in the background by listening to the stream output until the
 	// container has stopped, at which point we'll disconnect from it.
