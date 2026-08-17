@@ -94,7 +94,7 @@ type DockerConfiguration struct {
 
 	// CpuShares is the relative CFS weight of server containers when the host is
 	// fully saturated, it limits nothing on an idle host. Zero leaves containers
-	// at the engine default. Wings historically set 1024, which cgroup v2 converts
+	// at the engine default. Agent historically set 1024, which cgroup v2 converts
 	// to less than half of the default weight, set that value to restore the old
 	// bias towards host system services.
 	CpuShares int64 `default:"0" json:"cpu_shares" yaml:"cpu_shares"`
