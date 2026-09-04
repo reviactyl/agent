@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04]
-        go: ["1.24.11", "1.25.5"]
+        go: ["1.26.4"]
         goos: [linux]
         goarch: [amd64, arm64]
     permissions:
