@@ -78,16 +78,15 @@ func postSystemUpdate(c *gin.Context) {
 		})
 		return
 	}
+	var request postSystemUpdateRequest
+	if err := c.BindJSON(&request); err != nil {
+		return
+	}
+
 	if !systemUpdateInProgress.CompareAndSwap(false, true) {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 			"error": "an Agent update is already in progress",
 		})
-		return
-	}
-
-	var request postSystemUpdateRequest
-	if err := c.BindJSON(&request); err != nil {
-		systemUpdateInProgress.Store(false)
 		return
 	}
 
