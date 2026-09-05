@@ -8,7 +8,7 @@ COPY go.mod go.sum /app/
 RUN go mod download
 COPY . /app/
 RUN CGO_ENABLED=0 go build \
-    -ldflags="-s -w -X github.com/reviactyl/agent/system.Version=$VERSION" \
+    -ldflags="-s -w -X github.com/reviactyl/agent/system.Version=$VERSION -X github.com/reviactyl/agent/system.InstallationType=docker" \
     -v \
     -trimpath \
     -o agent \

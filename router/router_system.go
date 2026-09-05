@@ -3,8 +3,11 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
@@ -18,8 +21,10 @@ import (
 )
 
 // Returns information about the system that agent is running on.
+var readSystemInformation = system.GetSystemInformation
+
 func getSystemInformation(c *gin.Context) {
-	i, err := system.GetSystemInformation()
+	i, err := readSystemInformation()
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -31,17 +36,81 @@ func getSystemInformation(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, struct {
-		Architecture  string `json:"architecture"`
-		CPUCount      int    `json:"cpu_count"`
-		KernelVersion string `json:"kernel_version"`
-		OS            string `json:"os"`
-		Version       string `json:"version"`
+		Architecture     string `json:"architecture"`
+		CPUCount         int    `json:"cpu_count"`
+		KernelVersion    string `json:"kernel_version"`
+		OS               string `json:"os"`
+		Version          string `json:"version"`
+		InstallationType string `json:"installation_type"`
 	}{
-		Architecture:  i.System.Architecture,
-		CPUCount:      i.System.CPUThreads,
-		KernelVersion: i.System.KernelVersion,
-		OS:            i.System.OSType,
-		Version:       i.Version,
+		Architecture:     i.System.Architecture,
+		CPUCount:         i.System.CPUThreads,
+		KernelVersion:    i.System.KernelVersion,
+		OS:               i.System.OSType,
+		Version:          i.Version,
+		InstallationType: i.InstallationType,
+	})
+}
+
+type postSystemUpdateRequest struct {
+	Version string `json:"version" binding:"required"`
+}
+
+type postSystemUpdateResponse struct {
+	Version string `json:"version"`
+	Status  string `json:"status"`
+}
+
+var installSystemUpdate = func(ctx context.Context, version string) (*system.InstalledUpdate, error) {
+	return system.NewUpdater().Install(ctx, version)
+}
+
+var restartAfterSystemUpdate = system.RestartAfterUpdate
+
+var systemUpdateInProgress atomic.Bool
+
+const systemUpdateTimeout = 2 * time.Minute
+
+func postSystemUpdate(c *gin.Context) {
+	if system.InstallationType != "native" {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "automatic updates are only available for native Agent installations",
+		})
+		return
+	}
+	var request postSystemUpdateRequest
+	if err := c.BindJSON(&request); err != nil {
+		return
+	}
+
+	if !systemUpdateInProgress.CompareAndSwap(false, true) {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "an Agent update is already in progress",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), systemUpdateTimeout)
+	defer cancel()
+	installed, err := installSystemUpdate(ctx, request.Version)
+	if err != nil {
+		systemUpdateInProgress.Store(false)
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	if err := restartAfterSystemUpdate(ctx, installed); err != nil {
+		systemUpdateInProgress.Store(false)
+		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
+			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+		}
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	c.JSON(http.StatusAccepted, postSystemUpdateResponse{
+		Version: request.Version,
+		Status:  "restarting",
 	})
 }
 
