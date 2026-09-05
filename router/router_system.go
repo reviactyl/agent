@@ -86,7 +86,7 @@ func postSystemUpdate(c *gin.Context) {
 	}
 
 	var request postSystemUpdateRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
+	if err := c.BindJSON(&request); err != nil {
 		systemUpdateInProgress.Store(false)
 		return
 	}
@@ -100,7 +100,7 @@ func postSystemUpdate(c *gin.Context) {
 		return
 	}
 
-	if err := restartAfterSystemUpdate(installed); err != nil {
+	if err := restartAfterSystemUpdate(ctx, installed); err != nil {
 		systemUpdateInProgress.Store(false)
 		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
 			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)

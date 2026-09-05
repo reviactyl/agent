@@ -219,7 +219,7 @@ func fileSHA256(path string) (string, error) {
 // restores the previous binary when the new service does not become active.
 // The separate unit is important: a child process left in agent.service's
 // cgroup would normally be killed by the restart it is meant to supervise.
-func RestartAfterUpdate(update *InstalledUpdate) error {
+func RestartAfterUpdate(ctx context.Context, update *InstalledUpdate) error {
 	if update == nil {
 		return errors.New("missing installed Agent update")
 	}
@@ -237,7 +237,8 @@ if mv -f -- "$2" "$1"; then
     systemctl restart agent
 fi`
 	unit := fmt.Sprintf("reviactyl-agent-update-%d", os.Getpid())
-	command := exec.Command(
+	command := exec.CommandContext(
+		ctx,
 		"systemd-run",
 		"--quiet",
 		"--collect",

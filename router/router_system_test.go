@@ -38,7 +38,7 @@ func TestGetSystemInformationIncludesInstallationType(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodGet, "/api/system", nil)
+	c.Request = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/system", nil)
 	getSystemInformation(c)
 
 	var response map[string]any
@@ -70,7 +70,7 @@ func TestPostSystemUpdateRejectsDockerInstallations(t *testing.T) {
 	engine := gin.New()
 	engine.Use(middleware.CaptureErrors())
 	engine.POST("/api/system/update", postSystemUpdate)
-	request := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(recorder, request)
 
@@ -79,6 +79,44 @@ func TestPostSystemUpdateRejectsDockerInstallations(t *testing.T) {
 	}
 	if called {
 		t.Fatal("Docker update invoked the native updater")
+	}
+}
+
+func TestPostSystemUpdateRejectsInvalidRequests(t *testing.T) {
+	originalType := system.InstallationType
+	originalInstall := installSystemUpdate
+	t.Cleanup(func() {
+		system.InstallationType = originalType
+		installSystemUpdate = originalInstall
+		systemUpdateInProgress.Store(false)
+	})
+	system.InstallationType = "native"
+	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
+		t.Fatal("invalid request invoked the updater")
+		return nil, nil
+	}
+
+	for name, body := range map[string]string{
+		"missing version": `{}`,
+		"malformed JSON":  `{"version":`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			systemUpdateInProgress.Store(false)
+			recorder := httptest.NewRecorder()
+			engine := gin.New()
+			engine.Use(middleware.CaptureErrors())
+			engine.POST("/api/system/update", postSystemUpdate)
+			request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			engine.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected bad request, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if systemUpdateInProgress.Load() {
+				t.Fatal("update lock remained set after invalid request")
+			}
+		})
 	}
 }
 
@@ -106,14 +144,14 @@ func TestPostSystemUpdateInstallsBeforeSchedulingRestart(t *testing.T) {
 		return installed, nil
 	}
 	restarted := make(chan *system.InstalledUpdate, 1)
-	restartAfterSystemUpdate = func(update *system.InstalledUpdate) error {
+	restartAfterSystemUpdate = func(_ context.Context, update *system.InstalledUpdate) error {
 		restarted <- update
 		return nil
 	}
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	c.Request = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 	postSystemUpdate(c)
 
@@ -141,7 +179,7 @@ func TestPostSystemUpdateRejectsConcurrentAttempts(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	c.Request = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 	postSystemUpdate(c)
 
@@ -174,7 +212,7 @@ func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
-	restartAfterSystemUpdate = func(*system.InstalledUpdate) error {
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) error {
 		return errors.New("systemd unavailable")
 	}
 
@@ -182,7 +220,7 @@ func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	engine := gin.New()
 	engine.Use(middleware.CaptureErrors())
 	engine.POST("/api/system/update", postSystemUpdate)
-	request := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(recorder, request)
 
@@ -201,6 +239,68 @@ func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	}
 	if systemUpdateInProgress.Load() {
 		t.Fatal("update lock remained set after rollback")
+	}
+}
+
+func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
+	originalType := system.InstallationType
+	originalInstall := installSystemUpdate
+	originalRestart := restartAfterSystemUpdate
+	t.Cleanup(func() {
+		system.InstallationType = originalType
+		installSystemUpdate = originalInstall
+		restartAfterSystemUpdate = originalRestart
+		systemUpdateInProgress.Store(false)
+	})
+	systemUpdateInProgress.Store(false)
+	system.InstallationType = "native"
+
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "agent")
+	backup := executable + ".update-backup"
+	if err := os.WriteFile(executable, []byte("new agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
+		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
+	}
+	restartAfterSystemUpdate = system.RestartAfterUpdate
+
+	binDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDirectory, "systemd-run"), []byte("#!/bin/sh\nexec /bin/sleep 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	requestContext, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	recorder := httptest.NewRecorder()
+	engine := gin.New()
+	engine.Use(middleware.CaptureErrors())
+	engine.POST("/api/system/update", postSystemUpdate)
+	request := httptest.NewRequestWithContext(requestContext, http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	started := time.Now()
+	engine.ServeHTTP(recorder, request)
+
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("blocked restart ignored request deadline: %s", elapsed)
+	}
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if systemUpdateInProgress.Load() {
+		t.Fatal("update lock remained set after restart timeout")
+	}
+	current, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != "old agent" {
+		t.Fatalf("expected old Agent binary to be restored, got %q", current)
 	}
 }
 
@@ -224,7 +324,7 @@ func TestPostUpdateConfigurationRotatesCredentials(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Set("manager", manager)
-	c.Request = httptest.NewRequest("POST", "/api/update", strings.NewReader(`{"token_id":"new-id","token":"new-token"}`))
+	c.Request = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/update", strings.NewReader(`{"token_id":"new-id","token":"new-token"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	postUpdateConfiguration(c)

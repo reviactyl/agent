@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUpdaterRejectsInvalidVersion(t *testing.T) {
@@ -138,6 +139,26 @@ func TestUpdaterPreservesExistingRecoveryBackup(t *testing.T) {
 	}
 	if string(current) != "current agent" || string(recovery) != "recovery agent" {
 		t.Fatalf("updater changed recovery files: current=%q backup=%q", current, recovery)
+	}
+}
+
+func TestRestartAfterUpdateHonorsContext(t *testing.T) {
+	binDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDirectory, "systemd-run"), []byte("#!/bin/sh\nexec /bin/sleep 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := RestartAfterUpdate(ctx, &InstalledUpdate{ExecutablePath: "/agent", BackupPath: "/agent.update-backup"})
+
+	if err == nil {
+		t.Fatal("expected blocked systemd-run to fail when the context expired")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("blocked systemd-run ignored context deadline: %s", elapsed)
 	}
 }
 
