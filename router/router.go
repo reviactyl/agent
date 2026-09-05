@@ -63,6 +63,7 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	protected := router.Use(middleware.RequireAuthorization())
 	protected.POST("/api/update", postUpdateConfiguration)
 	protected.GET("/api/system", getSystemInformation)
+	protected.POST("/api/system/update", postSystemUpdate)
 	protected.GET("/api/system/monitoring", getSystemMonitoring)
 	protected.GET("/api/servers", getAllServers)
 	protected.POST("/api/servers", postCreateServer)
