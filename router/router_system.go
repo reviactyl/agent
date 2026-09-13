@@ -54,6 +54,7 @@ func getSystemInformation(c *gin.Context) {
 
 type postSystemUpdateRequest struct {
 	Version string `json:"version" binding:"required"`
+	Channel string `json:"channel" binding:"omitempty,oneof=stable beta"`
 }
 
 type postSystemUpdateResponse struct {
@@ -61,15 +62,21 @@ type postSystemUpdateResponse struct {
 	Status  string `json:"status"`
 }
 
-var installSystemUpdate = func(ctx context.Context, version string) (*system.InstalledUpdate, error) {
-	return system.NewUpdater().Install(ctx, version)
+var installSystemUpdate = func(ctx context.Context, version string, channel string) (*system.InstalledUpdate, error) {
+	return system.NewUpdater().Install(ctx, version, channel)
 }
 
 var restartAfterSystemUpdate = system.RestartAfterUpdate
 
 var systemUpdateInProgress atomic.Bool
 
-const systemUpdateTimeout = 2 * time.Minute
+var systemUpdateTimeout = 2 * time.Minute
+
+var systemUpdateRestartTimeout = 20 * time.Second
+
+var systemUpdateLockRelease = 5 * time.Minute
+
+var scheduleSystemUpdateLockRelease = time.AfterFunc
 
 func postSystemUpdate(c *gin.Context) {
 	if system.InstallationType != "native" {
@@ -90,23 +97,37 @@ func postSystemUpdate(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), systemUpdateTimeout)
+	operationContext := context.Background()
+	ctx, cancel := context.WithTimeout(operationContext, systemUpdateTimeout)
 	defer cancel()
-	installed, err := installSystemUpdate(ctx, request.Version)
+	installed, err := installSystemUpdate(ctx, request.Version, request.Channel)
 	if err != nil {
+		systemUpdateInProgress.Store(false)
+		if errors.Is(err, system.ErrInvalidUpdateRequest) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	restartContext, restartCancel := context.WithTimeout(operationContext, systemUpdateRestartTimeout)
+	defer restartCancel()
+	if err := restartAfterSystemUpdate(restartContext, installed); err != nil {
+		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
+			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+		}
 		systemUpdateInProgress.Store(false)
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
 
-	if err := restartAfterSystemUpdate(ctx, installed); err != nil {
+	// The transient supervisor should replace this process almost immediately.
+	// Release the guard if that never happens so a failed restart cannot block
+	// future update attempts until the Agent is restarted manually.
+	scheduleSystemUpdateLockRelease(systemUpdateLockRelease, func() {
 		systemUpdateInProgress.Store(false)
-		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
-			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
-		}
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
+	})
 
 	c.JSON(http.StatusAccepted, postSystemUpdateResponse{
 		Version: request.Version,

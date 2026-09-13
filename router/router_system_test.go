@@ -61,7 +61,7 @@ func TestPostSystemUpdateRejectsDockerInstallations(t *testing.T) {
 	t.Cleanup(func() { systemUpdateInProgress.Store(false) })
 	system.InstallationType = "docker"
 	called := false
-	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
+	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
 		called = true
 		return nil, errors.New("should not be called")
 	}
@@ -91,13 +91,14 @@ func TestPostSystemUpdateRejectsInvalidRequests(t *testing.T) {
 		systemUpdateInProgress.Store(false)
 	})
 	system.InstallationType = "native"
-	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
+	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
 		t.Fatal("invalid request invoked the updater")
 		return nil, nil
 	}
 
 	for name, body := range map[string]string{
 		"missing version": `{}`,
+		"invalid channel": `{"version":"26.10.0-beta.1","channel":"nightly"}`,
 		"malformed JSON":  `{"version":`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -124,17 +125,31 @@ func TestPostSystemUpdateInstallsBeforeSchedulingRestart(t *testing.T) {
 	originalType := system.InstallationType
 	originalInstall := installSystemUpdate
 	originalRestart := restartAfterSystemUpdate
+	originalScheduleLockRelease := scheduleSystemUpdateLockRelease
 	t.Cleanup(func() {
 		system.InstallationType = originalType
 		installSystemUpdate = originalInstall
 		restartAfterSystemUpdate = originalRestart
+		scheduleSystemUpdateLockRelease = originalScheduleLockRelease
 	})
 	systemUpdateInProgress.Store(false)
 	t.Cleanup(func() { systemUpdateInProgress.Store(false) })
 	system.InstallationType = "native"
+	var releaseLock func()
+	scheduleSystemUpdateLockRelease = func(delay time.Duration, callback func()) *time.Timer {
+		if delay != systemUpdateLockRelease {
+			t.Fatalf("unexpected update lock release delay: %s", delay)
+		}
+		releaseLock = callback
+
+		return nil
+	}
 	installed := &system.InstalledUpdate{ExecutablePath: "/agent", BackupPath: "/agent.update-backup"}
-	installSystemUpdate = func(ctx context.Context, version string) (*system.InstalledUpdate, error) {
-		if version != "26.09.1" {
+	installSystemUpdate = func(ctx context.Context, version string, channel string) (*system.InstalledUpdate, error) {
+		if channel != "beta" {
+			t.Fatalf("unexpected channel %q", channel)
+		}
+		if version != "26.10.0-rc.1" {
 			t.Fatalf("unexpected version %q", version)
 		}
 		deadline, ok := ctx.Deadline()
@@ -144,14 +159,18 @@ func TestPostSystemUpdateInstallsBeforeSchedulingRestart(t *testing.T) {
 		return installed, nil
 	}
 	restarted := make(chan *system.InstalledUpdate, 1)
-	restartAfterSystemUpdate = func(_ context.Context, update *system.InstalledUpdate) error {
+	restartAfterSystemUpdate = func(ctx context.Context, update *system.InstalledUpdate) error {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > systemUpdateRestartTimeout {
+			t.Fatalf("unexpected restart deadline: %v", deadline)
+		}
 		restarted <- update
 		return nil
 	}
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	c.Request = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.10.0-rc.1","channel":"beta"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 	postSystemUpdate(c)
 
@@ -165,6 +184,16 @@ func TestPostSystemUpdateInstallsBeforeSchedulingRestart(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expected restart to be scheduled")
+	}
+	if !systemUpdateInProgress.Load() {
+		t.Fatal("update lock was released before the restart grace period")
+	}
+	if releaseLock == nil {
+		t.Fatal("update lock release was not scheduled")
+	}
+	releaseLock()
+	if systemUpdateInProgress.Load() {
+		t.Fatal("update lock remained set after the restart grace period")
 	}
 }
 
@@ -209,7 +238,7 @@ func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
+	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
 	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) error {
@@ -246,14 +275,17 @@ func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
 	originalType := system.InstallationType
 	originalInstall := installSystemUpdate
 	originalRestart := restartAfterSystemUpdate
+	originalRestartTimeout := systemUpdateRestartTimeout
 	t.Cleanup(func() {
 		system.InstallationType = originalType
 		installSystemUpdate = originalInstall
 		restartAfterSystemUpdate = originalRestart
+		systemUpdateRestartTimeout = originalRestartTimeout
 		systemUpdateInProgress.Store(false)
 	})
 	systemUpdateInProgress.Store(false)
 	system.InstallationType = "native"
+	systemUpdateRestartTimeout = 50 * time.Millisecond
 
 	directory := t.TempDir()
 	executable := filepath.Join(directory, "agent")
@@ -264,18 +296,19 @@ func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
 	if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	installSystemUpdate = func(context.Context, string) (*system.InstalledUpdate, error) {
+	installSystemUpdate = func(ctx context.Context, _ string, _ string) (*system.InstalledUpdate, error) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("install context inherited request cancellation: %v", err)
+		}
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
-	restartAfterSystemUpdate = system.RestartAfterUpdate
-
-	binDirectory := t.TempDir()
-	if err := os.WriteFile(filepath.Join(binDirectory, "systemd-run"), []byte("#!/bin/sh\nexec /bin/sleep 2\n"), 0o755); err != nil {
-		t.Fatal(err)
+	restartAfterSystemUpdate = func(ctx context.Context, _ *system.InstalledUpdate) error {
+		<-ctx.Done()
+		return ctx.Err()
 	}
-	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	requestContext, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
 	defer cancel()
 	recorder := httptest.NewRecorder()
 	engine := gin.New()
@@ -286,8 +319,8 @@ func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
 	started := time.Now()
 	engine.ServeHTTP(recorder, request)
 
-	if elapsed := time.Since(started); elapsed >= time.Second {
-		t.Fatalf("blocked restart ignored request deadline: %s", elapsed)
+	if elapsed := time.Since(started); elapsed < systemUpdateRestartTimeout || elapsed >= time.Second {
+		t.Fatalf("blocked restart did not use its detached timeout: %s", elapsed)
 	}
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("expected internal server error, got %d: %s", recorder.Code, recorder.Body.String())
@@ -343,5 +376,25 @@ func TestPostUpdateConfigurationRotatesCredentials(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected client credentials to be rotated")
+	}
+}
+
+func TestPostSystemUpdateReturnsBadRequestForInvalidVersion(t *testing.T) {
+	originalType := system.InstallationType
+	t.Cleanup(func() { system.InstallationType = originalType; systemUpdateInProgress.Store(false) })
+	system.InstallationType = "native"
+	systemUpdateInProgress.Store(false)
+	recorder := httptest.NewRecorder()
+	engine := gin.New()
+	engine.Use(middleware.CaptureErrors())
+	engine.POST("/api/system/update", postSystemUpdate)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.10.0/../../agent","channel":"beta"}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if systemUpdateInProgress.Load() {
+		t.Fatal("invalid version retained the update lock")
 	}
 }

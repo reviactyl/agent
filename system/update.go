@@ -18,7 +18,11 @@ import (
 	"time"
 )
 
+var ErrInvalidUpdateRequest = errors.New("invalid Agent update request")
+
 const maxAgentBinarySize = 128 << 20
+
+var previewVersionPattern = regexp.MustCompile(`(?i)^[0-9]+\.[0-9]+\.[0-9]+-(?:beta|rc)[0-9]*(?:\.[0-9]+)*$`)
 
 var releaseVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 
@@ -49,9 +53,15 @@ func NewUpdater() *Updater {
 	}
 }
 
-func (u *Updater) Install(ctx context.Context, version string) (*InstalledUpdate, error) {
+func (u *Updater) Install(ctx context.Context, version string, channel string) (*InstalledUpdate, error) {
+	if channel == "" {
+		channel = "stable"
+	}
+	if channel != "stable" && channel != "beta" {
+		return nil, fmt.Errorf("%w: invalid Agent release channel", ErrInvalidUpdateRequest)
+	}
 	if !releaseVersionPattern.MatchString(version) {
-		return nil, errors.New("invalid Agent release version")
+		return nil, fmt.Errorf("%w: invalid Agent release version", ErrInvalidUpdateRequest)
 	}
 	if u.GOOS != "linux" {
 		return nil, fmt.Errorf("automatic Agent updates are unsupported on %s", u.GOOS)
@@ -75,7 +85,7 @@ func (u *Updater) Install(ctx context.Context, version string) (*InstalledUpdate
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	expectedDigest, err := u.releaseDigest(ctx, version)
+	expectedDigest, err := u.releaseDigest(ctx, version, channel)
 	if err != nil {
 		temporary.Close()
 		return nil, err
@@ -153,7 +163,7 @@ func (u *Updater) Install(ctx context.Context, version string) (*InstalledUpdate
 	return &InstalledUpdate{ExecutablePath: executable, BackupPath: backupPath}, nil
 }
 
-func (u *Updater) releaseDigest(ctx context.Context, version string) (string, error) {
+func (u *Updater) releaseDigest(ctx context.Context, version string, channel string) (string, error) {
 	url := fmt.Sprintf("%s/v%s", strings.TrimRight(u.ReleaseMetadataURL, "/"), version)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -172,8 +182,10 @@ func (u *Updater) releaseDigest(ctx context.Context, version string) (string, er
 	}
 
 	var metadata struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
+		TagName    string `json:"tag_name"`
+		Draft      bool   `json:"draft"`
+		Prerelease bool   `json:"prerelease"`
+		Assets     []struct {
 			Name   string `json:"name"`
 			Digest string `json:"digest"`
 		} `json:"assets"`
@@ -183,6 +195,17 @@ func (u *Updater) releaseDigest(ctx context.Context, version string) (string, er
 	}
 	if metadata.TagName != "v"+version {
 		return "", errors.New("Agent release metadata returned an unexpected version")
+	}
+	if metadata.Draft {
+		return "", errors.New("cannot install a draft Agent release")
+	}
+	versionWithoutMetadata, _, _ := strings.Cut(version, "+")
+	preview := strings.Contains(versionWithoutMetadata, "-")
+	if channel == "stable" && (metadata.Prerelease || preview) {
+		return "", fmt.Errorf("%w: preview Agent releases require the beta channel", ErrInvalidUpdateRequest)
+	}
+	if preview && !previewVersionPattern.MatchString(versionWithoutMetadata) {
+		return "", fmt.Errorf("%w: unsupported Agent preview release", ErrInvalidUpdateRequest)
 	}
 	expectedAsset := "agent_linux_" + u.GOARCH
 	for _, asset := range metadata.Assets {
@@ -247,6 +270,12 @@ fi`
 		"agent-update", update.ExecutablePath, update.BackupPath,
 	)
 	if output, err := command.CombinedOutput(); err != nil {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		cleanupOutput, cleanupErr := exec.CommandContext(cleanupContext, "systemctl", "stop", unit).CombinedOutput()
+		if cleanupErr != nil {
+			return fmt.Errorf("start Agent update supervisor: %w: %s (stop supervisor: %v: %s)", err, strings.TrimSpace(string(output)), cleanupErr, strings.TrimSpace(string(cleanupOutput)))
+		}
 		return fmt.Errorf("start Agent update supervisor: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 
