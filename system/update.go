@@ -242,9 +242,11 @@ func fileSHA256(path string) (string, error) {
 // restores the previous binary when the new service does not become active.
 // The separate unit is important: a child process left in agent.service's
 // cgroup would normally be killed by the restart it is meant to supervise.
-func RestartAfterUpdate(ctx context.Context, update *InstalledUpdate) error {
+// rollbackSafe is false when the transient unit could not be stopped and may
+// still execute the update script against the installed binary.
+func RestartAfterUpdate(ctx context.Context, update *InstalledUpdate) (rollbackSafe bool, err error) {
 	if update == nil {
-		return errors.New("missing installed Agent update")
+		return true, errors.New("missing installed Agent update")
 	}
 
 	script := `sleep 2
@@ -274,12 +276,12 @@ fi`
 		defer cleanupCancel()
 		cleanupOutput, cleanupErr := exec.CommandContext(cleanupContext, "systemctl", "stop", unit).CombinedOutput()
 		if cleanupErr != nil {
-			return fmt.Errorf("start Agent update supervisor: %w: %s (stop supervisor: %v: %s)", err, strings.TrimSpace(string(output)), cleanupErr, strings.TrimSpace(string(cleanupOutput)))
+			return false, fmt.Errorf("start Agent update supervisor: %w: %s (stop supervisor: %v: %s)", err, strings.TrimSpace(string(output)), cleanupErr, strings.TrimSpace(string(cleanupOutput)))
 		}
-		return fmt.Errorf("start Agent update supervisor: %w: %s", err, strings.TrimSpace(string(output)))
+		return true, fmt.Errorf("start Agent update supervisor: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 
-	return nil
+	return true, nil
 }
 
 func RollbackInstalledUpdate(update *InstalledUpdate) error {

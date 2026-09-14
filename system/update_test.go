@@ -164,7 +164,7 @@ func TestRestartAfterUpdateHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	err := RestartAfterUpdate(ctx, &InstalledUpdate{ExecutablePath: "/agent", BackupPath: "/agent.update-backup"})
+	_, err := RestartAfterUpdate(ctx, &InstalledUpdate{ExecutablePath: "/agent", BackupPath: "/agent.update-backup"})
 
 	if err == nil {
 		t.Fatal("expected blocked systemd-run to fail when the context expired")
@@ -304,9 +304,12 @@ func TestRestartAfterUpdateStopsSupervisorWhenLaunchFails(t *testing.T) {
 			t.Setenv("UPDATER_TEST_LOG", logPath)
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
-			err := RestartAfterUpdate(ctx, &InstalledUpdate{ExecutablePath: "/unused/agent", BackupPath: "/unused/backup"})
+			rollbackSafe, err := RestartAfterUpdate(ctx, &InstalledUpdate{ExecutablePath: "/unused/agent", BackupPath: "/unused/backup"})
 			if err == nil {
 				t.Fatal("expected launch failure")
+			}
+			if !rollbackSafe {
+				t.Fatal("expected successful supervisor cleanup to allow rollback")
 			}
 			if !timeout && !strings.Contains(err.Error(), "launcher failed after starting unit") {
 				t.Fatalf("lost original error: %v", err)
@@ -319,5 +322,27 @@ func TestRestartAfterUpdateStopsSupervisorWhenLaunchFails(t *testing.T) {
 				t.Fatalf("wrong supervisor stopped: %q", stopped)
 			}
 		})
+	}
+}
+
+func TestRestartAfterUpdatePreventsRollbackWhenSupervisorCleanupFails(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "systemd-run"), []byte("#!/bin/sh\necho 'launcher failed after starting unit' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "systemctl"), []byte("#!/bin/sh\necho 'cleanup failed' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	rollbackSafe, err := RestartAfterUpdate(context.Background(), &InstalledUpdate{ExecutablePath: "/unused/agent", BackupPath: "/unused/backup"})
+	if err == nil {
+		t.Fatal("expected launch and cleanup failure")
+	}
+	if rollbackSafe {
+		t.Fatal("rollback was reported safe while the supervisor could still be running")
+	}
+	if !strings.Contains(err.Error(), "stop supervisor") || !strings.Contains(err.Error(), "cleanup failed") {
+		t.Fatalf("missing supervisor cleanup failure: %v", err)
 	}
 }

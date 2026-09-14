@@ -159,13 +159,13 @@ func TestPostSystemUpdateInstallsBeforeSchedulingRestart(t *testing.T) {
 		return installed, nil
 	}
 	restarted := make(chan *system.InstalledUpdate, 1)
-	restartAfterSystemUpdate = func(ctx context.Context, update *system.InstalledUpdate) error {
+	restartAfterSystemUpdate = func(ctx context.Context, update *system.InstalledUpdate) (bool, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > systemUpdateRestartTimeout {
 			t.Fatalf("unexpected restart deadline: %v", deadline)
 		}
 		restarted <- update
-		return nil
+		return true, nil
 	}
 
 	recorder := httptest.NewRecorder()
@@ -241,8 +241,8 @@ func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
-	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) error {
-		return errors.New("systemd unavailable")
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+		return true, errors.New("systemd unavailable")
 	}
 
 	recorder := httptest.NewRecorder()
@@ -268,6 +268,59 @@ func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	}
 	if systemUpdateInProgress.Load() {
 		t.Fatal("update lock remained set after rollback")
+	}
+}
+
+func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T) {
+	originalType := system.InstallationType
+	originalInstall := installSystemUpdate
+	originalRestart := restartAfterSystemUpdate
+	t.Cleanup(func() {
+		system.InstallationType = originalType
+		installSystemUpdate = originalInstall
+		restartAfterSystemUpdate = originalRestart
+		systemUpdateInProgress.Store(false)
+	})
+	systemUpdateInProgress.Store(false)
+	system.InstallationType = "native"
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "agent")
+	backup := executable + ".update-backup"
+	if err := os.WriteFile(executable, []byte("new agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
+		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
+	}
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+		return false, errors.New("systemd unavailable and supervisor cleanup failed")
+	}
+	recorder := httptest.NewRecorder()
+	engine := gin.New()
+	engine.Use(middleware.CaptureErrors())
+	engine.POST("/api/system/update", postSystemUpdate)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error, got %d", recorder.Code)
+	}
+	current, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != "new agent" {
+		t.Fatalf("expected new Agent binary to remain installed, got %q", current)
+	}
+	if previous, err := os.ReadFile(backup); err != nil || string(previous) != "old agent" {
+		t.Fatalf("expected recovery backup to remain available, got %q, %v", previous, err)
+	}
+	if !systemUpdateInProgress.Load() {
+		t.Fatal("update lock was released while the supervisor state remained unknown")
 	}
 }
 
@@ -302,9 +355,9 @@ func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
 		}
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
-	restartAfterSystemUpdate = func(ctx context.Context, _ *system.InstalledUpdate) error {
+	restartAfterSystemUpdate = func(ctx context.Context, _ *system.InstalledUpdate) (bool, error) {
 		<-ctx.Done()
-		return ctx.Err()
+		return true, ctx.Err()
 	}
 
 	requestContext, cancel := context.WithCancel(context.Background())

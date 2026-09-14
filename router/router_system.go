@@ -113,11 +113,14 @@ func postSystemUpdate(c *gin.Context) {
 
 	restartContext, restartCancel := context.WithTimeout(operationContext, systemUpdateRestartTimeout)
 	defer restartCancel()
-	if err := restartAfterSystemUpdate(restartContext, installed); err != nil {
-		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
-			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+	rollbackSafe, err := restartAfterSystemUpdate(restartContext, installed)
+	if err != nil {
+		if rollbackSafe {
+			if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
+				err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+			}
+			systemUpdateInProgress.Store(false)
 		}
-		systemUpdateInProgress.Store(false)
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
