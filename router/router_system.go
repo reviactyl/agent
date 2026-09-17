@@ -3,8 +3,11 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
@@ -18,8 +21,10 @@ import (
 )
 
 // Returns information about the system that agent is running on.
+var readSystemInformation = system.GetSystemInformation
+
 func getSystemInformation(c *gin.Context) {
-	i, err := system.GetSystemInformation()
+	i, err := readSystemInformation()
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -31,17 +36,105 @@ func getSystemInformation(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, struct {
-		Architecture  string `json:"architecture"`
-		CPUCount      int    `json:"cpu_count"`
-		KernelVersion string `json:"kernel_version"`
-		OS            string `json:"os"`
-		Version       string `json:"version"`
+		Architecture     string `json:"architecture"`
+		CPUCount         int    `json:"cpu_count"`
+		KernelVersion    string `json:"kernel_version"`
+		OS               string `json:"os"`
+		Version          string `json:"version"`
+		InstallationType string `json:"installation_type"`
 	}{
-		Architecture:  i.System.Architecture,
-		CPUCount:      i.System.CPUThreads,
-		KernelVersion: i.System.KernelVersion,
-		OS:            i.System.OSType,
-		Version:       i.Version,
+		Architecture:     i.System.Architecture,
+		CPUCount:         i.System.CPUThreads,
+		KernelVersion:    i.System.KernelVersion,
+		OS:               i.System.OSType,
+		Version:          i.Version,
+		InstallationType: i.InstallationType,
+	})
+}
+
+type postSystemUpdateRequest struct {
+	Version string `json:"version" binding:"required"`
+	Channel string `json:"channel" binding:"omitempty,oneof=stable beta"`
+}
+
+type postSystemUpdateResponse struct {
+	Version string `json:"version"`
+	Status  string `json:"status"`
+}
+
+var installSystemUpdate = func(ctx context.Context, version string, channel string) (*system.InstalledUpdate, error) {
+	return system.NewUpdater().Install(ctx, version, channel)
+}
+
+var restartAfterSystemUpdate = system.RestartAfterUpdate
+
+var systemUpdateInProgress atomic.Bool
+
+var systemUpdateTimeout = 2 * time.Minute
+
+var systemUpdateRestartTimeout = 20 * time.Second
+
+var systemUpdateLockRelease = 5 * time.Minute
+
+var scheduleSystemUpdateLockRelease = time.AfterFunc
+
+func postSystemUpdate(c *gin.Context) {
+	if system.InstallationType != "native" {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "automatic updates are only available for native Agent installations",
+		})
+		return
+	}
+	var request postSystemUpdateRequest
+	if err := c.BindJSON(&request); err != nil {
+		return
+	}
+
+	if !systemUpdateInProgress.CompareAndSwap(false, true) {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "an Agent update is already in progress",
+		})
+		return
+	}
+
+	operationContext := context.Background()
+	ctx, cancel := context.WithTimeout(operationContext, systemUpdateTimeout)
+	defer cancel()
+	installed, err := installSystemUpdate(ctx, request.Version, request.Channel)
+	if err != nil {
+		systemUpdateInProgress.Store(false)
+		if errors.Is(err, system.ErrInvalidUpdateRequest) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	restartContext, restartCancel := context.WithTimeout(operationContext, systemUpdateRestartTimeout)
+	defer restartCancel()
+	rollbackSafe, err := restartAfterSystemUpdate(restartContext, installed)
+	if err != nil {
+		if rollbackSafe {
+			if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
+				err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+			}
+			systemUpdateInProgress.Store(false)
+		}
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	// The transient supervisor should replace this process almost immediately.
+	// Release the guard if that never happens so a failed restart cannot block
+	// future update attempts until the Agent is restarted manually.
+	scheduleSystemUpdateLockRelease(systemUpdateLockRelease, func() {
+		systemUpdateInProgress.Store(false)
+	})
+
+	c.JSON(http.StatusAccepted, postSystemUpdateResponse{
+		Version: request.Version,
+		Status:  "restarting",
 	})
 }
 
