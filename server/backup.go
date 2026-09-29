@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 
 	"emperror.dev/errors"
@@ -11,6 +12,7 @@ import (
 	"github.com/docker/docker/client"
 
 	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/internal/ufs"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/server/backup"
 )
@@ -151,9 +153,35 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
-	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
+	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, linkTarget string, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if linkTarget == "" {
+				target, err := io.ReadAll(io.LimitReader(r, 4097))
+				if err != nil || len(target) > 4096 {
+					return errors.New("backup: invalid symlink target")
+				}
+				linkTarget = string(target)
+			}
+			if len(linkTarget) > 4096 {
+				return errors.New("backup: invalid symlink target")
+			}
+			if err := s.Filesystem().CreateDirectory("", filepath.Dir(file)); err != nil {
+				return err
+			}
+			if existing, err := s.Filesystem().UnixFS().Lstat(file); err == nil {
+				if existing.IsDir() {
+					return errors.New("backup: cannot replace directory with symlink")
+				}
+				if err := s.Filesystem().Delete(file); err != nil {
+					return err
+				}
+			} else if !errors.Is(err, ufs.ErrNotExist) {
+				return err
+			}
+			return s.Filesystem().Symlink(linkTarget, file)
+		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.

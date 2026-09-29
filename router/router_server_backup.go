@@ -44,6 +44,7 @@ func postServerBackup(c *gin.Context) {
 		Adapter backup.AdapterType `json:"adapter"`
 		Uuid    string             `json:"uuid"`
 		Ignore  string             `json:"ignore"`
+		Format  string             `json:"format"`
 	}
 	if err := c.BindJSON(&data); err != nil {
 		return
@@ -52,13 +53,20 @@ func postServerBackup(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if data.Format == "" {
+		data.Format = "tar.gz"
+	}
+	if data.Format != "tar.gz" && data.Format != "zip" {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "Unsupported backup format."})
+		return
+	}
 
 	var adapter backup.BackupInterface
 	switch data.Adapter {
 	case backup.LocalBackupAdapter:
-		adapter = backup.NewLocal(client, backupUuid, data.Ignore)
+		adapter = backup.NewLocal(client, backupUuid, data.Ignore, data.Format)
 	case backup.S3BackupAdapter:
-		adapter = backup.NewS3(client, backupUuid, data.Ignore)
+		adapter = backup.NewS3(client, backupUuid, data.Ignore, data.Format)
 	default:
 		middleware.CaptureAndAbort(c, errors.New("router/backups: provided adapter is not valid: "+string(data.Adapter)))
 		return
@@ -100,12 +108,21 @@ func postServerRestoreBackup(c *gin.Context) {
 		// A UUID is always required for this endpoint, however the download URL
 		// is only present when the given adapter type is s3.
 		DownloadUrl string `json:"download_url"`
+		Format      string `json:"format"`
 	}
 	if err := c.BindJSON(&data); err != nil {
 		return
 	}
 	backupUuid, ok := parseBackupUuid(c, c.Param("backup"))
 	if !ok {
+		return
+	}
+	requestedFormat := data.Format
+	if data.Format == "" {
+		data.Format = "tar.gz"
+	}
+	if data.Format != "tar.gz" && data.Format != "zip" {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "Unsupported backup format."})
 		return
 	}
 	if data.Adapter == backup.S3BackupAdapter && data.DownloadUrl == "" {
@@ -141,7 +158,13 @@ func postServerRestoreBackup(c *gin.Context) {
 	// Now that we've cleaned up the data directory if necessary, grab the backup file
 	// and attempt to restore it into the server directory.
 	if data.Adapter == backup.LocalBackupAdapter {
-		b, _, err := backup.LocateLocal(client, backupUuid)
+		var b *backup.LocalBackup
+		var err error
+		if requestedFormat == "" {
+			b, _, err = backup.LocateLocal(client, backupUuid)
+		} else {
+			b, _, err = backup.LocateLocal(client, backupUuid, requestedFormat)
+		}
 		if err != nil {
 			middleware.CaptureAndAbort(c, err)
 			return
@@ -192,17 +215,17 @@ func postServerRestoreBackup(c *gin.Context) {
 		return
 	}
 	// Don't allow content types that we know are going to give us problems.
-	if !isSupportedBackupRestoreContentType(res.Header.Get("Content-Type")) {
+	if !isSupportedBackupRestoreContentType(res.Header.Get("Content-Type"), data.Format) {
 		_ = res.Body.Close()
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "The provided backup link is not a supported content type. \"" + res.Header.Get("Content-Type") + "\" is not application/x-gzip.",
+			"error": "The provided backup link is not a supported gzip or ZIP content type: " + res.Header.Get("Content-Type"),
 		})
 		return
 	}
 
 	go func(s *server.Server, uuid string, logger *log.Entry) {
 		logger.Info("starting restoration process for server backup using S3 driver")
-		if err := s.RestoreBackup(backup.NewS3(client, uuid, ""), res.Body); err != nil {
+		if err := s.RestoreBackup(backup.NewS3(client, uuid, "", data.Format), res.Body); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 		}
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
@@ -224,7 +247,18 @@ func deleteServerBackup(c *gin.Context) {
 	if !ok {
 		return
 	}
-	b, _, err := backup.LocateLocal(middleware.ExtractApiClient(c), backupUuid)
+	format := c.Query("format")
+	if format != "" && format != "tar.gz" && format != "zip" {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "Unsupported backup format."})
+		return
+	}
+	var b *backup.LocalBackup
+	var err error
+	if format == "" {
+		b, _, err = backup.LocateLocal(middleware.ExtractApiClient(c), backupUuid)
+	} else {
+		b, _, err = backup.LocateLocal(middleware.ExtractApiClient(c), backupUuid, format)
+	}
 	if err != nil {
 		// Just return from the function at this point if the backup was not located.
 		if errors.Is(err, os.ErrNotExist) {
@@ -356,14 +390,16 @@ func isAllowedBackupRestoreDestination(host string, addr netip.Addr) bool {
 	return false
 }
 
-func isSupportedBackupRestoreContentType(value string) bool {
+func isSupportedBackupRestoreContentType(value string, format string) bool {
 	mediaType, _, err := mime.ParseMediaType(value)
 	if err != nil {
 		mediaType = strings.TrimSpace(value)
 	}
 	switch strings.ToLower(mediaType) {
 	case "application/x-gzip", "application/gzip":
-		return true
+		return format == "tar.gz"
+	case "application/zip", "application/x-zip-compressed":
+		return format == "zip"
 	default:
 		return false
 	}

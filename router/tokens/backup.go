@@ -11,6 +11,7 @@ type BackupPayload struct {
 	ServerUuid string `json:"server_uuid"`
 	UserUuid   string `json:"user_uuid"`
 	BackupUuid string `json:"backup_uuid"`
+	Format     string `json:"format"`
 	UniqueId   string `json:"unique_id"`
 }
 
