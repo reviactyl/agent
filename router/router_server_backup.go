@@ -398,7 +398,7 @@ func isSupportedBackupRestoreContentType(value string, format string) bool {
 	switch strings.ToLower(mediaType) {
 	case "application/x-gzip", "application/gzip":
 		return format == "tar.gz"
-	case "application/zip", "application/x-zip-compressed":
+	case "application/zip", "application/x-zip-compressed", "application/x-zip":
 		return format == "zip"
 	default:
 		return false

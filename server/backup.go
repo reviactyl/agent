@@ -5,6 +5,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"time"
 
 	"emperror.dev/errors"
@@ -153,6 +155,13 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
+	type restoredDirectory struct {
+		path    string
+		mode    fs.FileMode
+		modTime time.Time
+	}
+	var directoryMu sync.Mutex
+	var directories []restoredDirectory
 	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, linkTarget string, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
@@ -182,6 +191,17 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			}
 			return s.Filesystem().Symlink(linkTarget, file)
 		}
+		if info.IsDir() {
+			if err := s.Filesystem().CreateDirectory("", file); err != nil {
+				return err
+			}
+			directoryMu.Lock()
+			// Restore rwx permissions without reintroducing special privilege bits
+			// from an archive supplied by the backup source.
+			directories = append(directories, restoredDirectory{file, info.Mode().Perm(), info.ModTime()})
+			directoryMu.Unlock()
+			return nil
+		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
@@ -191,6 +211,22 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		atime := info.ModTime()
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
+	if err != nil {
+		return errors.WithStackIf(err)
+	}
+	// Apply directory metadata after its children so extraction does not reset the
+	// timestamp or fail while writing into a read-only directory.
+	sort.Slice(directories, func(i, j int) bool {
+		return len(directories[i].path) > len(directories[j].path)
+	})
+	for _, directory := range directories {
+		if err = s.Filesystem().Chtimes(directory.path, directory.modTime, directory.modTime); err != nil {
+			return errors.WithStackIf(err)
+		}
+		if err = s.Filesystem().Chmod(directory.path, directory.mode); err != nil {
+			return errors.WithStackIf(err)
+		}
+	}
 
-	return errors.WithStackIf(err)
+	return nil
 }

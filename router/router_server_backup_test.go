@@ -250,6 +250,9 @@ func TestBackupRestoreContentTypeValidation(t *testing.T) {
 	if !isSupportedBackupRestoreContentType("application/zip", "zip") || isSupportedBackupRestoreContentType("application/zip", "tar.gz") {
 		t.Fatal("ZIP content type must only be accepted for ZIP backups")
 	}
+	if !isSupportedBackupRestoreContentType("application/x-zip", "zip") {
+		t.Fatal("application/x-zip must be accepted for ZIP backups")
+	}
 }
 
 func TestParseBackupUuid(t *testing.T) {
