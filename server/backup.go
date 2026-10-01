@@ -4,6 +4,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"sort"
+	"sync"
 	"time"
 
 	"emperror.dev/errors"
@@ -11,6 +14,7 @@ import (
 	"github.com/docker/docker/client"
 
 	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/internal/ufs"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/server/backup"
 )
@@ -151,9 +155,53 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
-	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
+	type restoredDirectory struct {
+		path    string
+		mode    fs.FileMode
+		modTime time.Time
+	}
+	var directoryMu sync.Mutex
+	var directories []restoredDirectory
+	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, linkTarget string, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if linkTarget == "" {
+				target, err := io.ReadAll(io.LimitReader(r, 4097))
+				if err != nil || len(target) > 4096 {
+					return errors.New("backup: invalid symlink target")
+				}
+				linkTarget = string(target)
+			}
+			if len(linkTarget) > 4096 {
+				return errors.New("backup: invalid symlink target")
+			}
+			if err := s.Filesystem().CreateDirectory("", filepath.Dir(file)); err != nil {
+				return err
+			}
+			if existing, err := s.Filesystem().UnixFS().Lstat(file); err == nil {
+				if existing.IsDir() {
+					return errors.New("backup: cannot replace directory with symlink")
+				}
+				if err := s.Filesystem().Delete(file); err != nil {
+					return err
+				}
+			} else if !errors.Is(err, ufs.ErrNotExist) {
+				return err
+			}
+			return s.Filesystem().Symlink(linkTarget, file)
+		}
+		if info.IsDir() {
+			if err := s.Filesystem().CreateDirectory("", file); err != nil {
+				return err
+			}
+			directoryMu.Lock()
+			// Restore rwx permissions without reintroducing special privilege bits
+			// from an archive supplied by the backup source.
+			directories = append(directories, restoredDirectory{file, info.Mode().Perm(), info.ModTime()})
+			directoryMu.Unlock()
+			return nil
+		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
@@ -163,6 +211,22 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		atime := info.ModTime()
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
+	if err != nil {
+		return errors.WithStackIf(err)
+	}
+	// Apply directory metadata after its children so extraction does not reset the
+	// timestamp or fail while writing into a read-only directory.
+	sort.Slice(directories, func(i, j int) bool {
+		return len(directories[i].path) > len(directories[j].path)
+	})
+	for _, directory := range directories {
+		if err = s.Filesystem().Chtimes(directory.path, directory.modTime, directory.modTime); err != nil {
+			return errors.WithStackIf(err)
+		}
+		if err = s.Filesystem().Chmod(directory.path, directory.mode); err != nil {
+			return errors.WithStackIf(err)
+		}
+	}
 
-	return errors.WithStackIf(err)
+	return nil
 }

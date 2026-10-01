@@ -20,12 +20,17 @@ type LocalBackup struct {
 
 var _ BackupInterface = (*LocalBackup)(nil)
 
-func NewLocal(client remote.Client, uuid string, ignore string) *LocalBackup {
+func NewLocal(client remote.Client, uuid string, ignore string, archiveFormat ...string) *LocalBackup {
+	selectedFormat := "tar.gz"
+	if len(archiveFormat) > 0 {
+		selectedFormat = archiveFormat[0]
+	}
 	return &LocalBackup{
 		Backup{
 			client:  client,
 			Uuid:    uuid,
 			Ignore:  ignore,
+			Format:  selectedFormat,
 			adapter: LocalBackupAdapter,
 		},
 	}
@@ -33,12 +38,16 @@ func NewLocal(client remote.Client, uuid string, ignore string) *LocalBackup {
 
 // LocateLocal finds the backup for a server and returns the local path. This
 // will obviously only work if the backup was created as a local backup.
-func LocateLocal(client remote.Client, uuid string) (*LocalBackup, os.FileInfo, error) {
-	b := NewLocal(client, uuid, "")
+func LocateLocal(client remote.Client, uuid string, archiveFormat ...string) (*LocalBackup, os.FileInfo, error) {
+	b := NewLocal(client, uuid, "", archiveFormat...)
 	if err := b.validateIdentifier(); err != nil {
 		return nil, nil, err
 	}
 	st, err := os.Stat(b.Path())
+	if errors.Is(err, os.ErrNotExist) && len(archiveFormat) == 0 {
+		b.Format = "zip"
+		st, err = os.Stat(b.Path())
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -72,6 +81,7 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 	a := &filesystem.Archive{
 		Filesystem: fsys,
 		Ignore:     ignore,
+		Format:     b.Format,
 	}
 
 	b.log().WithField("path", b.Path()).Info("creating backup for server")
@@ -100,19 +110,32 @@ func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback Restore
 	defer f.Close()
 
 	var reader io.Reader = f
+	var zipLimiter *ratelimit.Bucket
 	// Steal the logic we use for making backups which will be applied when restoring
 	// this specific backup. This allows us to prevent overloading the disk unintentionally.
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
-		reader = ratelimit.Reader(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+		limiter := ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit)
+		if b.Format == "zip" {
+			zipLimiter = limiter
+		} else {
+			reader = ratelimit.Reader(f, limiter)
+		}
 	}
-	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+	if err := b.archiveFormat().Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err
 		}
 		defer r.Close()
+		var callbackReader io.ReadCloser = r
+		if zipLimiter != nil {
+			callbackReader = struct {
+				io.Reader
+				io.Closer
+			}{ratelimit.Reader(r, zipLimiter), r}
+		}
 
-		return callback(f.NameInArchive, f.FileInfo, r)
+		return callback(f.NameInArchive, f.FileInfo, f.LinkTarget, callbackReader)
 	}); err != nil {
 		return err
 	}

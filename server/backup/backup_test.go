@@ -1,8 +1,13 @@
 package backup
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +16,87 @@ import (
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/server/filesystem"
 )
+
+func TestTarBackupRestorePreservesSymlinkTarget(t *testing.T) {
+	config.Set(&config.Configuration{AuthenticationToken: "test"})
+	var archive bytes.Buffer
+	gzipWriter := gzip.NewWriter(&archive)
+	tarWriter := tar.NewWriter(gzipWriter)
+	if err := tarWriter.WriteHeader(&tar.Header{Name: "link.txt", Typeflag: tar.TypeSymlink, Linkname: "file.txt", Mode: 0o777}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := NewS3(nil, "00000000-0000-0000-0000-000000000001", "")
+	var target string
+	if err := b.Restore(context.Background(), bytes.NewReader(archive.Bytes()), func(_ string, _ fs.FileInfo, linkTarget string, _ io.ReadCloser) error {
+		target = linkTarget
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if target != "file.txt" {
+		t.Fatalf("tar symlink target is %q", target)
+	}
+}
+
+func TestZipBackupRestore(t *testing.T) {
+	configuration := &config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: t.TempDir()}}
+	configuration.System.Backups.WriteLimit = 1
+	config.Set(configuration)
+	var archive bytes.Buffer
+	writer := zip.NewWriter(&archive)
+	file, err := writer.Create("nested/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("restored")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := NewS3(nil, "00000000-0000-0000-0000-000000000001", "", "zip")
+	var name, content string
+	err = b.Restore(context.Background(), io.NopCloser(bytes.NewReader(archive.Bytes())), func(file string, _ fs.FileInfo, _ string, reader io.ReadCloser) error {
+		name = file
+		data, err := io.ReadAll(reader)
+		content = string(data)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "nested/file.txt" || content != "restored" {
+		t.Fatalf("restored %q with %q", name, content)
+	}
+	local := NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", "zip")
+	if err := os.WriteFile(local.Path(), archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(NewLocal(nil, local.Uuid, "").Path(), []byte("old tar archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected, _, err := LocateLocal(nil, local.Uuid, "zip")
+	if err != nil || selected.Path() != local.Path() {
+		t.Fatalf("explicit ZIP lookup selected %v: %v", selected, err)
+	}
+	content = ""
+	if err := local.Restore(context.Background(), nil, func(_ string, _ fs.FileInfo, _ string, reader io.ReadCloser) error {
+		data, err := io.ReadAll(reader)
+		content = string(data)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if content != "restored" {
+		t.Fatalf("local ZIP restore produced %q", content)
+	}
+}
 
 func TestBackupGenerateRequiresUuidIdentifier(t *testing.T) {
 	tests := map[string]func(string) BackupInterface{

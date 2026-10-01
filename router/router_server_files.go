@@ -418,6 +418,7 @@ func postServerCompressFiles(c *gin.Context) {
 	var data struct {
 		RootPath string   `json:"root"`
 		Files    []string `json:"files"`
+		Format   string   `json:"format"`
 	}
 
 	if err := c.BindJSON(&data); err != nil {
@@ -430,6 +431,13 @@ func postServerCompressFiles(c *gin.Context) {
 		})
 		return
 	}
+	if data.Format == "" {
+		data.Format = "tar.gz"
+	}
+	if data.Format != "tar.gz" && data.Format != "zip" {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "Unsupported archive format."})
+		return
+	}
 
 	if !s.Filesystem().HasSpaceAvailable(true) {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
@@ -438,15 +446,19 @@ func postServerCompressFiles(c *gin.Context) {
 		return
 	}
 
-	f, err := s.Filesystem().CompressFiles(data.RootPath, data.Files)
+	f, err := s.Filesystem().CompressFiles(data.RootPath, data.Files, data.Format)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
 
+	mimetype := "application/tar+gzip"
+	if data.Format == "zip" {
+		mimetype = "application/zip"
+	}
 	c.JSON(http.StatusOK, &filesystem.Stat{
 		FileInfo: f,
-		Mimetype: "application/tar+gzip",
+		Mimetype: mimetype,
 	})
 }
 

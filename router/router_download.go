@@ -43,7 +43,18 @@ func getDownloadBackup(c *gin.Context) {
 	}
 
 	// Locate the backup on the local disk.
-	b, st, err := backup.LocateLocal(client, token.BackupUuid)
+	if token.Format != "" && token.Format != "tar.gz" && token.Format != "zip" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Unsupported backup format."})
+		return
+	}
+	var b *backup.LocalBackup
+	var st os.FileInfo
+	var err error
+	if token.Format == "" {
+		b, st, err = backup.LocateLocal(client, token.BackupUuid)
+	} else {
+		b, st, err = backup.LocateLocal(client, token.BackupUuid, token.Format)
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
