@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -150,8 +151,7 @@ func (s *Server) Context() context.Context {
 // server instance.
 func (s *Server) GetEnvironmentVariables() []string {
 	out := []string{
-		// TODO: allow this to be overridden by the user.
-		fmt.Sprintf("TZ=%s", config.Get().System.Timezone),
+		fmt.Sprintf("TZ=%s", s.timezone()),
 		fmt.Sprintf("STARTUP=%s", s.Config().Invocation),
 		fmt.Sprintf("SERVER_MEMORY=%d", s.MemoryLimit()),
 		fmt.Sprintf("SERVER_IP=%s", s.Config().Allocations.DefaultMapping.Ip),
@@ -171,6 +171,27 @@ eloop:
 	}
 
 	return out
+}
+
+func (s *Server) timezone() string {
+	for k := range s.Config().EnvVars {
+		if strings.ToUpper(k) != "TZ" {
+			continue
+		}
+
+		tz := s.Config().EnvVars.Get(k)
+		if tz == "" || tz == "Local" {
+			break
+		}
+		if _, err := time.LoadLocation(tz); err != nil {
+			s.Log().WithField("timezone", tz).Warn("server timezone could not be loaded, falling back to the system timezone")
+			break
+		}
+
+		return tz
+	}
+
+	return config.Get().System.Timezone
 }
 
 func (s *Server) Log() *log.Entry {
