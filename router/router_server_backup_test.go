@@ -243,9 +243,15 @@ func TestBackupRestoreContentTypeValidation(t *testing.T) {
 	}
 
 	for contentType, expected := range tests {
-		if got := isSupportedBackupRestoreContentType(contentType); got != expected {
+		if got := isSupportedBackupRestoreContentType(contentType, "tar.gz"); got != expected {
 			t.Fatalf("expected content type %q support to be %v, got %v", contentType, expected, got)
 		}
+	}
+	if !isSupportedBackupRestoreContentType("application/zip", "zip") || isSupportedBackupRestoreContentType("application/zip", "tar.gz") {
+		t.Fatal("ZIP content type must only be accepted for ZIP backups")
+	}
+	if !isSupportedBackupRestoreContentType("application/x-zip", "zip") {
+		t.Fatal("application/x-zip must be accepted for ZIP backups")
 	}
 }
 

@@ -36,7 +36,7 @@ const (
 
 // RestoreCallback is a generic restoration callback that exists for both local
 // and remote backups allowing the files to be restored.
-type RestoreCallback func(file string, info fs.FileInfo, r io.ReadCloser) error
+type RestoreCallback func(file string, info fs.FileInfo, linkTarget string, r io.ReadCloser) error
 
 // noinspection GoNameStartsWithPackageName
 type BackupInterface interface {
@@ -79,6 +79,7 @@ type Backup struct {
 	// An array of files to ignore when generating this backup. This should be
 	// compatible with a standard .gitignore structure.
 	Ignore string `json:"ignore"`
+	Format string `json:"format"`
 
 	client     remote.Client
 	adapter    AdapterType
@@ -116,7 +117,18 @@ func (b *Backup) Path() string {
 	if err != nil {
 		identifier = path.Base(b.Identifier())
 	}
-	return path.Join(config.Get().System.BackupDirectory, identifier+".tar.gz")
+	format := b.Format
+	if format != "zip" {
+		format = "tar.gz"
+	}
+	return path.Join(config.Get().System.BackupDirectory, identifier+"."+format)
+}
+
+func (b *Backup) archiveFormat() archives.Extractor {
+	if b.Format == "zip" {
+		return archives.Zip{}
+	}
+	return format
 }
 
 // Size returns the size of the generated backup.

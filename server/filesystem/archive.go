@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"context"
 	"io"
 	"io/fs"
@@ -15,6 +16,7 @@ import (
 	"github.com/juju/ratelimit"
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
+	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/internal/progress"
@@ -73,8 +75,11 @@ type Archive struct {
 
 	// Progress wraps the writer of the archive to pass through the progress tracker.
 	Progress *progress.Progress
+	// Format is "zip" or "tar.gz". An empty value keeps the legacy tar.gz format.
+	Format string
 
-	w *TarProgress
+	w  *TarProgress
+	zw *zip.Writer
 }
 
 // Create creates an archive at dst with all the files defined in the
@@ -108,7 +113,7 @@ func (a *Archive) Create(ctx context.Context, dst string) error {
 type walkFunc func(dirfd int, name, relative string, d ufs.DirEntry) error
 
 // Stream streams the creation of the archive to the given writer.
-func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
+func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 	if a.Filesystem == nil {
 		return errors.New("filesystem: archive.Filesystem is unset")
 	}
@@ -129,27 +134,40 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		a.Files = files
 	}
 
-	// Choose which compression level to use based on the compression_level configuration option
-	var compressionLevel int
-	switch config.Get().System.Backups.CompressionLevel {
-	case "none":
-		compressionLevel = pgzip.NoCompression
-	case "best_compression":
-		compressionLevel = pgzip.BestCompression
-	default:
-		compressionLevel = pgzip.BestSpeed
+	if a.Format == "zip" {
+		a.zw = zip.NewWriter(w)
+		defer func() {
+			if err := a.zw.Close(); streamErr == nil {
+				streamErr = err
+			}
+		}()
+	} else if a.Format != "" && a.Format != "tar.gz" {
+		return errors.New("filesystem: unsupported archive format")
 	}
 
-	// Create a new gzip writer around the file.
-	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
-	_ = gw.SetConcurrency(1<<20, 1)
-	defer gw.Close()
+	if a.zw == nil {
+		// Choose which compression level to use based on the compression_level configuration option
+		var compressionLevel int
+		switch config.Get().System.Backups.CompressionLevel {
+		case "none":
+			compressionLevel = pgzip.NoCompression
+		case "best_compression":
+			compressionLevel = pgzip.BestCompression
+		default:
+			compressionLevel = pgzip.BestSpeed
+		}
 
-	// Create a new tar writer around the gzip writer.
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
+		// Create a new gzip writer around the file.
+		gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
+		_ = gw.SetConcurrency(1<<20, 1)
+		defer gw.Close()
 
-	a.w = NewTarProgress(tw, a.Progress)
+		// Create a new tar writer around the gzip writer.
+		tw := tar.NewWriter(gw)
+		defer tw.Close()
+
+		a.w = NewTarProgress(tw, a.Progress)
+	}
 
 	fs := a.Filesystem.unixFS
 
@@ -273,6 +291,55 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 	// Error will come from tar#FileInfoHeader: "archive/tar: sockets not supported"
 	if s.Mode()&fs.ModeSocket != 0 {
 		return nil
+	}
+	if a.zw != nil {
+		if !s.Mode().IsRegular() && s.Mode()&fs.ModeSymlink == 0 {
+			return nil
+		}
+		header, err := zip.FileInfoHeader(s)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(relative)
+		header.Method = zip.Deflate
+		if s.Mode()&fs.ModeSymlink != 0 {
+			target := make([]byte, 4096)
+			n, err := unix.Readlinkat(dirfd, name, target)
+			if err != nil {
+				if errors.Is(err, unix.ENOENT) {
+					return nil
+				}
+				return err
+			}
+			if n == len(target) {
+				return errors.New("filesystem: symlink target is too long for ZIP archive")
+			}
+			writer, err := a.zw.CreateHeader(header)
+			if err != nil {
+				return err
+			}
+			_, err = writer.Write(target[:n])
+			return err
+		}
+		f, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
+		if err != nil {
+			if errors.Is(err, ufs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		defer f.Close()
+		writer, err := a.zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		var output io.Writer = writer
+		if a.Progress != nil {
+			a.Progress.Writer = writer
+			output = a.Progress
+		}
+		_, err = io.Copy(output, io.LimitReader(f, s.Size()))
+		return err
 	}
 
 	// Resolve the symlink target if the file is a symlink.

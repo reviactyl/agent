@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
+	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/remote"
@@ -25,12 +27,17 @@ type S3Backup struct {
 
 var _ BackupInterface = (*S3Backup)(nil)
 
-func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
+func NewS3(client remote.Client, uuid string, ignore string, archiveFormat ...string) *S3Backup {
+	selectedFormat := "tar.gz"
+	if len(archiveFormat) > 0 {
+		selectedFormat = archiveFormat[0]
+	}
 	return &S3Backup{
 		Backup{
 			client:  client,
 			Uuid:    uuid,
 			Ignore:  ignore,
+			Format:  selectedFormat,
 			adapter: S3BackupAdapter,
 		},
 	}
@@ -60,6 +67,7 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	a := &filesystem.Archive{
 		Filesystem: fsys,
 		Ignore:     ignore,
+		Format:     s.Format,
 	}
 
 	s.log().WithField("path", s.Path()).Info("creating backup for server")
@@ -94,19 +102,65 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 // on the machine when writing files to the disk.
 func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
 	reader := r
+	var zipLimiter *ratelimit.Bucket
 	// Steal the logic we use for making backups which will be applied when restoring
 	// this specific backup. This allows us to prevent overloading the disk unintentionally.
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
-		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+		limiter := ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit)
+		reader = ratelimit.Reader(r, limiter)
+		if s.Format == "zip" {
+			zipLimiter = ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit)
+		}
 	}
-	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+	if s.Format == "zip" {
+		file, err := os.CreateTemp(config.Get().System.BackupDirectory, "restore-*.zip")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(file.Name())
+		defer file.Close()
+		var disk unix.Statfs_t
+		if err := unix.Statfs(file.Name(), &disk); err != nil {
+			return err
+		}
+		const reserve = 100 << 20
+		if disk.Bsize <= 0 {
+			return errors.New("backup: cannot determine free space for ZIP restore")
+		}
+		maxBytes := int64(math.MaxInt64 - reserve)
+		if disk.Bavail <= uint64(math.MaxInt64)/uint64(disk.Bsize) {
+			maxBytes = int64(disk.Bavail*uint64(disk.Bsize)) - reserve
+		}
+		if maxBytes <= 0 {
+			return errors.New("backup: not enough free space for ZIP restore")
+		}
+		n, err := io.Copy(file, io.LimitReader(reader, maxBytes+1))
+		if err != nil {
+			return err
+		}
+		if n > maxBytes {
+			return errors.New("backup: ZIP restore exceeds available disk space")
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		reader = file
+	}
+	if err := s.archiveFormat().Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err
 		}
 		defer r.Close()
+		var callbackReader io.ReadCloser = r
+		if zipLimiter != nil {
+			callbackReader = struct {
+				io.Reader
+				io.Closer
+			}{ratelimit.Reader(r, zipLimiter), r}
+		}
 
-		return callback(f.NameInArchive, f.FileInfo, r)
+		return callback(f.NameInArchive, f.FileInfo, f.LinkTarget, callbackReader)
 	}); err != nil {
 		return err
 	}
