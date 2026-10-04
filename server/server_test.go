@@ -23,6 +23,8 @@ func TestEnvironmentVariablesTimezone(t *testing.T) {
 		{name: "uses the server timezone", vars: environment.Variables{"TZ": "America/New_York"}, want: "TZ=America/New_York"},
 		{name: "ignores an empty server timezone", vars: environment.Variables{"TZ": ""}, want: "TZ=Europe/London"},
 		{name: "ignores the local timezone", vars: environment.Variables{"TZ": "Local"}, want: "TZ=Europe/London"},
+		{name: "skips an empty key of another case", vars: environment.Variables{"TZ": "America/New_York", "tz": ""}, want: "TZ=America/New_York"},
+		{name: "prefers the uppercase key", vars: environment.Variables{"TZ": "America/New_York", "tz": "Asia/Tokyo"}, want: "TZ=America/New_York"},
 		{name: "ignores an unknown server timezone", vars: environment.Variables{"TZ": "Not/AZone"}, want: "TZ=Europe/London"},
 	}
 

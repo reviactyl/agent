@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -174,18 +175,24 @@ eloop:
 }
 
 func (s *Server) timezone() string {
-	for k := range s.Config().EnvVars {
-		if strings.ToUpper(k) != "TZ" {
-			continue
-		}
+	vars := s.Config().EnvVars
 
-		tz := s.Config().EnvVars.Get(k)
+	keys := make([]string, 0, 1)
+	for k := range vars {
+		if strings.ToUpper(k) == "TZ" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		tz := vars.Get(k)
 		if tz == "" || tz == "Local" {
-			break
+			continue
 		}
 		if _, err := time.LoadLocation(tz); err != nil {
 			s.Log().WithField("timezone", tz).Warn("server timezone could not be loaded, falling back to the system timezone")
-			break
+			continue
 		}
 
 		return tz
