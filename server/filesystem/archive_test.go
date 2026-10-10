@@ -1,7 +1,9 @@
 package filesystem
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
 	"context"
 	"io"
 	iofs "io/fs"
@@ -16,6 +18,92 @@ import (
 	"github.com/reviactyl/agent/internal/progress"
 	"golang.org/x/sys/unix"
 )
+
+func TestArchiveTarPreservesSymlinks(t *testing.T) {
+	for _, format := range []string{"", "tar.gz"} {
+		t.Run("format="+format, func(t *testing.T) {
+			for _, selection := range []string{"all", "files", "ignore", "base"} {
+				t.Run(selection, func(t *testing.T) {
+					fs, rfs := NewFs()
+					t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+					content := strings.NewReader("tar content")
+					if err := fs.Write("nested/deep/file.txt", content, content.Size(), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					links := map[string]string{
+						"nested/link.txt":       "deep/file.txt",
+						"nested/deep/link.txt":  "file.txt",
+						"nested/deep/dangling":  "missing.txt",
+						"nested/deep/directory": "..",
+						"nested/deep/external":  "/etc/hostname",
+					}
+					for name, target := range links {
+						if err := os.Symlink(target, filepath.Join(rfs.root, "server", name)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					a := &Archive{Filesystem: fs, Format: format}
+					switch selection {
+					case "files":
+						a.Files = []string{"nested"}
+					case "ignore":
+						a.Ignore = "nested/deep/dangling"
+						delete(links, "nested/deep/dangling")
+					case "base":
+						a.BaseDirectory = "nested"
+					}
+					archivePath := filepath.Join(t.TempDir(), "archive.tar.gz")
+					if err := a.Create(context.Background(), archivePath); err != nil {
+						t.Fatal(err)
+					}
+					file, err := os.Open(archivePath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer file.Close()
+					gz, err := gzip.NewReader(file)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer gz.Close()
+					reader := tar.NewReader(gz)
+					entries := map[string]*tar.Header{}
+					for {
+						header, err := reader.Next()
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if _, exists := entries[header.Name]; exists {
+							t.Fatalf("duplicate entry %q", header.Name)
+						}
+						entries[header.Name] = header
+						if header.Typeflag == tar.TypeReg {
+							data, err := io.ReadAll(reader)
+							if err != nil || string(data) != "tar content" {
+								t.Fatalf("unexpected file content %q: %v", data, err)
+							}
+						}
+					}
+					if len(entries) != len(links)+1 {
+						t.Fatalf("unexpected TAR entries: %v", entries)
+					}
+					for name, target := range links {
+						if selection == "base" {
+							name = strings.TrimPrefix(name, "nested/")
+						}
+						header := entries[name]
+						if header == nil || header.Typeflag != tar.TypeSymlink || header.Linkname != target {
+							t.Fatalf("symlink %q: got %+v, want target %q", name, header, target)
+						}
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestArchiveZip(t *testing.T) {
 	fs, rfs := NewFs()
