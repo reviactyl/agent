@@ -258,10 +258,14 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		if n == 0 && readErr != io.EOF {
 			return readErr
 		}
-		if n > 0 {
-			if quotaErr := fs.HasSpaceFor(int64(n) - st.Size()); quotaErr != nil {
-				return quotaErr
-			}
+		// Truncation is a write even when the decompressed stream is empty.
+		if quotaErr := fs.HasSpaceFor(0); quotaErr != nil {
+			return quotaErr
+		}
+		usageAfterTruncation := max(fs.CachedUsage()-st.Size(), 0)
+		if limit := fs.MaxDisk(); n > 0 && limit > 0 &&
+			(usageAfterTruncation >= limit || int64(n) > limit-usageAfterTruncation) {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
 		}
 		// Replace existing contents and release their quota before writing.
 		if err := f.Truncate(0); err != nil {

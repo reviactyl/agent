@@ -69,43 +69,67 @@ func TestFilesystem_DecompressGzipReplacesContents(t *testing.T) {
 }
 
 func TestFilesystem_DecompressGzipQuotaFailurePreservesContents(t *testing.T) {
-	fs, rfs := NewFs()
-	t.Cleanup(func() {
-		_ = fs.unixFS.Close()
-		_ = os.RemoveAll(rfs.root)
-	})
-	oldContent := []byte("old contents")
-	if err := rfs.CreateServerFile("test.txt", oldContent); err != nil {
-		t.Fatal(err)
-	}
-	var compressed bytes.Buffer
-	writer := gzip.NewWriter(&compressed)
-	if _, err := writer.Write(bytes.Repeat([]byte("new"), 4096)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rfs.CreateServerFile("test.txt.gz", compressed.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	usage, err := fs.DiskUsage(false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs.SetDiskLimit(usage + 1)
-	if err := fs.DecompressFile(context.Background(), "/", "test.txt.gz"); !IsErrorCode(err, ErrCodeDiskSpace) {
-		t.Fatalf("expected disk space error, got %v", err)
-	}
-	content, err := os.ReadFile(filepath.Join(rfs.root, "server", "test.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(content, oldContent) {
-		t.Fatal("quota failure changed the existing contents")
-	}
-	if got := fs.CachedUsage(); got != usage {
-		t.Fatalf("quota failure changed cached usage: got %d, want %d", got, usage)
+	for _, tc := range []struct {
+		name      string
+		existing  []byte
+		content   []byte
+		otherSize int
+		limit     int64
+	}{
+		{"growth", []byte("old contents"), bytes.Repeat([]byte("new"), 4096), 0, 0},
+		{"over quota", bytes.Repeat([]byte("o"), 5000), []byte("new\n"), 15000, 10000},
+		{"replacement exceeds remaining quota", bytes.Repeat([]byte("o"), 5000), bytes.Repeat([]byte("n"), 4096), 9000, 10000},
+		{"empty writes disabled", []byte("old contents"), []byte{}, 0, -1},
+		{"writes disabled", []byte("old contents"), []byte("new\n"), 0, -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() {
+				_ = fs.unixFS.Close()
+				_ = os.RemoveAll(rfs.root)
+			})
+			if err := rfs.CreateServerFile("test.txt", tc.existing); err != nil {
+				t.Fatal(err)
+			}
+			if tc.otherSize > 0 {
+				if err := rfs.CreateServerFile("other.txt", bytes.Repeat([]byte("x"), tc.otherSize)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var compressed bytes.Buffer
+			writer := gzip.NewWriter(&compressed)
+			if _, err := writer.Write(tc.content); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := rfs.CreateServerFile("test.txt.gz", compressed.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			usage, err := fs.DiskUsage(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			limit := tc.limit
+			if limit == 0 {
+				limit = usage + 1
+			}
+			fs.SetDiskLimit(limit)
+			if err := fs.DecompressFile(context.Background(), "/", "test.txt.gz"); !IsErrorCode(err, ErrCodeDiskSpace) {
+				t.Fatalf("expected disk space error, got %v", err)
+			}
+			content, err := os.ReadFile(filepath.Join(rfs.root, "server", "test.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(content, tc.existing) {
+				t.Fatal("quota failure changed the existing contents")
+			}
+			if got := fs.CachedUsage(); got != usage {
+				t.Fatalf("quota failure changed cached usage: got %d, want %d", got, usage)
+			}
+		})
 	}
 }
 
