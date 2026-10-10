@@ -17,6 +17,19 @@ type Stat struct {
 }
 
 func (s *Stat) MarshalJSON() ([]byte, error) {
+	// Convert Go's special mode flags to the Unix octal bits used by chmod.
+	mode := s.Mode()
+	modeBits := mode.Perm()
+	if mode&ufs.ModeSetuid != 0 {
+		modeBits |= 0o4000
+	}
+	if mode&ufs.ModeSetgid != 0 {
+		modeBits |= 0o2000
+	}
+	if mode&ufs.ModeSticky != 0 {
+		modeBits |= 0o1000
+	}
+
 	return json.Marshal(struct {
 		Name      string `json:"name"`
 		Created   string `json:"created"`
@@ -29,12 +42,11 @@ func (s *Stat) MarshalJSON() ([]byte, error) {
 		Symlink   bool   `json:"symlink"`
 		Mime      string `json:"mime"`
 	}{
-		Name:     s.Name(),
-		Created:  s.CTime().Format(time.RFC3339),
-		Modified: s.ModTime().Format(time.RFC3339),
-		Mode:     s.Mode().String(),
-		// Using `&ModePerm` on the file's mode will cause the mode to only have the permission values, and nothing else.
-		ModeBits:  strconv.FormatUint(uint64(s.Mode()&ufs.ModePerm), 8),
+		Name:      s.Name(),
+		Created:   s.CTime().Format(time.RFC3339),
+		Modified:  s.ModTime().Format(time.RFC3339),
+		Mode:      mode.String(),
+		ModeBits:  strconv.FormatUint(uint64(modeBits), 8),
 		Size:      s.Size(),
 		Directory: s.IsDir(),
 		File:      !s.IsDir(),
