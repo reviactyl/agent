@@ -3,7 +3,9 @@ package filesystem
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -17,6 +19,65 @@ import (
 
 	"github.com/reviactyl/agent/config"
 )
+
+func TestStatMarshalJSONModeBits(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	for _, directory := range []bool{false, true} {
+		for special := 0; special < 8; special++ {
+			for _, permissions := range []os.FileMode{0o755, 0o644, 0o040, 0} {
+				bits := os.FileMode(special<<9) | permissions
+				t.Run(fmt.Sprintf("directory=%t/mode=%o", directory, bits), func(t *testing.T) {
+					name := fmt.Sprintf("mode-%t-%o", directory, bits)
+					p := filepath.Join(rfs.root, "server", name)
+					if directory {
+						if err := os.Mkdir(p, 0o755); err != nil {
+							t.Fatal(err)
+						}
+					} else if err := os.WriteFile(p, []byte("test"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					mode := permissions
+					if special&4 != 0 {
+						mode |= os.ModeSetuid
+					}
+					if special&2 != 0 {
+						mode |= os.ModeSetgid
+					}
+					if special&1 != 0 {
+						mode |= os.ModeSticky
+					}
+					if err := os.Chmod(p, mode); err != nil {
+						t.Fatal(err)
+					}
+					info, err := fs.unixFS.Lstat(name)
+					if err != nil {
+						t.Fatal(err)
+					}
+					stat := Stat{FileInfo: info}
+					data, err := json.Marshal(&stat)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var result struct {
+						ModeBits  string `json:"mode_bits"`
+						Mode      string `json:"mode"`
+						Directory bool   `json:"directory"`
+					}
+					if err := json.Unmarshal(data, &result); err != nil {
+						t.Fatal(err)
+					}
+					if want := fmt.Sprintf("%o", bits); result.ModeBits != want {
+						t.Fatalf("mode_bits = %q, want %q", result.ModeBits, want)
+					}
+					if result.Mode != info.Mode().String() || result.Directory != directory {
+						t.Fatalf("file type or symbolic mode changed: %+v", result)
+					}
+				})
+			}
+		}
+	}
+}
 
 func NewFs() (*Filesystem, *rootFs) {
 	config.Set(&config.Configuration{
