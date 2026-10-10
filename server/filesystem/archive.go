@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	"emperror.dev/errors"
-	"github.com/apex/log"
 	"github.com/juju/ratelimit"
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
@@ -342,21 +341,22 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return err
 	}
 
-	// Resolve the symlink target if the file is a symlink.
+	// Read the link itself relative to the directory being walked, without
+	// following its target (which may be missing or outside the server).
 	var target string
 	if s.Mode()&fs.ModeSymlink != 0 {
-		// Read the target of the symlink. If there are any errors we will dump them out to
-		// the logs, but we're not going to stop the backup. There are far too many cases of
-		// symlinks causing all sorts of unnecessary pain in this process. Sucks to suck if
-		// it doesn't work.
-		target, err = os.Readlink(s.Name())
+		buf := make([]byte, 4096)
+		n, err := unix.Readlinkat(dirfd, name, buf)
 		if err != nil {
-			// Ignore the not exist errors specifically, since there is nothing important about that.
-			if !os.IsNotExist(err) {
-				log.WithField("name", name).WithField("readlink_err", err.Error()).Warn("failed reading symlink for target path; skipping...")
+			if errors.Is(err, unix.ENOENT) {
+				return nil
 			}
-			return nil
+			return errors.WrapIff(err, "failed reading symlink '%s'", relative)
 		}
+		if n == len(buf) {
+			return errors.New("filesystem: symlink target is too long for TAR archive")
+		}
+		target = string(buf[:n])
 	}
 
 	// Get the tar FileInfoHeader in order to add the file to the archive.
@@ -365,10 +365,8 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed to get tar#FileInfoHeader for '%s'", name)
 	}
 
-	// Fix the header name if the file is not a symlink.
-	if s.Mode()&fs.ModeSymlink == 0 {
-		header.Name = relative
-	}
+	// Preserve the path within the archive for regular files and symlinks alike.
+	header.Name = filepath.ToSlash(relative)
 
 	// Write the tar FileInfoHeader to the archive.
 	if err := a.w.WriteHeader(header); err != nil {
