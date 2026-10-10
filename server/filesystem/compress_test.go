@@ -7,10 +7,107 @@ import (
 	"compress/gzip"
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	. "github.com/franela/goblin"
 )
+
+func TestFilesystem_DecompressGzipReplacesContents(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing []byte
+		content  []byte
+	}{
+		{"shorter", bytes.Repeat([]byte("old"), 4096), []byte("new\n")},
+		{"empty", []byte("old contents"), []byte{}},
+		{"longer", []byte("old"), bytes.Repeat([]byte("new"), 4096)},
+		{"new file", nil, []byte("new\n")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() {
+				_ = fs.unixFS.Close()
+				_ = os.RemoveAll(rfs.root)
+			})
+			if tc.existing != nil {
+				if err := rfs.CreateServerFile("test.txt", tc.existing); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var compressed bytes.Buffer
+			writer := gzip.NewWriter(&compressed)
+			if _, err := writer.Write(tc.content); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := rfs.CreateServerFile("test.txt.gz", compressed.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			// Initialize cached usage so replacement accounting is checked too.
+			if _, err := fs.DiskUsage(false); err != nil {
+				t.Fatal(err)
+			}
+			fs.SetDiskLimit(int64(compressed.Len() + max(len(tc.existing), len(tc.content)) + 1))
+			if err := fs.DecompressFile(context.Background(), "/", "test.txt.gz"); err != nil {
+				t.Fatal(err)
+			}
+			content, err := os.ReadFile(filepath.Join(rfs.root, "server", "test.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(content, tc.content) {
+				t.Fatalf("extracted contents differ: got %d bytes, want %d", len(content), len(tc.content))
+			}
+			if got, want := fs.CachedUsage(), int64(compressed.Len()+len(tc.content)); got != want {
+				t.Fatalf("cached usage = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestFilesystem_DecompressGzipQuotaFailurePreservesContents(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() {
+		_ = fs.unixFS.Close()
+		_ = os.RemoveAll(rfs.root)
+	})
+	oldContent := []byte("old contents")
+	if err := rfs.CreateServerFile("test.txt", oldContent); err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(bytes.Repeat([]byte("new"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rfs.CreateServerFile("test.txt.gz", compressed.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := fs.DiskUsage(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetDiskLimit(usage + 1)
+	if err := fs.DecompressFile(context.Background(), "/", "test.txt.gz"); !IsErrorCode(err, ErrCodeDiskSpace) {
+		t.Fatalf("expected disk space error, got %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(rfs.root, "server", "test.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(content, oldContent) {
+		t.Fatal("quota failure changed the existing contents")
+	}
+	if got := fs.CachedUsage(); got != usage {
+		t.Fatalf("quota failure changed cached usage: got %d, want %d", got, usage)
+	}
+}
 
 // Given an archive named test.{ext}, with the following file structure:
 //

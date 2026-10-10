@@ -243,10 +243,34 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		}
 		defer f.Close()
 
-		// Read in 4 KB chunks
+		st, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		// Check the first chunk before replacing the destination, accounting
+		// for the space that truncation will release.
 		buf := make([]byte, 4096)
+		var n int
+		var readErr error
+		for n == 0 && readErr == nil {
+			n, readErr = reader.Read(buf)
+		}
+		if n == 0 && readErr != io.EOF {
+			return readErr
+		}
+		if n > 0 {
+			if quotaErr := fs.HasSpaceFor(int64(n) - st.Size()); quotaErr != nil {
+				return quotaErr
+			}
+		}
+		// Replace existing contents and release their quota before writing.
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		fs.addDisk(-st.Size())
+
+		// Read in 4 KB chunks
 		for {
-			n, err := reader.Read(buf)
 			if n > 0 {
 
 				// Check quota before writing the chunk
@@ -263,15 +287,16 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 				fs.addDisk(int64(n))
 			}
 
-			if err != nil {
+			if readErr != nil {
 				// EOF are expected
-				if err == io.EOF {
+				if readErr == io.EOF {
 					break
 				}
 
 				// Return any other
-				return err
+				return readErr
 			}
+			n, readErr = reader.Read(buf)
 		}
 
 		return nil
