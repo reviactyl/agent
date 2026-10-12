@@ -855,3 +855,32 @@ func (fs *testUnixFS) testWalkDirAt(path string) ([]Path, error) {
 	})
 	return pathsTraversed, nil
 }
+
+func TestUnixFS_Replace(t *testing.T) {
+	fs, err := newTestUnixFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Cleanup()
+	for name, contents := range map[string]string{"staged": "new", "destination": "old"} {
+		if err := os.WriteFile(filepath.Join(fs.Root, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.Rename("staged", "destination"); !errors.Is(err, ufs.ErrExist) {
+		t.Fatalf("Rename error = %v", err)
+	}
+	if err := fs.Replace("staged", "destination"); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(filepath.Join(fs.Root, "destination"))
+	if err != nil || string(contents) != "new" {
+		t.Fatalf("contents = %q, error = %v", contents, err)
+	}
+	if _, err := fs.Stat("staged"); !errors.Is(err, ufs.ErrNotExist) {
+		t.Fatalf("staged file remains: %v", err)
+	}
+	if err := fs.Replace("destination", "../escape"); !errors.Is(err, ufs.ErrBadPathResolution) {
+		t.Fatalf("escape error = %v", err)
+	}
+}

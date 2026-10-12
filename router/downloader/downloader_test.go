@@ -43,6 +43,10 @@ func TestExecuteStreamingResponse(t *testing.T) {
 			dl := New(s, DownloadRequest{URL: u, Directory: "/nested", UseHeader: true})
 			err := dl.Execute()
 			if quota > 0 {
+				data, readErr := os.ReadFile(filepath.Join(s.Filesystem().Path(), "nested", "stream.txt"))
+				if readErr != nil || string(data) != "streamed contents" {
+					t.Fatalf("failed download changed original: %q, %v", data, readErr)
+				}
 				if !filesystem.IsErrorCode(err, filesystem.ErrCodeDiskSpace) {
 					t.Fatalf("expected quota error, got %v", err)
 				}
@@ -64,8 +68,8 @@ func TestExecuteStreamingResponse(t *testing.T) {
 			if quota > 0 && dl.Progress() != 0 {
 				t.Fatalf("failed download progress = %v", dl.Progress())
 			}
-			if s.Filesystem().CachedUsage() > quota && quota > 0 {
-				t.Fatal("disk quota exceeded")
+			if usage := s.Filesystem().CachedUsage(); usage != int64(len("streamed contents")) {
+				t.Fatalf("usage = %d", usage)
 			}
 			if ByID(dl.Identifier) != nil {
 				t.Fatal("download remains tracked")

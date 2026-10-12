@@ -435,6 +435,15 @@ func (fs *UnixFS) unlinkat(dirfd int, name string, flags int) error {
 //
 // If there is an error, it will be of type *LinkError.
 func (fs *UnixFS) Rename(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, false)
+}
+
+// Replace atomically renames a file, replacing an existing destination.
+func (fs *UnixFS) Replace(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, true)
+}
+
+func (fs *UnixFS) rename(oldpath, newpath string, replace bool) error {
 	// Simple case: both paths are the same.
 	if oldpath == newpath {
 		return nil
@@ -495,13 +504,13 @@ func (fs *UnixFS) Rename(oldpath, newpath string) error {
 	// Stat the new target to return proper errors.
 	_, err = fs.Lstatat(newdirfd, newname)
 	switch {
-	case err == nil:
+	case err == nil && !replace:
 		return &PathError{
 			Op:   "rename",
 			Path: newname,
 			Err:  ErrExist,
 		}
-	case !errors.Is(err, ErrNotExist):
+	case err != nil && !errors.Is(err, ErrNotExist):
 		return err
 	}
 	if err := unix.Renameat(olddirfd, oldname, newdirfd, newname); err != nil {
