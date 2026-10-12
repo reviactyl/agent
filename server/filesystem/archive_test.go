@@ -43,7 +43,9 @@ func TestArchiveTarFinalization(t *testing.T) {
 			t.Run(format+"/"+compression, func(t *testing.T) {
 				fs, rfs := NewFs()
 				t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
-				config.Get().System.Backups.CompressionLevel = compression
+				config.Update(func(c *config.Configuration) {
+					c.System.Backups.CompressionLevel = compression
+				})
 				if err := rfs.CreateServerFileFromString("file.txt", "backup contents"); err != nil {
 					t.Fatal(err)
 				}
