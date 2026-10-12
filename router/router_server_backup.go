@@ -147,16 +147,6 @@ func postServerRestoreBackup(c *gin.Context) {
 	}()
 
 	logger.Info("processing server backup restore request")
-	if data.TruncateDirectory {
-		logger.Info("received \"truncate_directory\" flag in request: deleting server files")
-		if err := s.Filesystem().TruncateRootDirectory(); err != nil {
-			middleware.CaptureAndAbort(c, err)
-			return
-		}
-	}
-
-	// Now that we've cleaned up the data directory if necessary, grab the backup file
-	// and attempt to restore it into the server directory.
 	if data.Adapter == backup.LocalBackupAdapter {
 		var b *backup.LocalBackup
 		var err error
@@ -168,6 +158,13 @@ func postServerRestoreBackup(c *gin.Context) {
 		if err != nil {
 			middleware.CaptureAndAbort(c, err)
 			return
+		}
+		if data.TruncateDirectory {
+			logger.Info("received \"truncate_directory\" flag in request: deleting server files")
+			if err := s.Filesystem().TruncateRootDirectory(); err != nil {
+				middleware.CaptureAndAbort(c, err)
+				return
+			}
 		}
 		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
 			logger.Info("starting restoration process for server backup using local driver")
@@ -221,6 +218,15 @@ func postServerRestoreBackup(c *gin.Context) {
 			"error": "The provided backup link is not a supported gzip or ZIP content type: " + res.Header.Get("Content-Type"),
 		})
 		return
+	}
+
+	if data.TruncateDirectory {
+		logger.Info("received \"truncate_directory\" flag in request: deleting server files")
+		if err := s.Filesystem().TruncateRootDirectory(); err != nil {
+			_ = res.Body.Close()
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
 	}
 
 	go func(s *server.Server, uuid string, logger *log.Entry) {
