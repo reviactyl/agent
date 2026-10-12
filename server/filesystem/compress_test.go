@@ -270,3 +270,102 @@ func tarGzWithEmptyDir() ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+func TestFilesystem_DecompressionReplacementQuota(t *testing.T) {
+	for _, format := range []string{"zip", "tar.gz"} {
+		for _, tc := range []struct {
+			name             string
+			oldSize, newSize int
+			reject           bool
+		}{
+			{"shrinking replacement", 1000, 800, false},
+			{"same size replacement", 1000, 1000, false},
+			{"growth fits exactly", 1000, 1100, false},
+			{"growth exceeds quota", 1000, 1101, true},
+			{"new file exceeds quota", 0, 800, true},
+			{"empty replacement", 1000, 0, false},
+		} {
+			t.Run(format+"/"+tc.name, func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = fs.unixFS.Close(); _ = os.RemoveAll(rfs.root) })
+				if err := os.MkdirAll(filepath.Join(rfs.root, "server/nested"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				old := bytes.Repeat([]byte("o"), tc.oldSize)
+				content := bytes.Repeat([]byte("n"), tc.newSize)
+				if tc.oldSize > 0 {
+					if err := rfs.CreateServerFile("nested/test.txt", old); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var archive bytes.Buffer
+				if format == "zip" {
+					zw := zip.NewWriter(&archive)
+					w, err := zw.Create("nested/test.txt")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := w.Write(content); err != nil {
+						t.Fatal(err)
+					}
+					if err := zw.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					gw := gzip.NewWriter(&archive)
+					tw := tar.NewWriter(gw)
+					if err := tw.WriteHeader(&tar.Header{Name: "nested/test.txt", Mode: 0o644, Size: int64(len(content))}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := tw.Write(content); err != nil {
+						t.Fatal(err)
+					}
+					if err := tw.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if err := gw.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				filename := "test." + format
+				if err := rfs.CreateServerFile(filename, archive.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+				usage, err := fs.DiskUsage(false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fs.SetDiskLimit(usage + 100)
+				err = fs.SpaceAvailableForDecompression(context.Background(), "/", filename)
+				if tc.reject {
+					if !IsErrorCode(err, ErrCodeDiskSpace) {
+						t.Fatalf("expected quota error, got %v", err)
+					}
+					if fs.CachedUsage() != usage {
+						t.Fatal("preflight changed usage")
+					}
+					if tc.oldSize > 0 {
+						got, err := os.ReadFile(filepath.Join(rfs.root, "server/nested/test.txt"))
+						if err != nil || !bytes.Equal(got, old) {
+							t.Fatal("preflight changed existing contents")
+						}
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.DecompressFile(context.Background(), "/", filename); err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.ReadFile(filepath.Join(rfs.root, "server/nested/test.txt"))
+				if err != nil || !bytes.Equal(got, content) {
+					t.Fatalf("incorrect replacement contents: %v", err)
+				}
+				if want := usage + int64(tc.newSize-tc.oldSize); fs.CachedUsage() != want {
+					t.Fatalf("usage %d, want %d", fs.CachedUsage(), want)
+				}
+			})
+		}
+	}
+}
