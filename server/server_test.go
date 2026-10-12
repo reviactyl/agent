@@ -236,3 +236,97 @@ func TestRestoreBackupPreservesDirectoryMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreBackupPreservesFilePermissions(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			configuration := &config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: t.TempDir()}}
+			configuration.System.User.Uid = os.Getuid()
+			configuration.System.User.Gid = os.Getgid()
+			config.Set(configuration)
+			source := t.TempDir()
+			files := []struct {
+				name    string
+				mode    os.FileMode
+				content string
+			}{
+				{"run.sh", 0o755, "#!/bin/sh\necho restored\n"},
+				{"private.txt", 0o600, "private"},
+				{"empty.sh", 0o750, ""},
+			}
+			for _, file := range files {
+				path := filepath.Join(source, file.name)
+				if err := os.WriteFile(path, []byte(file.content), file.mode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, file.mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sourceFS, err := filesystem.New(source, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sourceFS.UnixFS().Close() })
+			local := backup.NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", format)
+			if err := (&filesystem.Archive{Filesystem: sourceFS, Format: format}).Create(context.Background(), local.Path()); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(local.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, adapter := range []string{"local", "s3"} {
+				for _, existing := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/existing=%t", adapter, existing), func(t *testing.T) {
+						destination := t.TempDir()
+						if existing {
+							for _, file := range files {
+								path := filepath.Join(destination, file.name)
+								if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+									t.Fatal(err)
+								}
+								if err := os.Chmod(path, 0o644); err != nil {
+									t.Fatal(err)
+								}
+							}
+						}
+						destinationFS, err := filesystem.New(destination, 0, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() { _ = destinationFS.UnixFS().Close() })
+						client := &restoreStatusClient{}
+						srv := &Server{ctx: context.Background(), client: client, fs: destinationFS, Environment: offlineRestoreEnvironment{}}
+						var b backup.BackupInterface = local
+						var reader io.ReadCloser
+						if adapter == "s3" {
+							b = backup.NewS3(nil, local.Uuid, "", format)
+							reader = io.NopCloser(bytes.NewReader(data))
+						}
+						if err := srv.RestoreBackup(b, reader); err != nil {
+							t.Fatal(err)
+						}
+						if !client.successful {
+							t.Fatal("Panel was not notified of a successful restoration")
+						}
+						for _, file := range files {
+							path := filepath.Join(destination, file.name)
+							contents, err := os.ReadFile(path)
+							if err != nil || string(contents) != file.content {
+								t.Fatalf("restored %s contents: %q, %v", file.name, contents, err)
+							}
+							info, err := os.Stat(path)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if info.Mode().Perm() != file.mode {
+								t.Errorf("restored %s mode = %o, want %o", file.name, info.Mode().Perm(), file.mode)
+							}
+						}
+					})
+				}
+			}
+		})
+	}
+}

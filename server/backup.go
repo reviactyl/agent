@@ -208,6 +208,9 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		if err := s.Filesystem().Write(file, r, info.Size(), info.Mode()); err != nil {
 			return err
 		}
+		if err := s.Filesystem().Chmod(file, info.Mode().Perm()); err != nil {
+			return err
+		}
 		atime := info.ModTime()
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
