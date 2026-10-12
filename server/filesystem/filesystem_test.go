@@ -766,3 +766,47 @@ func TestFilesystem_Delete(t *testing.T) {
 		})
 	})
 }
+
+func TestWriteUnknownSize(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		contents   string
+		limit      int64
+		quotaError bool
+	}{
+		{name: "stream to EOF", contents: "1234567890"},
+		{name: "empty stream"},
+		{name: "replace at quota", contents: "12345", limit: 5},
+		{name: "reject beyond quota", contents: "123456", limit: 5, quotaError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			if err := fs.Write("nested/file.txt", bytes.NewBufferString("old contents"), 12, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fs.SetDiskLimit(tt.limit)
+			err := fs.Write("nested/file.txt", bytes.NewBufferString(tt.contents), -1, 0o644)
+			if tt.quotaError {
+				if !IsErrorCode(err, ErrCodeDiskSpace) {
+					t.Fatalf("expected quota error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(rfs.root, "server", "nested", "file.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tt.quotaError && string(data) != tt.contents {
+				t.Fatalf("contents = %q, want %q", data, tt.contents)
+			}
+			if usage := fs.CachedUsage(); usage != int64(len(data)) {
+				t.Fatalf("cached usage = %d, actual = %d", usage, len(data))
+			}
+			if tt.limit > 0 && int64(len(data)) > tt.limit {
+				t.Fatal("disk quota exceeded")
+			}
+		})
+	}
+}
