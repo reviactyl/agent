@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -838,4 +840,187 @@ func TestFilesystem_Delete(t *testing.T) {
 			_ = fs.TruncateRootDirectory()
 		})
 	})
+}
+
+func TestWriteUnknownSize(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		contents   string
+		limit      int64
+		quotaError bool
+	}{
+		{name: "stream to EOF", contents: "1234567890"},
+		{name: "empty stream"},
+		{name: "replace with staging space", contents: "12345", limit: 17},
+		{name: "reject beyond quota", contents: "1234567890123", limit: 12, quotaError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			if err := fs.Write("nested/file.txt", bytes.NewBufferString("old contents"), 12, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fs.SetDiskLimit(tt.limit)
+			err := fs.Write("nested/file.txt", bytes.NewBufferString(tt.contents), -1, 0o644)
+			if tt.quotaError {
+				if !IsErrorCode(err, ErrCodeDiskSpace) {
+					t.Fatalf("expected quota error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(rfs.root, "server", "nested", "file.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.quotaError && string(data) != "old contents" {
+				t.Fatalf("failed replacement changed original: %q", data)
+			}
+			if !tt.quotaError && string(data) != tt.contents {
+				t.Fatalf("contents = %q, want %q", data, tt.contents)
+			}
+			if usage := fs.CachedUsage(); usage != int64(len(data)) {
+				t.Fatalf("cached usage = %d, actual = %d", usage, len(data))
+			}
+			if tt.limit > 0 && int64(len(data)) > tt.limit {
+				t.Fatal("disk quota exceeded")
+			}
+		})
+	}
+}
+
+type streamReadFunc func([]byte) (int, error)
+
+func (r streamReadFunc) Read(p []byte) (int, error) { return r(p) }
+
+func TestWriteStreamPreservesFileOnReadError(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	if err := fs.Write("file.txt", bytes.NewBufferString("original"), 8, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readErr := errors.New("stream interrupted")
+	reads := 0
+	reader := streamReadFunc(func(p []byte) (int, error) {
+		reads++
+		if reads == 1 {
+			return copy(p, "partial replacement"), nil
+		}
+		return 0, readErr
+	})
+	if err := fs.Write("file.txt", reader, -1, 0o644); !errors.Is(err, readErr) {
+		t.Fatalf("error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(rfs.root, "server", "file.txt"))
+	if err != nil || string(data) != "original" {
+		t.Fatalf("original changed: %q, %v", data, err)
+	}
+	entries, err := fs.ReadDir("/")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("staging file was not cleaned up: %v, %v", entries, err)
+	}
+	if fs.CachedUsage() != 8 {
+		t.Fatalf("usage = %d", fs.CachedUsage())
+	}
+}
+
+func TestWriteStreamQuotaWithDiskScans(t *testing.T) {
+	for _, limit := range []int64{100, 140, 150} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			for name, size := range map[string]int{"file.txt": 40, "other.txt": 60} {
+				if err := fs.Write(name, bytes.NewReader(bytes.Repeat([]byte("x"), size)), int64(size), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fs.SetDiskLimit(limit)
+			reads := 0
+			reader := streamReadFunc(func(p []byte) (int, error) {
+				reads++
+				size, err := fs.updateCachedDiskUsage()
+				if err != nil {
+					return 0, err
+				}
+				if size != fs.CachedUsage() || size > limit {
+					t.Fatalf("scan size=%d, cached=%d, limit=%d", size, fs.CachedUsage(), limit)
+				}
+				switch reads {
+				case 1:
+					return copy(p, bytes.Repeat([]byte("y"), 20)), nil
+				case 2:
+					return copy(p, bytes.Repeat([]byte("y"), 30)), nil
+				default:
+					return 0, io.EOF
+				}
+			})
+			err := fs.Write("file.txt", reader, -1, 0o644)
+			if limit < 150 {
+				if !IsErrorCode(err, ErrCodeDiskSpace) {
+					t.Fatalf("expected quota error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(rfs.root, "server", "file.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := bytes.Repeat([]byte("x"), 40)
+			if limit == 150 {
+				want = bytes.Repeat([]byte("y"), 50)
+			}
+			if !bytes.Equal(data, want) {
+				t.Fatalf("unexpected destination: %q", data)
+			}
+			usage := fs.CachedUsage()
+			scanned, err := fs.updateCachedDiskUsage()
+			if err != nil || usage != scanned || scanned != int64(60+len(want)) {
+				t.Fatalf("usage=%d, actual=%d, error=%v", usage, scanned, err)
+			}
+			entries, err := fs.ReadDir("/")
+			if err != nil || len(entries) != 2 {
+				t.Fatalf("staging file was not cleaned up: %v, %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestWritePreservesExistingPermissions(t *testing.T) {
+	for _, mode := range []os.FileMode{0o755, 0o700, 0o640} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mode=%o/streaming=%t", mode, streaming), func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+				if err := fs.Write("script.sh", bytes.NewBufferString("old"), 3, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.Chmod("script.sh", mode); err != nil {
+					t.Fatal(err)
+				}
+				contents := "#!/bin/sh\nprintf 'updated\\n'\n"
+				size := int64(len(contents))
+				if streaming {
+					size = -1
+				}
+				if err := fs.Write("script.sh", bytes.NewBufferString(contents), size, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(rfs.root, "server", "script.sh")
+				st, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if st.Mode().Perm() != mode {
+					t.Fatalf("permissions = %o, want %o", st.Mode().Perm(), mode)
+				}
+				if mode&0o100 != 0 {
+					output, err := exec.Command(path).Output()
+					if err != nil || string(output) != "updated\n" {
+						t.Fatalf("script execution = %q, error = %v", output, err)
+					}
+				}
+			})
+		}
+	}
 }

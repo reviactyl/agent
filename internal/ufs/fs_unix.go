@@ -441,8 +441,20 @@ func (fs *UnixFS) Rename(oldpath, newpath string) error {
 	})
 }
 
+// Replace atomically renames a file, replacing an existing destination.
+func (fs *UnixFS) Replace(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, true, func(path string, mode FileMode) error {
+		_, err := fs.MkdirAll(path, mode)
+		return err
+	})
+}
+
 // RenameWithMkdirAll renames a path using mkdirAll to create missing destination parents.
 func (fs *UnixFS) RenameWithMkdirAll(oldpath, newpath string, mkdirAll func(string, FileMode) error) error {
+	return fs.rename(oldpath, newpath, false, mkdirAll)
+}
+
+func (fs *UnixFS) rename(oldpath, newpath string, replace bool, mkdirAll func(string, FileMode) error) error {
 	// Simple case: both paths are the same.
 	if oldpath == newpath {
 		return nil
@@ -503,13 +515,13 @@ func (fs *UnixFS) RenameWithMkdirAll(oldpath, newpath string, mkdirAll func(stri
 	// Stat the new target to return proper errors.
 	_, err = fs.Lstatat(newdirfd, newname)
 	switch {
-	case err == nil:
+	case err == nil && !replace:
 		return &PathError{
 			Op:   "rename",
 			Path: newname,
 			Err:  ErrExist,
 		}
-	case !errors.Is(err, ErrNotExist):
+	case err != nil && !errors.Is(err, ErrNotExist):
 		return err
 	}
 	if err := unix.Renameat(olddirfd, oldname, newdirfd, newname); err != nil {

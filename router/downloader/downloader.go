@@ -201,10 +201,6 @@ func (dl *Download) Execute() error {
 		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
 	}
 
-	if res.ContentLength < 1 {
-		return errors.New("downloader: request is missing ContentLength")
-	}
-
 	if dl.req.UseHeader {
 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
 			_, params, err := mime.ParseMediaType(contentDisposition)
@@ -235,6 +231,9 @@ func (dl *Download) Execute() error {
 	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
 	}
+	dl.mu.Lock()
+	dl.progress = 1
+	dl.mu.Unlock()
 	return nil
 }
 
@@ -270,7 +269,9 @@ func (dl *Download) counter(contentLength int64) *Counter {
 	onWrite := func(t int) {
 		dl.mu.Lock()
 		defer dl.mu.Unlock()
-		dl.progress = float64(t) / float64(contentLength)
+		if contentLength > 0 {
+			dl.progress = float64(t) / float64(contentLength)
+		}
 	}
 	return &Counter{
 		onWrite: onWrite,

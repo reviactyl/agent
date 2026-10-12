@@ -150,7 +150,11 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 	return err
 }
 
+// Write streams to EOF when newSize is negative, enforcing quota as data arrives.
 func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
+	if newSize < 0 {
+		return fs.writeStream(p, r, mode)
+	}
 	var currentSize int64
 	st, err := fs.unixFS.Stat(p)
 	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
