@@ -435,15 +435,26 @@ func (fs *UnixFS) unlinkat(dirfd int, name string, flags int) error {
 //
 // If there is an error, it will be of type *LinkError.
 func (fs *UnixFS) Rename(oldpath, newpath string) error {
-	return fs.rename(oldpath, newpath, false)
+	return fs.RenameWithMkdirAll(oldpath, newpath, func(path string, mode FileMode) error {
+		_, err := fs.MkdirAll(path, mode)
+		return err
+	})
 }
 
 // Replace atomically renames a file, replacing an existing destination.
 func (fs *UnixFS) Replace(oldpath, newpath string) error {
-	return fs.rename(oldpath, newpath, true)
+	return fs.rename(oldpath, newpath, true, func(path string, mode FileMode) error {
+		_, err := fs.MkdirAll(path, mode)
+		return err
+	})
 }
 
-func (fs *UnixFS) rename(oldpath, newpath string, replace bool) error {
+// RenameWithMkdirAll renames a path using mkdirAll to create missing destination parents.
+func (fs *UnixFS) RenameWithMkdirAll(oldpath, newpath string, mkdirAll func(string, FileMode) error) error {
+	return fs.rename(oldpath, newpath, false, mkdirAll)
+}
+
+func (fs *UnixFS) rename(oldpath, newpath string, replace bool, mkdirAll func(string, FileMode) error) error {
 	// Simple case: both paths are the same.
 	if oldpath == newpath {
 		return nil
@@ -479,7 +490,7 @@ func (fs *UnixFS) rename(oldpath, newpath string, replace bool) error {
 		if !errors.As(err, &pathErr) {
 			return err
 		}
-		if _, err := fs.MkdirAll(pathErr.Path, 0o755); err != nil {
+		if err := mkdirAll(pathErr.Path, 0o755); err != nil {
 			return err
 		}
 		newdirfd, newname, closeFd2, err = fs.safePath(newpath)

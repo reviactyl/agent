@@ -99,7 +99,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 		_ = b.Remove()
 
 		s.Log().WithField("error", notifyError).Info("failed to notify panel of successful backup state")
-		return err
+		return notifyError
 	} else {
 		s.Log().WithField("backup", b.Identifier()).Info("notified panel of successful backup state")
 	}
@@ -206,6 +206,9 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
 		if err := s.Filesystem().Write(file, r, info.Size(), info.Mode()); err != nil {
+			return err
+		}
+		if err := s.Filesystem().Chmod(file, info.Mode().Perm()); err != nil {
 			return err
 		}
 		atime := info.ModTime()

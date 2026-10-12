@@ -16,6 +16,7 @@ import (
 	"github.com/apex/log"
 	"github.com/gabriel-vasile/mimetype"
 	ignore "github.com/sabhiram/go-gitignore"
+	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/internal/ufs"
@@ -217,7 +218,7 @@ func (fs *Filesystem) CreateDirectory(name string, p string) error {
 }
 
 func (fs *Filesystem) Rename(oldpath, newpath string) error {
-	return fs.unixFS.Rename(oldpath, newpath)
+	return fs.unixFS.RenameWithMkdirAll(oldpath, newpath, fs.mkdirAll)
 }
 
 func (fs *Filesystem) Symlink(oldpath, newpath string) error {
@@ -237,8 +238,23 @@ func (fs *Filesystem) chownFile(name string) error {
 // mkdirAll creates the directory p along with any missing parents, chowning
 // every directory it creates to the server user so they are not left owned by
 // the user Agent runs as.
-func (fs *Filesystem) mkdirAll(p string, mode ufs.FileMode) error {
+func (fs *Filesystem) mkdirAll(p string, mode ufs.FileMode) (err error) {
 	created, err := fs.unixFS.MkdirAll(p, mode)
+	defer func() {
+		if err == nil {
+			return
+		}
+		for i := len(created) - 1; i >= 0; i-- {
+			dirfd, name, closeFd, cleanupErr := fs.unixFS.SafePath(created[i])
+			if cleanupErr == nil {
+				cleanupErr = unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR)
+			}
+			closeFd()
+			if cleanupErr != nil {
+				err = errors.Combine(err, errors.Wrapf(cleanupErr, "failed to remove newly created directory %s", created[i]))
+			}
+		}
+	}()
 	if err != nil {
 		return err
 	}

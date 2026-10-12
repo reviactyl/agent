@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +18,72 @@ import (
 	"github.com/reviactyl/agent/server/backup"
 	"github.com/reviactyl/agent/server/filesystem"
 )
+
+type backupStatusClient struct {
+	remote.Client
+	err           error
+	request       remote.BackupRequest
+	archivePath   string
+	archiveExists bool
+}
+
+type callbackTestBackup struct {
+	*backup.LocalBackup
+}
+
+func (b callbackTestBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignored string) (*backup.ArchiveDetails, error) {
+	if err := (&filesystem.Archive{Filesystem: fsys, Format: b.Format, Ignore: ignored}).Create(ctx, b.Path()); err != nil {
+		return nil, err
+	}
+	checksum, err := b.Checksum()
+	if err != nil {
+		return nil, err
+	}
+	size, err := b.Size()
+	if err != nil {
+		return nil, err
+	}
+	return &backup.ArchiveDetails{Checksum: fmt.Sprintf("%x", checksum), ChecksumType: "sha1", Size: size}, nil
+}
+
+func (c *backupStatusClient) SetBackupStatus(_ context.Context, _ string, request remote.BackupRequest) error {
+	c.request = request
+	_, err := os.Stat(c.archivePath)
+	c.archiveExists = err == nil
+	return c.err
+}
+
+func TestBackupReturnsCallbackError(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			configuration := &config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: t.TempDir()}}
+			config.Set(configuration)
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("backup content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fsys, err := filesystem.New(source, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = fsys.UnixFS().Close() })
+			callbackError := errors.New("Panel callback failed")
+			b := callbackTestBackup{backup.NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", format)}
+			client := &backupStatusClient{err: callbackError, archivePath: b.Path()}
+			srv := &Server{ctx: context.Background(), client: client, fs: fsys}
+			err = srv.Backup(b)
+			if !client.archiveExists || !client.request.Successful || client.request.Size == 0 || client.request.Checksum == "" {
+				t.Fatalf("callback did not follow successful generation: %+v", client.request)
+			}
+			if _, statErr := os.Stat(b.Path()); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("archive was not removed: %v", statErr)
+			}
+			if !errors.Is(err, callbackError) {
+				t.Fatalf("Backup returned %v, want callback error %v", err, callbackError)
+			}
+		})
+	}
+}
 
 func TestEnvironmentVariablesTimezone(t *testing.T) {
 	config.Set(&config.Configuration{
@@ -164,6 +232,100 @@ func TestRestoreBackupPreservesDirectoryMetadata(t *testing.T) {
 						t.Fatalf("empty directory contents: %v, %v", entries, err)
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestRestoreBackupPreservesFilePermissions(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			configuration := &config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: t.TempDir()}}
+			configuration.System.User.Uid = os.Getuid()
+			configuration.System.User.Gid = os.Getgid()
+			config.Set(configuration)
+			source := t.TempDir()
+			files := []struct {
+				name    string
+				mode    os.FileMode
+				content string
+			}{
+				{"run.sh", 0o755, "#!/bin/sh\necho restored\n"},
+				{"private.txt", 0o600, "private"},
+				{"empty.sh", 0o750, ""},
+			}
+			for _, file := range files {
+				path := filepath.Join(source, file.name)
+				if err := os.WriteFile(path, []byte(file.content), file.mode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, file.mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sourceFS, err := filesystem.New(source, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sourceFS.UnixFS().Close() })
+			local := backup.NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", format)
+			if err := (&filesystem.Archive{Filesystem: sourceFS, Format: format}).Create(context.Background(), local.Path()); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(local.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, adapter := range []string{"local", "s3"} {
+				for _, existing := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/existing=%t", adapter, existing), func(t *testing.T) {
+						destination := t.TempDir()
+						if existing {
+							for _, file := range files {
+								path := filepath.Join(destination, file.name)
+								if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+									t.Fatal(err)
+								}
+								if err := os.Chmod(path, 0o644); err != nil {
+									t.Fatal(err)
+								}
+							}
+						}
+						destinationFS, err := filesystem.New(destination, 0, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() { _ = destinationFS.UnixFS().Close() })
+						client := &restoreStatusClient{}
+						srv := &Server{ctx: context.Background(), client: client, fs: destinationFS, Environment: offlineRestoreEnvironment{}}
+						var b backup.BackupInterface = local
+						var reader io.ReadCloser
+						if adapter == "s3" {
+							b = backup.NewS3(nil, local.Uuid, "", format)
+							reader = io.NopCloser(bytes.NewReader(data))
+						}
+						if err := srv.RestoreBackup(b, reader); err != nil {
+							t.Fatal(err)
+						}
+						if !client.successful {
+							t.Fatal("Panel was not notified of a successful restoration")
+						}
+						for _, file := range files {
+							path := filepath.Join(destination, file.name)
+							contents, err := os.ReadFile(path)
+							if err != nil || string(contents) != file.content {
+								t.Fatalf("restored %s contents: %q, %v", file.name, contents, err)
+							}
+							info, err := os.Stat(path)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if info.Mode().Perm() != file.mode {
+								t.Errorf("restored %s mode = %o, want %o", file.name, info.Mode().Perm(), file.mode)
+							}
+						}
+					})
+				}
 			}
 		})
 	}
