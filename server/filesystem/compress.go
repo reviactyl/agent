@@ -321,6 +321,35 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			}
 			return nil
 		}
+		if f.Mode()&iofs.ModeSymlink != 0 {
+			if err := fs.HasSpaceFor(0); err != nil {
+				return err
+			}
+			if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
+				return wrapError(err, opts.FileName)
+			}
+			// Create the link itself, never open its target as a regular file.
+			if err := fs.Symlink(f.LinkTarget, p); err != nil {
+				if !errors.Is(err, ufs.ErrExist) {
+					return wrapError(err, opts.FileName)
+				}
+				st, err := fs.unixFS.Lstat(p)
+				if err != nil {
+					return wrapError(err, opts.FileName)
+				}
+				if st.IsDir() {
+					return newFilesystemError(ErrCodeIsDirectory, nil)
+				}
+				if err := fs.unixFS.Remove(p); err != nil {
+					return wrapError(err, opts.FileName)
+				}
+				if err := fs.Symlink(f.LinkTarget, p); err != nil {
+					return wrapError(err, opts.FileName)
+				}
+			}
+			// Chown uses Lchown; do not apply Chtimes through the link.
+			return fs.chownFile(p)
+		}
 		r, err := f.Open()
 		if err != nil {
 			return err

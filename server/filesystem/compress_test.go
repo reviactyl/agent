@@ -6,12 +6,139 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/franela/goblin"
 )
+
+func TestFilesystem_DecompressSymlinks(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			content := strings.NewReader("original content")
+			if err := fs.Write("source/file.txt", content, content.Size(), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for name, target := range map[string]string{
+				"link.txt": "file.txt", "dangling.txt": "missing.txt", "directory": ".", "parent.txt": "../source/file.txt",
+			} {
+				if err := os.Symlink(target, filepath.Join(rfs.root, "server/source", name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			archive, err := fs.CompressFiles("/", []string{"source"}, format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Extract both over existing links and into a directory without parents.
+			for _, dir := range []string{"fresh", "/"} {
+				file := archive.Name()
+				if dir == "fresh" {
+					if err := fs.CreateDirectory(dir, "/"); err != nil {
+						t.Fatal(err)
+					}
+					file = "../" + file
+				}
+				if err := fs.DecompressFile(context.Background(), dir, file); err != nil {
+					t.Fatal(err)
+				}
+				for name, target := range map[string]string{
+					"link.txt": "file.txt", "dangling.txt": "missing.txt", "directory": ".", "parent.txt": "../source/file.txt",
+				} {
+					p := filepath.Join(rfs.root, "server", dir, "source", name)
+					got, err := os.Readlink(p)
+					if err != nil || got != target {
+						t.Fatalf("%s: target = %q, error = %v; want %q", p, got, err, target)
+					}
+				}
+				got, err := os.ReadFile(filepath.Join(rfs.root, "server", dir, "source/link.txt"))
+				if err != nil || string(got) != "original content" {
+					t.Fatalf("linked content = %q, error = %v", got, err)
+				}
+			}
+			// A previous extraction may have flattened the link into a file.
+			if err := fs.unixFS.Remove("source/link.txt"); err != nil {
+				t.Fatal(err)
+			}
+			old := strings.NewReader("file.txt")
+			if err := fs.Write("source/link.txt", old, old.Size(), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			before := fs.CachedUsage()
+			if err := fs.DecompressFile(context.Background(), "/", archive.Name()); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.Readlink(filepath.Join(rfs.root, "server/source/link.txt")); err != nil || got != "file.txt" {
+				t.Fatalf("replacement link = %q, error = %v", got, err)
+			}
+			if got := fs.CachedUsage(); got != before-old.Size() {
+				t.Fatalf("usage = %d, want %d", got, before-old.Size())
+			}
+		})
+	}
+}
+
+func TestFilesystem_DecompressSymlinkEscape(t *testing.T) {
+	for _, format := range []string{"tar", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			outside := t.TempDir()
+			var buf bytes.Buffer
+			if format == "tar" {
+				w := tar.NewWriter(&buf)
+				if err := w.WriteHeader(&tar.Header{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: outside, Mode: 0o777}); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.WriteHeader(&tar.Header{Name: "escape/payload", Typeflag: tar.TypeReg, Size: 4, Mode: 0o644}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Write([]byte("evil")); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				w := zip.NewWriter(&buf)
+				h := &zip.FileHeader{Name: "escape"}
+				h.SetMode(os.ModeSymlink | 0o777)
+				link, err := w.CreateHeader(h)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.WriteString(link, outside); err != nil {
+					t.Fatal(err)
+				}
+				file, err := w.Create("escape/payload")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.WriteString(file, "evil"); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			name := "attack." + format
+			if err := rfs.CreateServerFile(name, buf.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			if err := fs.DecompressFile(context.Background(), "/", name); err == nil {
+				t.Fatal("extraction through an external symlink succeeded")
+			}
+			if _, err := os.Stat(filepath.Join(outside, "payload")); !os.IsNotExist(err) {
+				t.Fatalf("outside payload: %v", err)
+			}
+		})
+	}
+}
 
 func TestFilesystem_DecompressGzipReplacesContents(t *testing.T) {
 	for _, tc := range []struct {
