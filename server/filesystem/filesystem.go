@@ -213,7 +213,7 @@ func (fs *Filesystem) CreateDirectory(name string, p string) error {
 }
 
 func (fs *Filesystem) Rename(oldpath, newpath string) error {
-	return fs.unixFS.Rename(oldpath, newpath)
+	return fs.unixFS.RenameWithMkdirAll(oldpath, newpath, fs.mkdirAll)
 }
 
 func (fs *Filesystem) Symlink(oldpath, newpath string) error {

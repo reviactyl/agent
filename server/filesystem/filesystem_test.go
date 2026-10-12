@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"unicode/utf8"
 
@@ -402,6 +403,52 @@ func TestFilesystem_CreateDirectory(t *testing.T) {
 			_ = fs.TruncateRootDirectory()
 		})
 	})
+}
+
+func TestFilesystem_RenameParentOwnership(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	fs.isTest = false
+	cfg := config.Get()
+	cfg.System.User.Uid = 65534
+	cfg.System.User.Gid = 65534
+	config.Set(cfg)
+	if err := rfs.CreateServerFileFromString("config.txt", "config"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(rfs.root, "server", "existing"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := fs.Rename("config.txt", "existing/fresh/nested/config.txt")
+	if os.Geteuid() != 0 {
+		if !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("rename should stop on failed ownership correction, got %v", err)
+		}
+		if _, err := rfs.StatServerFile("config.txt"); err != nil {
+			t.Fatalf("source was moved after failed ownership correction: %v", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"existing", "existing/fresh", "existing/fresh/nested"} {
+		info, err := rfs.StatServerFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		uid, gid, mode := uint32(65534), uint32(65534), os.FileMode(0o755)
+		if path == "existing" {
+			uid, gid, mode = uint32(os.Geteuid()), uint32(os.Getegid()), 0o700
+		}
+		if stat.Uid != uid || stat.Gid != gid || info.Mode().Perm() != mode {
+			t.Fatalf("%s: got ownership %d:%d mode %o, want %d:%d mode %o", path, stat.Uid, stat.Gid, info.Mode().Perm(), uid, gid, mode)
+		}
+	}
+	if _, err := rfs.StatServerFile("existing/fresh/nested/config.txt"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestFilesystem_Rename(t *testing.T) {
