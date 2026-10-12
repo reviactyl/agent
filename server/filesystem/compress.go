@@ -133,6 +133,13 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 			// Stop walking if the context is canceled.
 			return ctx.Err()
 		default:
+			if d.IsDir() {
+				return nil
+			}
+			destination := filepath.Join(dir, path)
+			if err := fs.IsIgnored(destination); err != nil {
+				return nil
+			}
 			info, err := d.Info()
 			if err != nil {
 				return err
@@ -140,6 +147,22 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 			fileSize := info.Size()
 			if fileSize <= 0 {
 				return nil
+			}
+			// Single-file compression exposes its source as ".", rather
+			// than the extracted destination. Keep its existing size check.
+			if path != "." {
+				existing, err := fs.unixFS.Stat(destination)
+				if err != nil && !errors.Is(err, ufs.ErrNotExist) {
+					return err
+				}
+				if err == nil {
+					if existing.IsDir() {
+						return newFilesystemError(ErrCodeIsDirectory, nil)
+					}
+					// Reserve only growth. Crediting shrinking files against
+					// other entries would depend on the extraction order.
+					fileSize = max(fileSize-existing.Size(), 0)
+				}
 			}
 			current := size.Load()
 			if fileSize > math.MaxInt64-current {
