@@ -3,8 +3,10 @@ package filesystem
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -15,9 +17,112 @@ import (
 
 	. "github.com/franela/goblin"
 	"github.com/mholt/archives"
+	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/internal/progress"
 	"golang.org/x/sys/unix"
 )
+
+type archiveLimitedWriter struct {
+	bytes.Buffer
+	remaining int
+}
+
+func (w *archiveLimitedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.remaining {
+		n, _ := w.Buffer.Write(p[:w.remaining])
+		w.remaining = 0
+		return n, unix.ENOSPC
+	}
+	w.remaining -= len(p)
+	return w.Buffer.Write(p)
+}
+
+func TestArchiveTarFinalization(t *testing.T) {
+	for _, format := range []string{"", "tar.gz"} {
+		for _, compression := range []string{"none", "best_speed", "best_compression"} {
+			t.Run(format+"/"+compression, func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+				config.Update(func(c *config.Configuration) {
+					c.System.Backups.CompressionLevel = compression
+				})
+				if err := rfs.CreateServerFileFromString("file.txt", "backup contents"); err != nil {
+					t.Fatal(err)
+				}
+				var complete bytes.Buffer
+				if err := (&Archive{Filesystem: fs, Format: format}).Stream(context.Background(), &complete); err != nil {
+					t.Fatal(err)
+				}
+				reader, err := gzip.NewReader(bytes.NewReader(complete.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, reader); err != nil {
+					t.Fatalf("successful archive is corrupt: %v", err)
+				}
+				_ = reader.Close()
+
+				// Leave space for all but the last byte of the gzip trailer.
+				writer := &archiveLimitedWriter{remaining: complete.Len() - 1}
+				err = (&Archive{Filesystem: fs, Format: format}).Stream(context.Background(), writer)
+				if !errors.Is(err, unix.ENOSPC) {
+					t.Errorf("expected final-write disk-full error, got %v", err)
+				}
+				reader, err = gzip.NewReader(bytes.NewReader(writer.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reader.Close()
+				if _, err := io.Copy(io.Discard, reader); !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("expected truncated gzip trailer, got %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestArchiveTarFinalizationPreservesWalkError(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	writer := &archiveLimitedWriter{}
+	if err := (&Archive{Filesystem: fs}).Stream(ctx, writer); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected original cancellation error, got %v", err)
+	}
+}
+
+type archiveWriterFunc func([]byte) (int, error)
+
+func (w archiveWriterFunc) Write(p []byte) (int, error) { return w(p) }
+
+func TestArchiveTarCloseError(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	if err := rfs.CreateServerFileFromString("file.txt", "backup contents"); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	writer := archiveWriterFunc(func(p []byte) (int, error) {
+		// Shrink the file after its TAR header was built, before copying its data.
+		if err := os.Truncate(filepath.Join(rfs.root, "server/file.txt"), 0); err != nil {
+			return 0, err
+		}
+		return output.Write(p)
+	})
+	err := (&Archive{Filesystem: fs}).Stream(context.Background(), writer)
+	if err == nil || !strings.Contains(err.Error(), "missed writing") {
+		t.Fatalf("expected incomplete TAR entry error, got %v", err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("gzip must still be closed after a TAR close error: %v", err)
+	}
+}
 
 func TestArchiveTarPreservesSymlinks(t *testing.T) {
 	for _, format := range []string{"", "tar.gz"} {
