@@ -416,16 +416,42 @@ func TestFilesystem_RenameParentOwnership(t *testing.T) {
 	if err := rfs.CreateServerFileFromString("config.txt", "config"); err != nil {
 		t.Fatal(err)
 	}
+	chownErr := os.Chown(filepath.Join(rfs.root, "server", "config.txt"), 65534, 65534)
+	if chownErr != nil && !errors.Is(chownErr, os.ErrPermission) {
+		t.Fatal(chownErr)
+	}
+	if err := os.Mkdir(filepath.Join(rfs.root, "mode-reference"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reference, err := os.Stat(filepath.Join(rfs.root, "mode-reference"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(rfs.root, "server", "existing"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err := fs.Rename("config.txt", "existing/fresh/nested/config.txt")
-	if os.Geteuid() != 0 {
+	err = fs.Rename("config.txt", "existing/fresh/nested/config.txt")
+	if chownErr != nil {
 		if !errors.Is(err, os.ErrPermission) {
 			t.Fatalf("rename should stop on failed ownership correction, got %v", err)
 		}
 		if _, err := rfs.StatServerFile("config.txt"); err != nil {
 			t.Fatalf("source was moved after failed ownership correction: %v", err)
+		}
+		if _, err := rfs.StatServerFile("existing/fresh"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("new parents remain after failed ownership correction: %v", err)
+		}
+		if err := fs.Rename("config.txt", "existing/fresh/nested/config.txt"); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("retry bypassed ownership correction: %v", err)
+		}
+		if _, err := rfs.StatServerFile("config.txt"); err != nil {
+			t.Fatalf("retry moved the source after failed ownership correction: %v", err)
+		}
+		if _, err := rfs.StatServerFile("existing/fresh"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("new parents remain after retry: %v", err)
+		}
+		if info, err := rfs.StatServerFile("existing"); err != nil || info.Mode().Perm() != 0o700 {
+			t.Fatalf("existing parent changed after failed rename: %v", err)
 		}
 		return
 	}
@@ -438,7 +464,7 @@ func TestFilesystem_RenameParentOwnership(t *testing.T) {
 			t.Fatal(err)
 		}
 		stat := info.Sys().(*syscall.Stat_t)
-		uid, gid, mode := uint32(65534), uint32(65534), os.FileMode(0o755)
+		uid, gid, mode := uint32(65534), uint32(65534), reference.Mode().Perm()
 		if path == "existing" {
 			uid, gid, mode = uint32(os.Geteuid()), uint32(os.Getegid()), 0o700
 		}
