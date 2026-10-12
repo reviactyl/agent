@@ -187,3 +187,64 @@ func testBackupGenerateRequiresUuidIdentifier(t *testing.T, createBackup func(st
 	}
 	t.Fatal("expected backup generation not to overwrite existing archive")
 }
+
+func TestBackupRoundTripEmptyDirectories(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			root := t.TempDir()
+			serverDir := filepath.Join(root, "server")
+			if err := os.MkdirAll(filepath.Join(serverDir, "empty/deep"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(serverDir, "file.txt"), []byte("backup content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: t.TempDir()}})
+			fsys, err := filesystem.New(serverDir, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			local := NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", format)
+			if err := (&filesystem.Archive{Filesystem: fsys, Format: format}).Create(context.Background(), local.Path()); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(local.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, adapter := range []string{"local", "s3"} {
+				t.Run(adapter, func(t *testing.T) {
+					restored := t.TempDir()
+					callback := func(name string, info fs.FileInfo, _ string, reader io.ReadCloser) error {
+						dst := filepath.Join(restored, name)
+						if info.IsDir() {
+							return os.MkdirAll(dst, info.Mode().Perm())
+						}
+						contents, err := io.ReadAll(reader)
+						if err != nil {
+							return err
+						}
+						return os.WriteFile(dst, contents, info.Mode().Perm())
+					}
+					var err error
+					if adapter == "local" {
+						err = local.Restore(context.Background(), nil, callback)
+					} else {
+						err = NewS3(nil, local.Uuid, "", format).Restore(context.Background(), bytes.NewReader(data), callback)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					info, err := os.Stat(filepath.Join(restored, "empty/deep"))
+					if err != nil || !info.IsDir() {
+						t.Fatalf("empty directory was not restored: %v", err)
+					}
+					content, err := os.ReadFile(filepath.Join(restored, "file.txt"))
+					if err != nil || string(content) != "backup content" {
+						t.Fatalf("restored file: %q, %v", content, err)
+					}
+				})
+			}
+		})
+	}
+}

@@ -184,7 +184,10 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 	var callback walkFunc
 	if len(a.Files) == 0 && len(a.Ignore) > 0 {
 		i := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
-		callback = a.callback(func(_ int, _, relative string, _ ufs.DirEntry) error {
+		callback = a.callback(func(_ int, _, relative string, d ufs.DirEntry) error {
+			if d.IsDir() {
+				relative = strings.TrimSuffix(relative, "/") + "/"
+			}
 			if i.MatchesPath(relative) {
 				return SkipThis
 			}
@@ -229,8 +232,8 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 		base = filepath.Base(a.BaseDirectory) + "/"
 	}
 	return func(dirfd int, name, relative string, d ufs.DirEntry) error {
-		// Skip directories because we are walking them recursively.
-		if d.IsDir() {
+		// Skip the walk root, but include directory entries so empty folders survive extraction.
+		if d.IsDir() && relative == "." {
 			return nil
 		}
 
@@ -253,8 +256,7 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 			}
 		}
 
-		// Add the file to the archive, if it is nested in a directory,
-		// the directory will be automatically "created" in the archive.
+		// Add the selected file or directory without stopping traversal of its children.
 		return a.addToArchive(dirfd, name, relative, d)
 	}
 }
@@ -300,7 +302,7 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return nil
 	}
 	if a.zw != nil {
-		if !s.Mode().IsRegular() && s.Mode()&fs.ModeSymlink == 0 {
+		if !s.Mode().IsRegular() && !s.IsDir() && s.Mode()&fs.ModeSymlink == 0 {
 			return nil
 		}
 		header, err := zip.FileInfoHeader(s)
@@ -309,6 +311,12 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		}
 		header.Name = filepath.ToSlash(relative)
 		header.Method = zip.Deflate
+		if s.IsDir() {
+			header.Name = strings.TrimSuffix(header.Name, "/") + "/"
+			header.Method = zip.Store
+			_, err := a.zw.CreateHeader(header)
+			return err
+		}
 		if s.Mode()&fs.ModeSymlink != 0 {
 			target := make([]byte, 4096)
 			n, err := unix.Readlinkat(dirfd, name, target)

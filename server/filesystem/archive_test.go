@@ -192,7 +192,11 @@ func TestArchiveTarPreservesSymlinks(t *testing.T) {
 							}
 						}
 					}
-					if len(entries) != len(links)+1 {
+					directoryCount := 2
+					if selection == "base" {
+						directoryCount = 1
+					}
+					if len(entries) != len(links)+1+directoryCount {
 						t.Fatalf("unexpected TAR entries: %v", entries)
 					}
 					for name, target := range links {
@@ -383,4 +387,95 @@ func getFiles(f iofs.ReadDirFS, name string) ([]string, error) {
 	}
 
 	return v, nil
+}
+
+func TestArchivePreservesEmptyDirectories(t *testing.T) {
+	for _, format := range []string{"", "tar.gz", "zip"} {
+		for _, selection := range []string{"all", "files", "ignore", "base", "nested file"} {
+			t.Run(format+"/"+selection, func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = fs.unixFS.Close(); _ = os.RemoveAll(rfs.root) })
+				for _, dir := range []string{"nested/empty", "nested/tree/leaf", "excluded"} {
+					if err := os.MkdirAll(filepath.Join(rfs.root, "server", dir), 0o750); err != nil {
+						t.Fatal(err)
+					}
+				}
+				content := strings.NewReader("archive content")
+				if err := fs.Write("nested/file.txt", content, content.Size(), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				a := &Archive{Filesystem: fs, Format: format}
+				expected := []string{"nested", "nested/empty", "nested/tree", "nested/tree/leaf", "excluded"}
+				fileName := "nested/file.txt"
+				switch selection {
+				case "files":
+					a.Files = []string{"nested/empty", "nested/tree", "nested/file.txt"}
+					expected = expected[1:4]
+				case "ignore":
+					a.Ignore = "excluded/\nnested/tree/"
+					expected = expected[:2]
+				case "base":
+					a.BaseDirectory = "nested"
+					expected = []string{"empty", "tree", "tree/leaf"}
+					fileName = "file.txt"
+				case "nested file":
+					a.Files = []string{"nested/file.txt"}
+					expected = nil
+				}
+				archivePath := filepath.Join(t.TempDir(), "roundtrip."+format)
+				if format == "" {
+					archivePath += "tar.gz"
+				}
+				if err := a.Create(context.Background(), archivePath); err != nil {
+					t.Fatal(err)
+				}
+				archive, err := os.Open(archivePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer archive.Close()
+				extractor := archives.Extractor(archives.CompressedArchive{Compression: archives.Gz{}, Extraction: archives.Tar{}})
+				if format == "zip" {
+					extractor = archives.Zip{}
+				}
+				directories := map[string]bool{}
+				if err := extractor.Extract(context.Background(), archive, func(_ context.Context, f archives.FileInfo) error {
+					if f.IsDir() {
+						directories[strings.TrimSuffix(f.NameInArchive, "/")] = true
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if len(directories) != len(expected) {
+					t.Fatalf("directories = %v, want %v", directories, expected)
+				}
+				for _, dir := range expected {
+					if !directories[dir] {
+						t.Fatalf("missing directory %q", dir)
+					}
+				}
+				archiveData, err := os.ReadFile(archivePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.Write("restored/"+filepath.Base(archivePath), strings.NewReader(string(archiveData)), int64(len(archiveData)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.DecompressFile(context.Background(), "restored", filepath.Base(archivePath)); err != nil {
+					t.Fatal(err)
+				}
+				for _, dir := range expected {
+					info, err := os.Stat(filepath.Join(rfs.root, "server/restored", dir))
+					if err != nil || !info.IsDir() {
+						t.Fatalf("restored directory %q: %v", dir, err)
+					}
+				}
+				data, err := os.ReadFile(filepath.Join(rfs.root, "server/restored", fileName))
+				if err != nil || string(data) != "archive content" {
+					t.Fatalf("restored file %q: %q, %v", fileName, data, err)
+				}
+			})
+		}
+	}
 }
