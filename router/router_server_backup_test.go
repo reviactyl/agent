@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -347,4 +349,63 @@ func setBackupRestoreAllowlist(t *testing.T, entries []string) {
 	next := *previous
 	next.System.Backups.RestoreHostAllowlist = entries
 	config.Set(&next)
+}
+
+func TestPostServerRestoreBackupPreflightPreservesFiles(t *testing.T) {
+	for _, scenario := range []string{"missing local", "remote status", "remote content type", "remote connection"} {
+		t.Run(scenario, func(t *testing.T) {
+			previous := config.Get()
+			cfg := &config.Configuration{AuthenticationToken: "test-token", System: config.SystemConfiguration{Data: t.TempDir(), BackupDirectory: t.TempDir()}}
+			config.Set(cfg)
+			t.Cleanup(func() { config.Set(previous) })
+			setBackupRestoreAllowlist(t, []string{"127.0.0.1"})
+			client := backupTestRemoteClient{restoreStatus: make(chan string, 1)}
+			body := `{"adapter":"agent","truncate_directory":true}`
+			if scenario != "missing local" {
+				remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if scenario == "remote status" {
+						http.Error(w, "missing", http.StatusNotFound)
+						return
+					}
+					w.Header().Set("Content-Type", "text/plain")
+					_, _ = w.Write([]byte("not an archive"))
+				}))
+				defer remoteServer.Close()
+				if scenario == "remote connection" {
+					remoteServer.Close()
+				}
+				body = fmt.Sprintf(`{"adapter":"s3","truncate_directory":true,"download_url":%q}`, remoteServer.URL)
+			}
+			c, _, unused := newBackupRestoreContext(t, client, "11111111-1111-1111-1111-111111111111", body)
+			unused.CtxCancel()
+			s, err := wserver.NewEmptyManager(client).InitServer(remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"server"}`), ProcessConfiguration: &remote.ProcessConfiguration{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.CtxCancel()
+			defer s.Filesystem().UnixFS().Close()
+			s.Environment = backupTestEnvironment{}
+			c.Set("server", s)
+			world := filepath.Join(s.Filesystem().Path(), "world.dat")
+			if err := os.WriteFile(world, []byte("live world"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			postServerRestoreBackup(c)
+			if !c.IsAborted() {
+				t.Fatal("expected failed preflight to abort restoration")
+			}
+			if s.IsRestoring() {
+				t.Fatal("restoring state remained set after failed preflight")
+			}
+			content, err := os.ReadFile(world)
+			if err != nil || string(content) != "live world" {
+				t.Fatalf("live world changed after aborted restore: content=%q error=%v", content, err)
+			}
+			select {
+			case <-client.restoreStatus:
+				t.Fatal("restore started after failed preflight")
+			default:
+			}
+		})
+	}
 }
