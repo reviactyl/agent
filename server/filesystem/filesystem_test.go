@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -982,5 +983,44 @@ func TestWriteStreamQuotaWithDiskScans(t *testing.T) {
 				t.Fatalf("staging file was not cleaned up: %v, %v", entries, err)
 			}
 		})
+	}
+}
+
+func TestWritePreservesExistingPermissions(t *testing.T) {
+	for _, mode := range []os.FileMode{0o755, 0o700, 0o640} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mode=%o/streaming=%t", mode, streaming), func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+				if err := fs.Write("script.sh", bytes.NewBufferString("old"), 3, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.Chmod("script.sh", mode); err != nil {
+					t.Fatal(err)
+				}
+				contents := "#!/bin/sh\nprintf 'updated\\n'\n"
+				size := int64(len(contents))
+				if streaming {
+					size = -1
+				}
+				if err := fs.Write("script.sh", bytes.NewBufferString(contents), size, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(rfs.root, "server", "script.sh")
+				st, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if st.Mode().Perm() != mode {
+					t.Fatalf("permissions = %o, want %o", st.Mode().Perm(), mode)
+				}
+				if mode&0o100 != 0 {
+					output, err := exec.Command(path).Output()
+					if err != nil || string(output) != "updated\n" {
+						t.Fatalf("script execution = %q, error = %v", output, err)
+					}
+				}
+			})
+		}
 	}
 }

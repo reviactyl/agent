@@ -46,8 +46,14 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode) (err
 	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
 		return err
 	}
-	if err == nil && st.Mode().IsRegular() && st.Sys().(*unix.Stat_t).Nlink == 1 {
-		removedSize = st.Size()
+	if err == nil && st.Mode().IsRegular() {
+		stat := st.Sys().(*unix.Stat_t)
+		if err := fs.unixFS.Chmod(staged, ufs.FileMode(stat.Mode&0o7777)); err != nil {
+			return err
+		}
+		if stat.Nlink == 1 {
+			removedSize = st.Size()
+		}
 	}
 	if err := fs.unixFS.Replace(staged, p); err != nil {
 		return err
