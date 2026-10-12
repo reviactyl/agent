@@ -159,11 +159,19 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 		// Create a new gzip writer around the file.
 		gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
 		_ = gw.SetConcurrency(1<<20, 1)
-		defer gw.Close()
+		defer func() {
+			if err := gw.Close(); streamErr == nil {
+				streamErr = err
+			}
+		}()
 
 		// Create a new tar writer around the gzip writer.
 		tw := tar.NewWriter(gw)
-		defer tw.Close()
+		defer func() {
+			if err := tw.Close(); streamErr == nil {
+				streamErr = err
+			}
+		}()
 
 		a.w = NewTarProgress(tw, a.Progress)
 	}
