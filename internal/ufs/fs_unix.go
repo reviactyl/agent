@@ -435,6 +435,14 @@ func (fs *UnixFS) unlinkat(dirfd int, name string, flags int) error {
 //
 // If there is an error, it will be of type *LinkError.
 func (fs *UnixFS) Rename(oldpath, newpath string) error {
+	return fs.RenameWithMkdirAll(oldpath, newpath, func(path string, mode FileMode) error {
+		_, err := fs.MkdirAll(path, mode)
+		return err
+	})
+}
+
+// RenameWithMkdirAll renames a path using mkdirAll to create missing destination parents.
+func (fs *UnixFS) RenameWithMkdirAll(oldpath, newpath string, mkdirAll func(string, FileMode) error) error {
 	// Simple case: both paths are the same.
 	if oldpath == newpath {
 		return nil
@@ -470,7 +478,7 @@ func (fs *UnixFS) Rename(oldpath, newpath string) error {
 		if !errors.As(err, &pathErr) {
 			return err
 		}
-		if _, err := fs.MkdirAll(pathErr.Path, 0o755); err != nil {
+		if err := mkdirAll(pathErr.Path, 0o755); err != nil {
 			return err
 		}
 		newdirfd, newname, closeFd2, err = fs.safePath(newpath)
