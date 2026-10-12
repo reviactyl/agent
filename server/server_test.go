@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,72 @@ import (
 	"github.com/reviactyl/agent/server/backup"
 	"github.com/reviactyl/agent/server/filesystem"
 )
+
+type backupStatusClient struct {
+	remote.Client
+	err           error
+	request       remote.BackupRequest
+	archivePath   string
+	archiveExists bool
+}
+
+type callbackTestBackup struct {
+	*backup.LocalBackup
+}
+
+func (b callbackTestBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignored string) (*backup.ArchiveDetails, error) {
+	if err := (&filesystem.Archive{Filesystem: fsys, Format: b.Format, Ignore: ignored}).Create(ctx, b.Path()); err != nil {
+		return nil, err
+	}
+	checksum, err := b.Checksum()
+	if err != nil {
+		return nil, err
+	}
+	size, err := b.Size()
+	if err != nil {
+		return nil, err
+	}
+	return &backup.ArchiveDetails{Checksum: fmt.Sprintf("%x", checksum), ChecksumType: "sha1", Size: size}, nil
+}
+
+func (c *backupStatusClient) SetBackupStatus(_ context.Context, _ string, request remote.BackupRequest) error {
+	c.request = request
+	_, err := os.Stat(c.archivePath)
+	c.archiveExists = err == nil
+	return c.err
+}
+
+func TestBackupReturnsCallbackError(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			configuration := &config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: t.TempDir()}}
+			config.Set(configuration)
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("backup content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fsys, err := filesystem.New(source, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = fsys.UnixFS().Close() })
+			callbackError := errors.New("Panel callback failed")
+			b := callbackTestBackup{backup.NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", format)}
+			client := &backupStatusClient{err: callbackError, archivePath: b.Path()}
+			srv := &Server{ctx: context.Background(), client: client, fs: fsys}
+			err = srv.Backup(b)
+			if !client.archiveExists || !client.request.Successful || client.request.Size == 0 || client.request.Checksum == "" {
+				t.Fatalf("callback did not follow successful generation: %+v", client.request)
+			}
+			if _, statErr := os.Stat(b.Path()); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("archive was not removed: %v", statErr)
+			}
+			if !errors.Is(err, callbackError) {
+				t.Fatalf("Backup returned %v, want callback error %v", err, callbackError)
+			}
+		})
+	}
+}
 
 func TestEnvironmentVariablesTimezone(t *testing.T) {
 	config.Set(&config.Configuration{
