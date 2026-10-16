@@ -30,6 +30,9 @@ type Filesystem struct {
 	mu sync.RWMutex
 	// reserved is the space reserved by writes that have not finished yet.
 	reserved int64
+	// activeKnownSizeWrites prevents scans from lowering usage while a known-size
+	// write may have truncated its destination before finishing.
+	activeKnownSizeWrites int64
 	// walking is set while the disk usage is being calculated, during which
 	// walkReserved is the space reserved by writes in progress at any point.
 	walking      bool
@@ -219,10 +222,18 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 		return err
 	}
 	reserved := max(newSize-currentSize, 0)
+	fs.mu.Lock()
+	fs.activeKnownSizeWrites++
+	fs.mu.Unlock()
 	// Release the reservation even if reading r panics, since the panic is
 	// recovered and the reservation would otherwise last until Agent restarts.
 	var used int64
-	defer func() { fs.releaseDisk(reserved, used) }()
+	defer func() {
+		fs.releaseDisk(reserved, used)
+		fs.mu.Lock()
+		fs.activeKnownSizeWrites--
+		fs.mu.Unlock()
+	}()
 
 	if err := file.Truncate(0); err != nil {
 		return err

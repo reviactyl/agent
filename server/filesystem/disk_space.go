@@ -170,15 +170,20 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 
 	// If managed writes change disk usage during a scan, repeat it so those
 	// writes are reflected by the scan rather than double-counted as a delta.
+	const maxWalkPasses = 2
 	var size int64
 	var err error
-	for {
+	changedDuringFinalPass := false
+	for pass := 0; ; pass++ {
 		size, err = fs.DirectorySize("/")
 		fs.mu.Lock()
 		if err == nil && fs.walkCompleted > 0 {
 			fs.walkCompleted = 0
-			fs.mu.Unlock()
-			continue
+			if pass+1 < maxWalkPasses {
+				fs.mu.Unlock()
+				continue
+			}
+			changedDuringFinalPass = true
 		}
 		break
 	}
@@ -188,11 +193,12 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.lastLookupTime.Set(time.Now())
 
 	// Include writes still in progress. A successful walk can still lower stale
-	// cached usage when files were removed outside this process.
+	// cached usage when files were removed outside this process. Keep the current
+	// cache as a floor when a write is active or the final pass changed during
+	// the scan, since either case can make the walk miss managed usage changes.
+	// Failed partial walks also retain the existing cache as a floor.
 	usage := size + fs.walkReserved
-	if err != nil {
-		// A partial walk cannot establish the full usage, so don't lower the
-		// current cache based on its incomplete result.
+	if err != nil || changedDuringFinalPass || fs.activeKnownSizeWrites > 0 {
 		usage = max(usage, fs.unixFS.Usage())
 	}
 	fs.unixFS.SetUsage(usage)
