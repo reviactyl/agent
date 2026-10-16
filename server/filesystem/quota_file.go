@@ -51,6 +51,17 @@ func (f *quotaFile) WriteAt(p []byte, off int64) (int, error) {
 	})
 }
 
+// CheckSize checks whether replacing this file's contents with a file of the
+// given size would fit the disk limit, without changing the file.
+func (f *quotaFile) CheckSize(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if size <= f.size {
+		return nil
+	}
+	return f.fs.HasSpaceFor(size - f.size)
+}
+
 func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)) (int, error) {
 	previousSize := f.size
 	end, ok := quotaWriteEnd(off, len(p))
