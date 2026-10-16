@@ -177,18 +177,14 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	// cause the disk to be walked on every call.
 	fs.lastLookupTime.Set(time.Now())
 
-	// The walk may or may not have seen the data written by writes that are still in progress, so
-	// add the space reserved for them. Otherwise, a write that started before the walk could write
-	// past the disk limit. Writes that finished during the walk are not added, since the walk has
-	// usually already counted them, and counting them twice could make the server appear to be
-	// over its limit. Either error is corrected by the next walk.
+	// The walk may not have seen writes that finished during it. Keep the larger
+	// of the walk result plus outstanding reservations and the current cache, which
+	// includes completed writes' accounting adjustments.
 	fs.mu.Lock()
 	usage := size + fs.walkReserved
-	if err != nil {
-		// A walk that failed part of the way through has only counted some of the files, so
-		// never lower the usage because of one.
-		usage = max(usage, fs.unixFS.Usage())
-	}
+	// A partial walk or a completed write may have left the cache higher than
+	// the walk result. Never lower usage below that value.
+	usage = max(usage, fs.unixFS.Usage())
 	fs.unixFS.SetUsage(usage)
 	fs.walking = false
 	fs.mu.Unlock()
