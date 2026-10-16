@@ -21,6 +21,7 @@ import (
 	"github.com/reviactyl/agent/internal/models"
 	"github.com/reviactyl/agent/remote"
 	wserver "github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 func init() {
@@ -198,6 +199,24 @@ func TestPostServerRestoreBackupRejectsLoopbackDownloadURL(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestPostServerBackupRejectsInvalidIgnoreList(t *testing.T) {
+	client := backupTestRemoteClient{}
+	backupID := "11111111-1111-1111-1111-111111111111"
+	ignore := strings.Repeat("*a", filesystem.MaxIgnorePatternWildcards+1)
+	c, w, s := newBackupRestoreContext(t, client, backupID, fmt.Sprintf(`{"adapter":"wings","uuid":%q,"ignore":%q}`, backupID, ignore))
+	defer s.CtxCancel()
+
+	postServerBackup(c)
+
+	if c.Writer.Status() != http.StatusBadRequest {
+		t.Fatalf("expected invalid ignore list to be rejected, got status %d body %s", c.Writer.Status(), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "wildcards") {
+		t.Fatalf("expected error to describe the wildcard limit, got body %s", w.Body.String())
+	}
+}
+
 
 func TestPostServerRestoreBackupRejectsNonUuidBackupID(t *testing.T) {
 	client := backupTestRemoteClient{restoreStatus: make(chan string, 1)}

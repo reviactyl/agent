@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/juju/ratelimit"
@@ -144,6 +145,36 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 		return errors.New("filesystem: unsupported archive format")
 	}
 
+	// If we're specifically looking for only certain files, or have requested
+	// that certain files be ignored we'll update the callback function to reflect
+	// that request. Ignore patterns are compiled before anything is written so that
+	// an invalid list does not leave an empty archive behind.
+	var callback walkFunc
+	if len(a.Files) == 0 && len(a.Ignore) > 0 {
+		i, err := compileIgnore(a.Ignore)
+		if err != nil {
+			return errors.WrapIf(err, "filesystem: unable to compile archive ignore patterns")
+		}
+		// Time each evaluation and abort if the patterns prove disproportionately
+		// expensive for this server's file tree.
+		budget := newIgnoreMatchBudget()
+		callback = a.callback(func(_ int, _, relative string, _ ufs.DirEntry) error {
+			start := time.Now()
+			skip := i.MatchesPath(relative)
+			if err := budget.track(time.Since(start)); err != nil {
+				return err
+			}
+			if skip {
+				return SkipThis
+			}
+			return nil
+		})
+	} else if len(a.Files) > 0 {
+		callback = a.withFilesCallback()
+	} else {
+		callback = a.callback()
+	}
+
 	if a.zw == nil {
 		// Choose which compression level to use based on the compression_level configuration option
 		var compressionLevel int
@@ -177,27 +208,6 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 	}
 
 	fs := a.Filesystem.unixFS
-
-	// If we're specifically looking for only certain files, or have requested
-	// that certain files be ignored we'll update the callback function to reflect
-	// that request.
-	var callback walkFunc
-	if len(a.Files) == 0 && len(a.Ignore) > 0 {
-		i := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
-		callback = a.callback(func(_ int, _, relative string, d ufs.DirEntry) error {
-			if d.IsDir() {
-				relative = strings.TrimSuffix(relative, "/") + "/"
-			}
-			if i.MatchesPath(relative) {
-				return SkipThis
-			}
-			return nil
-		})
-	} else if len(a.Files) > 0 {
-		callback = a.withFilesCallback()
-	} else {
-		callback = a.callback()
-	}
 
 	// Open the base directory we were provided.
 	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)

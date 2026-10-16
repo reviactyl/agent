@@ -21,6 +21,7 @@ import (
 	"github.com/reviactyl/agent/router/middleware"
 	"github.com/reviactyl/agent/server"
 	"github.com/reviactyl/agent/server/backup"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 var blockedBackupRestorePrefixes = []netip.Prefix{
@@ -58,6 +59,11 @@ func postServerBackup(c *gin.Context) {
 	}
 	if data.Format != "tar.gz" && data.Format != "zip" {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "Unsupported backup format."})
+		return
+	}
+
+	if err := filesystem.ValidateIgnore(data.Ignore); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
