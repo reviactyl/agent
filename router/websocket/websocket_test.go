@@ -103,7 +103,7 @@ func signToken(t *testing.T, forServer string, permissions ...string) (string, *
 
 func signTokenFor(t *testing.T, forServer string, userUuid string, permissions ...string) (string, *tokens.WebsocketPayload) {
 	t.Helper()
-	// Tokens issued before Wings booted are rejected, and the issued time only has
+	// Tokens issued before Agent booted are rejected, and the issued time only has
 	// second precision.
 	now := time.Now().Add(time.Second * 2)
 	payload := tokens.WebsocketPayload{

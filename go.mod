@@ -15,6 +15,8 @@ require (
 	github.com/beevik/etree v1.8.1
 	github.com/buger/jsonparser v1.6.1
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/containerd/errdefs v0.3.0
+	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/creasty/defaults v1.11.0
 	github.com/distribution/reference v0.6.0
 	github.com/docker/docker v28.5.2+incompatible
@@ -66,8 +68,6 @@ require (
 	github.com/bytedance/sonic/loader v0.2.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.5 // indirect
-	github.com/containerd/errdefs v0.3.0 // indirect
-	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect

@@ -188,7 +188,7 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 	}
 	reserved := max(newSize-currentSize, 0)
 	// Release the reservation even if reading r panics, since the panic is
-	// recovered and the reservation would otherwise last until Wings restarts.
+	// recovered and the reservation would otherwise last until Agent restarts.
 	var used int64
 	defer func() { fs.releaseDisk(reserved, used) }()
 

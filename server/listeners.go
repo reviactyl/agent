@@ -14,12 +14,6 @@ import (
 	"github.com/reviactyl/agent/environment"
 )
 
-var dockerEvents = []string{
-	environment.DockerImagePullStatus,
-	environment.DockerImagePullStarted,
-	environment.DockerImagePullCompleted,
-}
-
 type diskSpaceLimiter struct {
 	o      sync.Once
 	mu     sync.Mutex

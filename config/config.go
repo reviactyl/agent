@@ -393,7 +393,7 @@ type Configuration struct {
 }
 
 // PanelConfiguration contains the only configuration values the Panel is allowed
-// to set on a node. Everything else in the configuration controls how Wings itself
+// to set on a node. Everything else in the configuration controls how Agent itself
 // runs on the host and must only be changed by the node operator.
 type PanelConfiguration struct {
 	Debug   bool   `json:"debug"`

@@ -26,7 +26,7 @@ func startTimeoutTestServer(t *testing.T) string {
 }
 
 // startTimeoutTestServerWithClosed starts the server as it is configured for
-// Wings, with shorter timeouts, also returning the number of connections the
+// Agent, with shorter timeouts, also returning the number of connections the
 // server has closed.
 func startTimeoutTestServerWithClosed(t *testing.T) (string, *atomic.Int64) {
 	t.Helper()
@@ -68,9 +68,9 @@ func startTimeoutTestServerWithClosed(t *testing.T) (string, *atomic.Int64) {
 // Requests have a deadline whichever way they are routed.
 func TestSlowRequestBodiesAreTimedOutBeforeRouting(t *testing.T) {
 	requests := map[string]string{
-		"redirect": "POST /upload/file/ HTTP/1.1\r\nHost: wings\r\nContent-Length: 1000\r\n\r\n",
-		"chunked":  "POST /api/servers/ HTTP/1.1\r\nHost: wings\r\nTransfer-Encoding: chunked\r\n\r\n",
-		"options":  "OPTIONS * HTTP/1.1\r\nHost: wings\r\nContent-Length: 1000\r\n\r\n",
+		"redirect": "POST /upload/file/ HTTP/1.1\r\nHost: agent\r\nContent-Length: 1000\r\n\r\n",
+		"chunked":  "POST /api/servers/ HTTP/1.1\r\nHost: agent\r\nTransfer-Encoding: chunked\r\n\r\n",
+		"options":  "OPTIONS * HTTP/1.1\r\nHost: agent\r\nContent-Length: 1000\r\n\r\n",
 	}
 	for name, head := range requests {
 		t.Run(name, func(t *testing.T) {
@@ -108,7 +108,7 @@ func TestSlowResponseReadsAreTimedOut(t *testing.T) {
 
 	// Enough responses to fill the socket buffers, which are never read.
 	go func() {
-		req := []byte("GET /api/system HTTP/1.1\r\nHost: wings\r\n\r\n")
+		req := []byte("GET /api/system HTTP/1.1\r\nHost: agent\r\n\r\n")
 		for i := 0; i < 40000; i++ {
 			if _, err := conn.Write(req); err != nil {
 				return
@@ -154,7 +154,7 @@ func TestSlowRequestHeadersAreTimedOut(t *testing.T) {
 	}
 	defer conn.Close()
 
-	go trickle(conn, "GET /api/system HTTP/1.1\r\nHost: wings\r\nX-Slow: "+strings.Repeat("a", 1000), time.Millisecond*50)
+	go trickle(conn, "GET /api/system HTTP/1.1\r\nHost: agent\r\nX-Slow: "+strings.Repeat("a", 1000), time.Millisecond*50)
 	if err := waitForClose(conn, time.Second*3); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestSlowUnauthenticatedRequestBodyIsTimedOut(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if _, err := conn.Write([]byte("POST /api/update HTTP/1.1\r\nHost: wings\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n")); err != nil {
+	if _, err := conn.Write([]byte("POST /api/update HTTP/1.1\r\nHost: agent\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
 	go trickle(conn, strings.Repeat(" ", 1000), time.Millisecond*50)
@@ -186,7 +186,7 @@ func TestSlowAuthenticatedRequestBodyIsAllowed(t *testing.T) {
 	defer conn.Close()
 
 	body := `{"token_id":"test-id","token":"test-token"}`
-	if _, err := conn.Write([]byte("POST /api/update HTTP/1.1\r\nHost: wings\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n")); err != nil {
+	if _, err := conn.Write([]byte("POST /api/update HTTP/1.1\r\nHost: agent\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
 	// Takes well over the deadline for unauthenticated requests to send.

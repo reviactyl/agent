@@ -1,5 +1,5 @@
 // Package network contains helpers for deciding which network destinations
-// Wings may connect to on behalf of a user.
+// Agent may connect to on behalf of a user.
 package network
 
 import (

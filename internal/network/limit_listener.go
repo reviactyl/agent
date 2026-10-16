@@ -47,7 +47,7 @@ func (l *limitListener) warn() {
 	if (last != 0 && now-last < int64(limitWarnInterval)) || !l.lastWarn.CompareAndSwap(last, now) {
 		return
 	}
-	log.WithField("limit", l.limit).Warn(l.name + ": reached the maximum number of open connections, new connections will wait until others close (raise the open file limit for Wings to allow more)")
+	log.WithField("limit", l.limit).Warn(l.name + ": reached the maximum number of open connections, new connections will wait until others close (raise the open file limit for Agent to allow more)")
 }
 
 type limitListenerConn struct {

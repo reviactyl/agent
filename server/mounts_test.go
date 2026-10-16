@@ -222,7 +222,7 @@ func TestCustomMountsWithoutMountsDoNotResolveAllowedMounts(t *testing.T) {
 	}
 }
 
-// A skipped mount is otherwise only visible in the Wings logs, while anything
+// A skipped mount is otherwise only visible in the Agent logs, while anything
 // written to its target silently ends up inside the container.
 func TestSkippedCustomMountIsReportedInConsole(t *testing.T) {
 	root := setupMountTest(t, "mnt")

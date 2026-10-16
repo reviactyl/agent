@@ -77,9 +77,6 @@ type Server struct {
 	sftpBag     *system.ContextBag
 
 	sinks map[system.SinkName]*system.SinkPool
-
-	logSink     *system.SinkPool
-	installSink *system.SinkPool
 }
 
 // New returns a new server instance with a context and all of the default

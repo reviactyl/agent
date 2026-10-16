@@ -169,7 +169,7 @@ func (b *Backup) Checksum() ([]byte, error) {
 // the disk to the caller.
 func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*ArchiveDetails, error) {
 	ad := ArchiveDetails{ChecksumType: "sha1", Parts: parts}
-	g, ctx := errgroup.WithContext(ctx)
+	var g errgroup.Group
 
 	g.Go(func() error {
 		resp, err := b.Checksum()

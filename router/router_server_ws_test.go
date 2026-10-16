@@ -75,7 +75,7 @@ func dialWebsocket(t *testing.T, url string) (*ws.Conn, error) {
 // authenticationMessage returns a message authenticating with a valid token.
 func authenticationMessage(t *testing.T) websocket.Message {
 	t.Helper()
-	// Tokens issued before Wings booted are rejected, and the issued time only has
+	// Tokens issued before Agent booted are rejected, and the issued time only has
 	// second precision.
 	now := time.Now().Add(time.Second * 2)
 	payload := tokens.WebsocketPayload{
