@@ -38,8 +38,14 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, repl
 	defer func() {
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
+		var stagedSize int64
+		if st, statErr := fs.unixFS.Lstat(staged); statErr == nil && st.Mode().IsRegular() {
+			stagedSize = st.Size()
+		}
 		if cleanupErr := fs.unixFS.Remove(staged); !errors.Is(cleanupErr, ufs.ErrNotExist) {
 			err = errors.Join(err, cleanupErr)
+		} else if stagedSize > 0 {
+			fs.addDisk(-stagedSize)
 		}
 	}()
 	n, copyErr := io.Copy(streamWriter{fs: fs, file: file, credit: credit}, r)
@@ -69,6 +75,13 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, repl
 		if stat.Nlink == 1 {
 			removedSize = st.Size()
 		}
+	}
+	// The destination may have been deleted or changed while the staged write
+	// was in progress, invalidating the credit used by streamWriter. Check the
+	// actual resulting usage before committing the replacement.
+	limit := fs.MaxDisk()
+	if limit > 0 && fs.CachedUsage()-removedSize > limit {
+		return n, newFilesystemError(ErrCodeDiskSpace, nil)
 	}
 	if err := fs.unixFS.Replace(staged, p); err != nil {
 		return n, err
