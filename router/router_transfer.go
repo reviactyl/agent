@@ -259,9 +259,6 @@ out:
 // removed, since the server still exists on the node it was being transferred
 // from.
 func completeIncomingTransfer(manager *server.Manager, trnsfr *transfer.Transfer, successful bool) {
-	// Remove the transfer from the list of incoming transfers.
-	transfer.Incoming().Remove(trnsfr)
-
 	if !successful {
 		trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
 		manager.Remove(func(match *server.Server) bool {
@@ -275,6 +272,9 @@ func completeIncomingTransfer(manager *server.Manager, trnsfr *transfer.Transfer
 			trnsfr.Log().WithError(err).Warn("failed to delete local server files")
 		}
 	}
+	// Keep failed transfers registered until their files have been removed so
+	// another transfer with the same UUID cannot start during cleanup.
+	transfer.Incoming().Remove(trnsfr)
 
 	if err := manager.Client().SetTransferStatus(context.Background(), trnsfr.Server.ID(), successful); err != nil {
 		trnsfr.Log().WithField("status", successful).WithError(err).Error("failed to set transfer status on panel")
