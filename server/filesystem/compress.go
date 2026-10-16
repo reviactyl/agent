@@ -9,7 +9,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"emperror.dev/errors"
@@ -17,7 +16,6 @@ import (
 	"github.com/mholt/archives"
 
 	"github.com/reviactyl/agent/internal/ufs"
-	"github.com/reviactyl/agent/server/filesystem/archiverext"
 )
 
 // CompressFiles compresses all the files matching the given paths in the
@@ -34,148 +32,166 @@ func (fs *Filesystem) CompressFiles(dir string, paths []string, format string) (
 		return nil, errors.New("unsupported archive format")
 	}
 	a := &Archive{Filesystem: fs, BaseDirectory: dir, Files: paths, Format: format}
-	d := path.Join(
-		dir,
-		fmt.Sprintf("archive-%s.%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""), format),
-	)
-	f, err := fs.unixFS.OpenFile(d, ufs.O_WRONLY|ufs.O_CREATE, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	cw := ufs.NewCountedWriter(f)
-	if err := a.Stream(context.Background(), cw); err != nil {
-		_ = fs.unixFS.Remove(d)
-		return nil, err
-	}
-	if cw.BytesWritten() < 0 || !fs.unixFS.CanFit(cw.BytesWritten()) {
-		_ = fs.unixFS.Remove(d)
-		return nil, newFilesystemError(ErrCodeDiskSpace, nil)
-	}
-	fs.unixFS.Add(cw.BytesWritten())
-	return f.Stat()
-}
-
-func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS, io.Closer, error) {
-	f, err := fs.unixFS.Open(p)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Do not use defer to close `f`, it will likely be used later.
-
-	format, _, err := archives.Identify(ctx, filepath.Base(p), f)
-	if err != nil && !errors.Is(err, archives.NoMatch) {
-		_ = f.Close()
-		return nil, nil, err
-	}
-
-	// Reset the file reader.
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, nil, err
-	}
-
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, nil, err
-	}
-
-	if format != nil {
-		switch ff := format.(type) {
-		case archives.Zip:
-			// zip.Reader is more performant than ArchiveFS, because zip.Reader caches content information
-			// and zip.Reader can open several content files concurrently because of io.ReaderAt requirement
-			// while ArchiveFS can't.
-			// zip.Reader doesn't suffer from issue #330 and #310 according to local test (but they should be fixed anyway)
-			reader, err := zip.NewReader(f, info.Size())
-			if err != nil {
-				_ = f.Close()
-				return nil, nil, err
-			}
-			return reader, f, nil
-		case archives.Extraction:
-			return &archives.ArchiveFS{Stream: io.NewSectionReader(f, 0, info.Size()), Format: ff, Context: ctx}, f, nil
-		case archives.Compression:
-			return archiverext.FileFS{File: f, Compression: ff}, f, nil
+	name := fmt.Sprintf("archive-%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""))
+	var d string
+	var f ufs.File
+	var err error
+	for i := 0; ; i++ {
+		d = path.Join(dir, name+"."+format)
+		if i > 0 {
+			d = path.Join(dir, fmt.Sprintf("%s-%d.%s", name, i, format))
+		}
+		f, err = fs.unixFS.OpenFile(d, ufs.O_WRONLY|ufs.O_CREATE|ufs.O_EXCL, 0o644)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ufs.ErrExist) || i >= 100 {
+			return nil, err
 		}
 	}
-	_ = f.Close()
-	return nil, nil, archives.NoMatch
+	qf := newQuotaFile(fs, f, 0)
+	removePartial := func(st ufs.FileInfo) {
+		if st == nil {
+			st, _ = qf.Stat()
+		}
+		_ = qf.Close()
+		if st == nil {
+			st, _ = fs.unixFS.Stat(d)
+		}
+		_ = fs.unixFS.Remove(d)
+		if st != nil {
+			fs.adjustDisk(-st.Size())
+		}
+	}
+	if err := a.Stream(context.Background(), qf); err != nil {
+		removePartial(nil)
+		return nil, err
+	}
+	st, err := qf.Stat()
+	if err != nil {
+		removePartial(nil)
+		return nil, err
+	}
+	if err := qf.Close(); err != nil {
+		_ = fs.unixFS.Remove(d)
+		fs.adjustDisk(-st.Size())
+		return nil, err
+	}
+	return st, nil
 }
+
+// maxArchiveEntryNameLength is the longest supported archive entry path.
+const maxArchiveEntryNameLength = 4096
 
 // SpaceAvailableForDecompression looks through a given archive and determines
 // if decompressing it would put the server over its allocated disk space limit.
 func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir string, file string) error {
-	// Don't waste time trying to determine this if we know the server will have the space for
-	// it since there is no limit.
 	if fs.MaxDisk() <= 0 {
 		return nil
 	}
-
-	fsys, archive, err := fs.archiverFileSystem(ctx, filepath.Join(dir, file))
+	f, err := fs.unixFS.Open(filepath.Join(dir, file))
 	if err != nil {
-		if errors.Is(err, archives.NoMatch) {
-			return newFilesystemError(ErrCodeUnknownArchive, err)
-		}
 		return err
 	}
-	defer archive.Close()
+	defer f.Close()
 
-	var size atomic.Int64
-	return iofs.WalkDir(fsys, ".", func(path string, d iofs.DirEntry, err error) error {
+	format, _, err := archives.Identify(ctx, filepath.Base(file), f)
+	if err != nil && !errors.Is(err, archives.NoMatch) {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	var size int64
+	add := func(name string, n int64) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if len(name) > maxArchiveEntryNameLength {
+			return errors.New("filesystem: archive contains an entry with a name that is too long")
+		}
+		if n <= 0 {
+			return nil
+		}
+		destination := filepath.Join(dir, filepath.FromSlash(name))
+		if err := fs.IsIgnored(destination); err != nil {
+			return nil
+		}
+		existing, err := fs.unixFS.Stat(destination)
+		if err != nil && !errors.Is(err, ufs.ErrNotExist) {
+			return err
+		}
+		if err == nil {
+			if existing.IsDir() {
+				return newFilesystemError(ErrCodeIsDirectory, nil)
+			}
+			// Account only for growth: shrinking files cannot safely offset
+			// other archive entries before extraction order is known.
+			n = max(n-existing.Size(), 0)
+		}
+		if n > math.MaxInt64-size {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+		size += n
+		if !fs.unixFS.CanFit(size) {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+		return nil
+	}
+
+	switch ff := format.(type) {
+	case archives.Zip:
+		reader, err := zip.NewReader(f, info.Size())
 		if err != nil {
 			return err
 		}
-
-		select {
-		case <-ctx.Done():
-			// Stop walking if the context is canceled.
-			return ctx.Err()
-		default:
-			if d.IsDir() {
-				return nil
+		for _, entry := range reader.File {
+			if entry.UncompressedSize64 > math.MaxInt64 {
+				return newFilesystemError(ErrCodeDiskSpace, nil)
 			}
-			destination := filepath.Join(dir, path)
-			if err := fs.IsIgnored(destination); err != nil {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
+			if err := add(entry.Name, int64(entry.UncompressedSize64)); err != nil {
 				return err
 			}
-			fileSize := info.Size()
-			if fileSize <= 0 {
-				return nil
-			}
-			// Single-file compression exposes its source as ".", rather
-			// than the extracted destination. Keep its existing size check.
-			if path != "." {
-				existing, err := fs.unixFS.Stat(destination)
-				if err != nil && !errors.Is(err, ufs.ErrNotExist) {
-					return err
-				}
-				if err == nil {
-					if existing.IsDir() {
-						return newFilesystemError(ErrCodeIsDirectory, nil)
-					}
-					// Reserve only growth. Crediting shrinking files against
-					// other entries would depend on the extraction order.
-					fileSize = max(fileSize-existing.Size(), 0)
-				}
-			}
-			current := size.Load()
-			if fileSize > math.MaxInt64-current {
-				return newFilesystemError(ErrCodeDiskSpace, nil)
-			}
-			next := current + fileSize
-			if !fs.unixFS.CanFit(next) {
-				return newFilesystemError(ErrCodeDiskSpace, nil)
-			}
-			size.Store(next)
-			return nil
 		}
-	})
+		return nil
+	case archives.Extraction:
+		return ff.Extract(ctx, io.NewSectionReader(f, 0, info.Size()), func(_ context.Context, entry archives.FileInfo) error {
+			return add(entry.NameInArchive, entry.Size())
+		})
+	case archives.Compression:
+		reader, err := ff.OpenReader(f)
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+		var total int64
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := reader.Read(buf)
+			if n > 0 {
+				if int64(n) > math.MaxInt64-total {
+					return newFilesystemError(ErrCodeDiskSpace, nil)
+				}
+				total += int64(n)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return readErr
+			}
+		}
+		name := strings.TrimSuffix(filepath.Base(file), ff.Extension())
+		return add(name, total)
+	}
+	return newFilesystemError(ErrCodeUnknownArchive, archives.NoMatch)
 }
 
 // DecompressFile will decompress a file in a given directory by using the
