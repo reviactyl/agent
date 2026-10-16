@@ -51,31 +51,24 @@ func (fs *Filesystem) CompressFiles(dir string, paths []string, format string) (
 		}
 	}
 	qf := newQuotaFile(fs, f, 0)
-	removePartial := func(st ufs.FileInfo) {
-		if st == nil {
-			st, _ = qf.Stat()
-		}
+	removePartial := func() {
 		_ = qf.Close()
-		if st == nil {
-			st, _ = fs.unixFS.Stat(d)
-		}
+		// Quota.Remove accounts for the removed file size itself. Do not also
+		// adjust the cached usage here, or failed concurrent archives will
+		// release their space twice and allow later writers to exceed the limit.
 		_ = fs.unixFS.Remove(d)
-		if st != nil {
-			fs.adjustDisk(-st.Size())
-		}
 	}
 	if err := a.Stream(context.Background(), qf); err != nil {
-		removePartial(nil)
+		removePartial()
 		return nil, err
 	}
 	st, err := qf.Stat()
 	if err != nil {
-		removePartial(nil)
+		removePartial()
 		return nil, err
 	}
 	if err := qf.Close(); err != nil {
 		_ = fs.unixFS.Remove(d)
-		fs.adjustDisk(-st.Size())
 		return nil, err
 	}
 	return st, nil

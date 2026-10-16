@@ -55,37 +55,41 @@ func limitWithRoomFor(t *testing.T, fs *Filesystem, n int64) int64 {
 }
 
 func TestParallelArchivesRespectDiskLimit(t *testing.T) {
-	fs, rfs := NewFs()
-	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
 
-	const count = 8
-	for i := 0; i < count; i++ {
-		dir := fmt.Sprintf("dir%d", i)
-		if err := os.MkdirAll(filepath.Join(rfs.root, "server", dir), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := rfs.CreateServerFile(filepath.Join(dir, "data.bin"), randomData(t, 1<<20)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Enough room for one more archive of the (incompressible) data, but not two.
-	limit := limitWithRoomFor(t, fs, 1<<20+512<<10)
+			const count = 8
+			for i := 0; i < count; i++ {
+				dir := fmt.Sprintf("dir%d", i)
+				if err := os.MkdirAll(filepath.Join(rfs.root, "server", dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := rfs.CreateServerFile(filepath.Join(dir, "data.bin"), randomData(t, 1<<20)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Enough room for one more archive of the (incompressible) data, but not two.
+			limit := limitWithRoomFor(t, fs, 1<<20+512<<10)
 
-	var wg sync.WaitGroup
-	for i := 0; i < count; i++ {
-		wg.Add(1)
-		go func(dir string) {
-			defer wg.Done()
-			_, _ = fs.CompressFiles(dir, []string{"data.bin"})
-		}(fmt.Sprintf("/dir%d", i))
-	}
-	wg.Wait()
+			var wg sync.WaitGroup
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(dir string) {
+					defer wg.Done()
+					_, _ = fs.CompressFiles(dir, []string{"data.bin"}, format)
+				}(fmt.Sprintf("/dir%d", i))
+			}
+			wg.Wait()
 
-	if used := diskUsage(t, rfs); used > limit {
-		t.Fatalf("parallel archives used %d bytes, exceeding the disk limit of %d bytes", used, limit)
-	}
-	if used, tracked := diskUsage(t, rfs), fs.CachedUsage(); used != tracked {
-		t.Fatalf("tracked disk usage %d does not match the actual usage %d", tracked, used)
+			if used := diskUsage(t, rfs); used > limit {
+				t.Fatalf("parallel archives used %d bytes, exceeding the disk limit of %d bytes", used, limit)
+			}
+			if used, tracked := diskUsage(t, rfs), fs.CachedUsage(); used != tracked {
+				t.Fatalf("tracked disk usage %d does not match the actual usage %d", tracked, used)
+			}
+		})
 	}
 }
 
