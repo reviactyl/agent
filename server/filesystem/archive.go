@@ -15,7 +15,6 @@ import (
 	"emperror.dev/errors"
 	"github.com/juju/ratelimit"
 	"github.com/klauspost/pgzip"
-	ignore "github.com/sabhiram/go-gitignore"
 	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/config"
