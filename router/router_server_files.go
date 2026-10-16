@@ -15,6 +15,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/reviactyl/agent/config"
@@ -658,13 +659,15 @@ func handleFileUpload(p string, s *server.Server, r io.Reader, limit int64) erro
 		return err
 	}
 
-	n, err := s.Filesystem().WriteFrom(p, io.LimitReader(r, limit+1))
+	staged := filepath.Join(filepath.Dir(p), ".upload-"+uuid.NewString())
+	defer func() { _ = s.Filesystem().Delete(staged) }()
+
+	n, err := s.Filesystem().WriteFrom(staged, io.LimitReader(r, limit+1))
 	if err != nil {
 		return err
 	}
 	if n > limit {
-		_ = s.Filesystem().Delete(p)
 		return errUploadTooLarge
 	}
-	return nil
+	return s.Filesystem().Replace(staged, p)
 }

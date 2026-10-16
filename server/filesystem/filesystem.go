@@ -263,6 +263,22 @@ func (fs *Filesystem) Rename(oldpath, newpath string) error {
 	return fs.unixFS.RenameWithMkdirAll(oldpath, newpath, fs.mkdirAll)
 }
 
+// Replace atomically replaces newpath with oldpath and adjusts disk usage for
+// any file that was already at newpath.
+func (fs *Filesystem) Replace(oldpath, newpath string) error {
+	var oldSize int64
+	if info, err := fs.unixFS.Stat(newpath); err == nil {
+		oldSize = info.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := fs.unixFS.Replace(oldpath, newpath); err != nil {
+		return err
+	}
+	fs.unixFS.Add(oldSize * -1)
+	return nil
+}
+
 func (fs *Filesystem) Symlink(oldpath, newpath string) error {
 	return fs.unixFS.Symlink(oldpath, newpath)
 }
