@@ -32,8 +32,9 @@ type Filesystem struct {
 	reserved int64
 	// walking is set while the disk usage is being calculated, during which
 	// walkReserved is the space reserved by writes in progress at any point.
-	walking      bool
-	walkReserved int64
+	walking       bool
+	walkReserved  int64
+	walkCompleted int64
 
 	// lookupMu prevents the disk usage from being calculated more than once
 	// at the same time.
@@ -253,6 +254,12 @@ func (fs *Filesystem) WriteFrom(p string, r io.Reader) (int64, error) {
 	return fs.writeStream(p, r, 0o644, true)
 }
 
+// WriteFromWithCredit streams to p using space that will be freed when
+// creditPath is replaced. Replace must be called after a successful write.
+func (fs *Filesystem) WriteFromWithCredit(p, creditPath string, r io.Reader) (int64, error) {
+	return fs.writeStreamWithCredit(p, r, 0o644, creditPath)
+}
+
 // CreateDirectory creates a new directory (name) at a specified path (p) for
 // the server.
 func (fs *Filesystem) CreateDirectory(name string, p string) error {
@@ -266,16 +273,31 @@ func (fs *Filesystem) Rename(oldpath, newpath string) error {
 // Replace atomically replaces newpath with oldpath and adjusts disk usage for
 // any file that was already at newpath.
 func (fs *Filesystem) Replace(oldpath, newpath string) error {
-	var oldSize int64
-	if info, err := fs.unixFS.Stat(newpath); err == nil {
-		oldSize = info.Size()
-	} else if !errors.Is(err, os.ErrNotExist) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	st, statErr := fs.unixFS.Lstat(newpath)
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	oldSize, err := replacementCredit(fs, newpath)
+	if err != nil {
 		return err
+	}
+	limit := fs.MaxDisk()
+	if limit == -1 || (limit > 0 && fs.CachedUsage()-oldSize > limit) {
+		return newFilesystemError(ErrCodeDiskSpace, nil)
+	}
+	if statErr == nil && st.Mode().IsRegular() {
+		if stat, ok := st.Sys().(*unix.Stat_t); ok {
+			if err := fs.unixFS.Chmod(oldpath, ufs.FileMode(stat.Mode&0o7777)); err != nil {
+				return err
+			}
+		}
 	}
 	if err := fs.unixFS.Replace(oldpath, newpath); err != nil {
 		return err
 	}
-	fs.unixFS.Add(oldSize * -1)
+	fs.addDisk(-oldSize)
 	return nil
 }
 

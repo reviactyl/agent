@@ -12,6 +12,14 @@ import (
 )
 
 func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, replace bool) (_ int64, err error) {
+	creditPath := ""
+	if replace {
+		creditPath = p
+	}
+	return fs.writeStreamWithCredit(p, r, mode, creditPath)
+}
+
+func (fs *Filesystem) writeStreamWithCredit(p string, r io.Reader, mode ufs.FileMode, creditPath string) (_ int64, err error) {
 	if fs.MaxDisk() == -1 {
 		return 0, newFilesystemError(ErrCodeDiskSpace, nil)
 	}
@@ -19,15 +27,11 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, repl
 		return 0, err
 	}
 	var credit int64
-	if replace {
-		if st, statErr := fs.unixFS.Lstat(p); statErr == nil {
-			if st.Mode().IsRegular() {
-				if stat, ok := st.Sys().(*unix.Stat_t); ok && stat.Nlink == 1 {
-					credit = st.Size()
-				}
-			}
-		} else if !errors.Is(statErr, ufs.ErrNotExist) {
-			return 0, statErr
+	if creditPath != "" {
+		var creditErr error
+		credit, creditErr = replacementCredit(fs, creditPath)
+		if creditErr != nil {
+			return 0, creditErr
 		}
 	}
 	staged := filepath.Join(filepath.Dir(p), ".download-"+uuid.NewString())
@@ -76,11 +80,19 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, repl
 			removedSize = st.Size()
 		}
 	}
+	projectedRemoved := removedSize
+	if creditPath != "" && creditPath != p {
+		credit, err = replacementCredit(fs, creditPath)
+		if err != nil {
+			return n, err
+		}
+		projectedRemoved += credit
+	}
 	// The destination may have been deleted or changed while the staged write
 	// was in progress, invalidating the credit used by streamWriter. Check the
 	// actual resulting usage before committing the replacement.
 	limit := fs.MaxDisk()
-	if limit > 0 && fs.CachedUsage()-removedSize > limit {
+	if limit > 0 && fs.CachedUsage()-projectedRemoved > limit {
 		return n, newFilesystemError(ErrCodeDiskSpace, nil)
 	}
 	if err := fs.unixFS.Replace(staged, p); err != nil {
@@ -88,6 +100,27 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, repl
 	}
 	fs.addDisk(-removedSize)
 	return n, nil
+}
+
+// replacementCredit returns space that a successful replacement can reclaim.
+// Files with multiple hard links cannot be credited because replacing one link
+// does not free the inode's data.
+func replacementCredit(fs *Filesystem, p string) (int64, error) {
+	st, err := fs.unixFS.Lstat(p)
+	if errors.Is(err, ufs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !st.Mode().IsRegular() {
+		return 0, nil
+	}
+	stat, ok := st.Sys().(*unix.Stat_t)
+	if !ok || stat.Nlink != 1 {
+		return 0, nil
+	}
+	return st.Size(), nil
 }
 
 type streamWriter struct {

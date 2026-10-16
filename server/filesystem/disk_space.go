@@ -165,6 +165,7 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.mu.Lock()
 	fs.walking = true
 	fs.walkReserved = fs.reserved
+	fs.walkCompleted = 0
 	fs.mu.Unlock()
 
 	// If there is no size its either because there is no data (in which case running this function
@@ -177,16 +178,20 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	// cause the disk to be walked on every call.
 	fs.lastLookupTime.Set(time.Now())
 
-	// The walk may not have seen writes that finished during it. Keep the larger
-	// of the walk result plus outstanding reservations and the current cache, which
-	// includes completed writes' accounting adjustments.
+	// Add reservations for writes still in progress and positive changes from
+	// writes completed during the walk. A successful walk can still lower stale
+	// cached usage when files were removed outside this process.
 	fs.mu.Lock()
-	usage := size + fs.walkReserved
-	// A partial walk or a completed write may have left the cache higher than
-	// the walk result. Never lower usage below that value.
-	usage = max(usage, fs.unixFS.Usage())
+	usage := size + fs.walkReserved + fs.walkCompleted
+	if err != nil {
+		// A partial walk cannot establish the full usage, so don't lower the
+		// current cache based on its incomplete result.
+		usage = max(usage, fs.unixFS.Usage())
+	}
 	fs.unixFS.SetUsage(usage)
 	fs.walking = false
+	fs.walkReserved = 0
+	fs.walkCompleted = 0
 	fs.mu.Unlock()
 
 	return usage, err
@@ -286,6 +291,7 @@ func (fs *Filesystem) releaseDisk(reserved int64, used int64) {
 	fs.reserved -= reserved
 	if fs.walking {
 		fs.walkReserved = max(fs.walkReserved-reserved, 0)
+		fs.walkCompleted += max(used, 0)
 	}
 	fs.unixFS.Add(used - reserved)
 }
@@ -303,5 +309,8 @@ func (fs *Filesystem) adjustDisk(size int64) int64 {
 
 // addDisk updates cached usage after a write whose size was already checked.
 func (fs *Filesystem) addDisk(size int64) int64 {
+	if fs.walking && size > 0 {
+		fs.walkCompleted += size
+	}
 	return fs.unixFS.Add(size)
 }

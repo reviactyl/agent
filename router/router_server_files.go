@@ -662,7 +662,7 @@ func handleFileUpload(p string, s *server.Server, r io.Reader, limit int64) erro
 	staged := filepath.Join(filepath.Dir(p), ".upload-"+uuid.NewString())
 	defer func() { _ = s.Filesystem().Delete(staged) }()
 
-	n, err := s.Filesystem().WriteFrom(staged, io.LimitReader(r, limit+1))
+	n, err := s.Filesystem().WriteFromWithCredit(staged, p, io.LimitReader(r, limit+1))
 	if err != nil {
 		return err
 	}
