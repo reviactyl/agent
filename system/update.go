@@ -131,11 +131,11 @@ func (u *Updater) Install(ctx context.Context, version string, channel string) (
 	if !strings.EqualFold(actualDigest, expectedDigest) {
 		return nil, errors.New("downloaded Agent binary does not match its official SHA-256 digest")
 	}
-	if err := os.Chmod(temporaryPath, 0o755); err != nil {
+	if err := os.Chmod(temporaryPath, 0o755); err != nil { // #nosec G302 -- the verified Agent executable must be executable by the service manager
 		return nil, fmt.Errorf("make staged Agent binary executable: %w", err)
 	}
 
-	output, err := exec.CommandContext(ctx, temporaryPath, "version").CombinedOutput()
+	output, err := exec.CommandContext(ctx, temporaryPath, "version").CombinedOutput() // #nosec G204 -- this path is a staged binary verified against the official release digest
 	if err != nil {
 		return nil, fmt.Errorf("validate staged Agent binary: %w", err)
 	}
@@ -194,7 +194,7 @@ func (u *Updater) releaseDigest(ctx context.Context, version string, channel str
 		return "", fmt.Errorf("decode Agent release metadata: %w", err)
 	}
 	if metadata.TagName != "v"+version {
-		return "", errors.New("Agent release metadata returned an unexpected version")
+		return "", errors.New("agent release metadata returned an unexpected version")
 	}
 	if metadata.Draft {
 		return "", errors.New("cannot install a draft Agent release")
@@ -223,7 +223,7 @@ func (u *Updater) releaseDigest(ctx context.Context, version string, channel str
 	return "", errors.New("official Agent release metadata does not include a SHA-256 digest")
 }
 
-func fileSHA256(path string) (string, error) {
+func fileSHA256(path string) (string, error) { // #nosec G304 -- called only for the updater's CreateTemp path
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -262,7 +262,7 @@ if mv -f -- "$2" "$1"; then
     systemctl restart agent
 fi`
 	unit := fmt.Sprintf("reviactyl-agent-update-%d", os.Getpid())
-	command := exec.CommandContext(
+	command := exec.CommandContext( // #nosec G204 -- fixed systemd-run command; arguments are fixed and the unit ID is PID-derived
 		ctx,
 		"systemd-run",
 		"--quiet",
@@ -274,7 +274,7 @@ fi`
 	if output, err := command.CombinedOutput(); err != nil {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		cleanupOutput, cleanupErr := exec.CommandContext(cleanupContext, "systemctl", "stop", unit).CombinedOutput()
+		cleanupOutput, cleanupErr := exec.CommandContext(cleanupContext, "systemctl", "stop", unit).CombinedOutput() // #nosec G204 -- fixed systemctl command; unit is PID-derived above
 		if cleanupErr != nil {
 			return false, fmt.Errorf("start Agent update supervisor: %w: %s (stop supervisor: %v: %s)", err, strings.TrimSpace(string(output)), cleanupErr, strings.TrimSpace(string(cleanupOutput)))
 		}

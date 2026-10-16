@@ -186,7 +186,8 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 // Write streams to EOF when newSize is negative, enforcing quota as data arrives.
 func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
 	if newSize < 0 {
-		return fs.writeStream(p, r, mode)
+		_, err := fs.writeStream(p, r, mode, false)
+		return err
 	}
 	if err := fs.checkNotDirectory(p); err != nil {
 		return err
@@ -249,30 +250,7 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 // of the contents does not need to be known ahead of time: each write is counted
 // against the disk limit as it happens. If writing fails the file is removed.
 func (fs *Filesystem) WriteFrom(p string, r io.Reader) (int64, error) {
-	if err := fs.checkNotDirectory(p); err != nil {
-		return 0, err
-	}
-
-	if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return 0, err
-	}
-
-	file, err := fs.Touch(p, ufs.O_RDWR|ufs.O_TRUNC)
-	if err != nil {
-		return 0, err
-	}
-	n, err := io.Copy(file, r)
-	if cerr := file.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = fs.chownFile(p)
-	}
-	if err != nil {
-		_ = fs.unixFS.Remove(p)
-		return n, err
-	}
-	return n, nil
+	return fs.writeStream(p, r, 0o644, true)
 }
 
 // CreateDirectory creates a new directory (name) at a specified path (p) for

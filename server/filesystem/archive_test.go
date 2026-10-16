@@ -355,15 +355,15 @@ func TestArchive_Stream(t *testing.T) {
 
 		g.It("treats regular expression metacharacters in ignore patterns literally", func() {
 			g.Assert(fs.CreateDirectory("world (copy)", "/")).IsNil()
-			g.Assert(fs.CreateDirectory("logs", "/")).IsNil()
-			for _, name := range []string{"world (copy)/level.dat", "logs/latest.log", "server.jar"} {
+			for _, name := range []string{"world (copy)/level.dat", "latest.log", "server.jar"} {
 				r := strings.NewReader("hello, world!\n")
 				g.Assert(fs.Write(name, r, r.Size(), 0o644)).IsNil()
 			}
 
 			a := &Archive{
-				Filesystem: fs,
-				Ignore:     "world (copy)/\n*.log\n",
+				Filesystem:    fs,
+				BaseDirectory: "/",
+				Ignore:        "world (copy)/\n*.log\n",
 			}
 
 			archivePath := filepath.Join(rfs.root, "archive.tar.gz")

@@ -209,6 +209,9 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, t
 			directoryMu.Unlock()
 			return nil
 		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.

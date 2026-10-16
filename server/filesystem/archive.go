@@ -157,13 +157,19 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 		// Time each evaluation and abort if the patterns prove disproportionately
 		// expensive for this server's file tree.
 		budget := newIgnoreMatchBudget(ignorePatternCount(a.Ignore))
-		callback = a.callback(func(_ int, _, relative string, _ ufs.DirEntry) error {
+		callback = a.callback(func(_ int, _, relative string, d ufs.DirEntry) error {
+			if d.IsDir() {
+				relative = strings.TrimSuffix(relative, "/") + "/"
+			}
 			start := time.Now()
 			skip := i.MatchesPath(relative)
 			if err := budget.track(time.Since(start)); err != nil {
 				return err
 			}
 			if skip {
+				if d.IsDir() {
+					return ufs.SkipDir
+				}
 				return SkipThis
 			}
 			return nil
@@ -357,7 +363,7 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		if err != nil {
 			return err
 		}
-		var output io.Writer = writer
+		output := io.Writer(writer)
 		if a.Progress != nil {
 			a.Progress.Writer = writer
 			output = a.Progress

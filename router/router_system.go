@@ -141,7 +141,7 @@ func postSystemUpdate(c *gin.Context) {
 // this agent instance.
 func getAllServers(c *gin.Context) {
 	servers := middleware.ExtractManager(c).All()
-	out := make([]server.APIResponse, len(servers), len(servers))
+	out := make([]server.APIResponse, len(servers))
 	for i, v := range servers {
 		out[i] = v.ToAPIResponse()
 	}

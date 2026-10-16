@@ -94,7 +94,6 @@ func NewFs() (*Filesystem, *rootFs) {
 	tmpDir, err := os.MkdirTemp(os.TempDir(), "reviactyl")
 	if err != nil {
 		panic(err)
-		return nil, nil
 	}
 
 	rfs := rootFs{root: tmpDir}

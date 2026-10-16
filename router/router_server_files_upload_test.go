@@ -49,7 +49,7 @@ var (
 func initTestDatabase(t *testing.T) {
 	t.Helper()
 	testDatabaseOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "wings-router-test")
+		dir, err := os.MkdirTemp("", "agent-router-test")
 		if err != nil {
 			testDatabaseErr = err
 			return
