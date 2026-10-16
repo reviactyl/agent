@@ -370,18 +370,16 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 	// following its target (which may be missing or outside the server).
 	var target string
 	if s.Mode()&fs.ModeSymlink != 0 {
-		buf := make([]byte, 4096)
-		n, err := unix.Readlinkat(dirfd, name, buf)
+		target, err = a.Filesystem.unixFS.Readlinkat(dirfd, name)
 		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
+			if errors.Is(err, ufs.ErrNotExist) {
 				return nil
 			}
 			return errors.WrapIff(err, "failed reading symlink '%s'", relative)
 		}
-		if n == len(buf) {
+		if len(target) >= 4096 {
 			return errors.New("filesystem: symlink target is too long for TAR archive")
 		}
-		target = string(buf[:n])
 	}
 
 	// Get the tar FileInfoHeader in order to add the file to the archive.
