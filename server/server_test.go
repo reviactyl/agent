@@ -205,7 +205,7 @@ func TestRestoreBackupPreservesDirectoryMetadata(t *testing.T) {
 						b = backup.NewS3(nil, local.Uuid, "", format)
 						reader = io.NopCloser(bytes.NewReader(data))
 					}
-					if err := srv.RestoreBackup(b, reader); err != nil {
+					if err := srv.RestoreBackup(b, reader, false); err != nil {
 						t.Fatal(err)
 					}
 					if !client.successful {
@@ -304,7 +304,7 @@ func TestRestoreBackupPreservesFilePermissions(t *testing.T) {
 							b = backup.NewS3(nil, local.Uuid, "", format)
 							reader = io.NopCloser(bytes.NewReader(data))
 						}
-						if err := srv.RestoreBackup(b, reader); err != nil {
+						if err := srv.RestoreBackup(b, reader, false); err != nil {
 							t.Fatal(err)
 						}
 						if !client.successful {

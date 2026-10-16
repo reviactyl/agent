@@ -97,8 +97,6 @@ func postServerBackup(c *gin.Context) {
 //
 // This endpoint will block until the backup is fully restored allowing for a
 // spinner to be displayed in the Panel UI effectively.
-//
-// TODO: stop the server if it is running
 func postServerRestoreBackup(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	client := middleware.ExtractApiClient(c)
@@ -161,16 +159,9 @@ func postServerRestoreBackup(c *gin.Context) {
 			middleware.CaptureAndAbort(c, err)
 			return
 		}
-		if data.TruncateDirectory {
-			logger.Info("received \"truncate_directory\" flag in request: deleting server files")
-			if err := s.Filesystem().TruncateRootDirectory(); err != nil {
-				middleware.CaptureAndAbort(c, err)
-				return
-			}
-		}
 		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
 			logger.Info("starting restoration process for server backup using local driver")
-			if err := s.RestoreBackup(b, nil); err != nil {
+			if err := s.RestoreBackup(b, nil, data.TruncateDirectory); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
 			}
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
@@ -222,18 +213,9 @@ func postServerRestoreBackup(c *gin.Context) {
 		return
 	}
 
-	if data.TruncateDirectory {
-		logger.Info("received \"truncate_directory\" flag in request: deleting server files")
-		if err := s.Filesystem().TruncateRootDirectory(); err != nil {
-			_ = res.Body.Close()
-			middleware.CaptureAndAbort(c, err)
-			return
-		}
-	}
-
 	go func(s *server.Server, uuid string, logger *log.Entry) {
 		logger.Info("starting restoration process for server backup using S3 driver")
-		if err := s.RestoreBackup(backup.NewS3(client, uuid, "", data.Format), res.Body); err != nil {
+		if err := s.RestoreBackup(backup.NewS3(client, uuid, "", data.Format), res.Body, data.TruncateDirectory); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 		}
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
