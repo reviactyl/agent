@@ -21,7 +21,7 @@ func TestExecuteStreamingResponse(t *testing.T) {
 	cfg.System.User.Uid = os.Getuid()
 	cfg.System.User.Gid = os.Getgid()
 	config.Set(cfg)
-	s, err := server.NewEmptyManager(nil).InitServer(remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"stream-test"}`)})
+	s, err := server.NewEmptyManager(nil).InitServer("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}`)})
 	if err != nil {
 		t.Fatal(err)
 	}

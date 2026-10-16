@@ -217,7 +217,6 @@ func TestPostServerBackupRejectsInvalidIgnoreList(t *testing.T) {
 	}
 }
 
-
 func TestPostServerRestoreBackupRejectsNonUuidBackupID(t *testing.T) {
 	client := backupTestRemoteClient{restoreStatus: make(chan string, 1)}
 	c, w, s := newBackupRestoreContext(t, client, "../target/archive", `{"adapter":"s3","download_url":"https://example.com/archive.tar.gz"}`)
@@ -397,7 +396,7 @@ func TestPostServerRestoreBackupPreflightPreservesFiles(t *testing.T) {
 			}
 			c, _, unused := newBackupRestoreContext(t, client, "11111111-1111-1111-1111-111111111111", body)
 			unused.CtxCancel()
-			s, err := wserver.NewEmptyManager(client).InitServer(remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"server"}`), ProcessConfiguration: &remote.ProcessConfiguration{}})
+			s, err := wserver.NewEmptyManager(client).InitServer("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}`), ProcessConfiguration: &remote.ProcessConfiguration{}})
 			if err != nil {
 				t.Fatal(err)
 			}
