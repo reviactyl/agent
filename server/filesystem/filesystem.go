@@ -32,8 +32,9 @@ type Filesystem struct {
 	reserved int64
 	// walking is set while the disk usage is being calculated, during which
 	// walkReserved is the space reserved by writes in progress at any point.
-	walking       bool
-	walkReserved  int64
+	walking      bool
+	walkReserved int64
+	// walkCompleted counts managed usage changes that require another scan pass.
 	walkCompleted int64
 
 	// lookupMu prevents the disk usage from being calculated more than once

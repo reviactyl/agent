@@ -168,21 +168,28 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.walkCompleted = 0
 	fs.mu.Unlock()
 
-	// If there is no size its either because there is no data (in which case running this function
-	// will have effectively no impact), or there is nothing in the cache, in which case we need to
-	// grab the size of their data directory. This is a taxing operation, so we want to store it in
-	// the cache once we've gotten it.
-	size, err := fs.DirectorySize("/")
+	// If managed writes change disk usage during a scan, repeat it so those
+	// writes are reflected by the scan rather than double-counted as a delta.
+	var size int64
+	var err error
+	for {
+		size, err = fs.DirectorySize("/")
+		fs.mu.Lock()
+		if err == nil && fs.walkCompleted > 0 {
+			fs.walkCompleted = 0
+			fs.mu.Unlock()
+			continue
+		}
+		break
+	}
 
 	// Always record the lookup, even if there is an error, so that a persistent error does not
 	// cause the disk to be walked on every call.
 	fs.lastLookupTime.Set(time.Now())
 
-	// Add reservations for writes still in progress and positive changes from
-	// writes completed during the walk. A successful walk can still lower stale
+	// Include writes still in progress. A successful walk can still lower stale
 	// cached usage when files were removed outside this process.
-	fs.mu.Lock()
-	usage := size + fs.walkReserved + fs.walkCompleted
+	usage := size + fs.walkReserved
 	if err != nil {
 		// A partial walk cannot establish the full usage, so don't lower the
 		// current cache based on its incomplete result.
@@ -291,7 +298,7 @@ func (fs *Filesystem) releaseDisk(reserved int64, used int64) {
 	fs.reserved -= reserved
 	if fs.walking {
 		fs.walkReserved = max(fs.walkReserved-reserved, 0)
-		fs.walkCompleted += max(used, 0)
+		fs.walkCompleted++
 	}
 	fs.unixFS.Add(used - reserved)
 }
@@ -303,14 +310,17 @@ func (fs *Filesystem) adjustDisk(size int64) int64 {
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if fs.walking {
+		fs.walkCompleted++
+	}
 
 	return fs.unixFS.Add(size)
 }
 
 // addDisk updates cached usage after a write whose size was already checked.
 func (fs *Filesystem) addDisk(size int64) int64 {
-	if fs.walking && size > 0 {
-		fs.walkCompleted += size
+	if fs.walking && size != 0 {
+		fs.walkCompleted++
 	}
 	return fs.unixFS.Add(size)
 }
