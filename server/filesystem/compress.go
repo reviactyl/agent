@@ -160,6 +160,15 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 			return add(entry.NameInArchive, entry.Size())
 		})
 	case archives.Compression:
+		name := strings.TrimSuffix(filepath.Base(file), ff.Extension())
+		destination := filepath.Join(dir, name)
+		if err := fs.IsIgnored(destination); err != nil {
+			return nil
+		}
+		var existingSize int64
+		if existing, err := fs.unixFS.Stat(destination); err == nil && existing.Mode().IsRegular() {
+			existingSize = existing.Size()
+		}
 		reader, err := ff.OpenReader(f)
 		if err != nil {
 			return err
@@ -168,12 +177,18 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 		var total int64
 		buf := make([]byte, 32*1024)
 		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			n, readErr := reader.Read(buf)
 			if n > 0 {
 				if int64(n) > math.MaxInt64-total {
 					return newFilesystemError(ErrCodeDiskSpace, nil)
 				}
 				total += int64(n)
+				if limit := fs.MaxDisk(); limit > 0 && total > max(limit, existingSize) {
+					return newFilesystemError(ErrCodeDiskSpace, nil)
+				}
 			}
 			if readErr == io.EOF {
 				break
@@ -182,7 +197,6 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 				return readErr
 			}
 		}
-		name := strings.TrimSuffix(filepath.Base(file), ff.Extension())
 		return add(name, total)
 	}
 	return newFilesystemError(ErrCodeUnknownArchive, archives.NoMatch)

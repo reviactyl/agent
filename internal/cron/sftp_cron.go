@@ -130,6 +130,7 @@ func (sc *sftpCron) fetchRecords(ctx context.Context, offset int, limit int) (ac
 	tx := database.Instance().WithContext(ctx).
 		Where("event LIKE ?", "server:sftp.%").
 		Order("event DESC").
+		Order("id ASC").
 		Offset(offset).
 		Limit(limit).
 		Find(&activity)

@@ -42,14 +42,12 @@ func (fs *Filesystem) writeStreamWithCredit(p string, r io.Reader, mode ufs.File
 	defer func() {
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
-		var stagedSize int64
-		if st, statErr := fs.unixFS.Lstat(staged); statErr == nil && st.Mode().IsRegular() {
-			stagedSize = st.Size()
-		}
-		if cleanupErr := fs.unixFS.Remove(staged); !errors.Is(cleanupErr, ufs.ErrNotExist) {
+		st, _ := fs.unixFS.Lstat(staged)
+		cleanupErr := fs.unixFS.Remove(staged)
+		if cleanupErr == nil {
+			fs.forgetWalkFileLocked(st)
+		} else if !errors.Is(cleanupErr, ufs.ErrNotExist) {
 			err = errors.Join(err, cleanupErr)
-		} else if stagedSize > 0 {
-			fs.addDisk(-stagedSize)
 		}
 	}()
 	n, copyErr := io.Copy(streamWriter{fs: fs, file: file, credit: credit}, r)
@@ -98,6 +96,7 @@ func (fs *Filesystem) writeStreamWithCredit(p string, r io.Reader, mode ufs.File
 	if err := fs.unixFS.Replace(staged, p); err != nil {
 		return n, err
 	}
+	fs.forgetWalkFileLocked(st)
 	fs.addDisk(-removedSize)
 	return n, nil
 }

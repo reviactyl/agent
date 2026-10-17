@@ -349,7 +349,13 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// Agent next starts.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	go shutdownOnSignal(signals, manager, s)
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		shutdownOnSignal(signals, manager, s)
+	}()
+	defer func() { <-shutdownDone }()
+	defer signal.Stop(signals)
 
 	profile, _ := cmd.Flags().GetBool("pprof")
 	if profile {

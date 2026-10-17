@@ -87,40 +87,24 @@ func (f *quotaFile) ReplaceContents(data []byte) error {
 	}
 
 	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	defer func() {
+		f.fs.recordWalkFileSizeLocked(f.File)
+		f.fs.releaseDiskLocked(reserved, f.size-previousSize)
+	}()
+
 	n, err := f.File.Write(data)
-	if n > 0 {
-		f.fs.recordWalkFileSizeLocked(f.File)
-	}
-	f.fs.mu.Unlock()
-	if int64(n) > f.size {
-		f.size = int64(n)
-	}
-	used := max(f.size-previousSize, 0)
-
+	f.size = max(f.size, int64(n))
 	if err != nil {
-		if reserved > 0 {
-			f.fs.releaseDisk(reserved, used)
-		}
 		return err
 	}
-
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
 	if err := f.File.Truncate(newSize); err != nil {
-		if reserved > 0 {
-			f.fs.releaseDisk(reserved, used)
-		}
 		return err
 	}
-
-	if newSize != f.size {
-		f.fs.mu.Lock()
-		f.fs.recordWalkFileSizeLocked(f.File)
-		f.fs.mu.Unlock()
-		f.fs.adjustDisk(newSize - f.size)
-		f.size = newSize
-	}
-	if reserved > 0 {
-		f.fs.releaseDisk(reserved, used)
-	}
+	f.size = newSize
 	return nil
 }
 

@@ -2,6 +2,8 @@ package filesystem
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -111,4 +113,138 @@ func TestWalkCountsUploadCreatedAfterDirectoryVisit(t *testing.T) {
 	assert.True(t, IsErrorCode(err, ErrCodeDiskSpace), "extra write should be rejected as over quota")
 	assert.Equal(t, int64(90), diskUsage(t, rfs))
 	assert.Equal(t, int64(90), fs.CachedUsage())
+}
+
+func TestWalkReconcilesStagedReplacementAndCleanup(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint("readFailure=", fail), func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			require.NoError(t, rfs.CreateServerFile("a.bin", bytes.Repeat([]byte("a"), 80)))
+			fs.SetDiskLimit(100)
+			_, err := fs.DiskUsage(false)
+			require.NoError(t, err)
+			var once sync.Once
+			fs.walkEntryHook = func() {
+				once.Do(func() {
+					var reader io.Reader = bytes.NewReader(bytes.Repeat([]byte("b"), 80))
+					if fail {
+						reader = io.MultiReader(reader, failingScanReader{})
+					}
+					_, err := fs.writeStream("a.bin", reader, 0o644, true)
+					if fail {
+						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
+					}
+				})
+			}
+			usage, err := fs.updateCachedDiskUsage()
+			require.NoError(t, err)
+			require.Equal(t, int64(80), usage)
+			require.Equal(t, diskUsage(t, rfs), fs.CachedUsage())
+			require.NoError(t, fs.Write("extra.bin", bytes.NewReader(bytes.Repeat([]byte("c"), 20)), 20, 0o644))
+			require.Equal(t, int64(100), diskUsage(t, rfs))
+		})
+	}
+}
+
+type failingScanReader struct{}
+
+func (failingScanReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+type pausedTruncateFile struct {
+	ufs.File
+	truncated chan struct{}
+	resume    chan struct{}
+}
+
+func (f pausedTruncateFile) Truncate(size int64) error {
+	err := f.File.Truncate(size)
+	close(f.truncated)
+	<-f.resume
+	return err
+}
+
+func TestReplaceContentsCommitsAccountingBeforeScan(t *testing.T) {
+	for _, sizes := range [][2]int{{80, 40}, {40, 80}} {
+		t.Run(fmt.Sprint(sizes), func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			require.NoError(t, rfs.CreateServerFile("config", bytes.Repeat([]byte("a"), sizes[0])))
+			fs.SetDiskLimit(100)
+			_, err := fs.DiskUsage(false)
+			require.NoError(t, err)
+			file, err := fs.Touch("config", ufs.O_RDWR)
+			require.NoError(t, err)
+			defer file.Close()
+			q := file.(*quotaFile)
+			paused := pausedTruncateFile{File: q.File, truncated: make(chan struct{}), resume: make(chan struct{})}
+			q.File = paused
+			replaced := make(chan error, 1)
+			go func() { replaced <- q.ReplaceContents(bytes.Repeat([]byte("b"), sizes[1])) }()
+			<-paused.truncated
+			scanned := make(chan error, 1)
+			go func() { _, err := fs.updateCachedDiskUsage(); scanned <- err }()
+			select {
+			case err := <-scanned:
+				close(paused.resume)
+				require.NoError(t, <-replaced)
+				require.NoError(t, err)
+				t.Fatal("scan committed before replacement accounting")
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(paused.resume)
+			require.NoError(t, <-replaced)
+			require.NoError(t, <-scanned)
+			require.Equal(t, int64(sizes[1]), fs.CachedUsage())
+			require.Equal(t, diskUsage(t, rfs), fs.CachedUsage())
+			if sizes[1] == 40 {
+				require.Error(t, fs.Write("extra", bytes.NewReader(make([]byte, 70)), 70, 0o644))
+			} else {
+				require.NoError(t, fs.Write("extra", bytes.NewReader(make([]byte, 10)), 10, 0o644))
+			}
+		})
+	}
+}
+
+func TestWalkCountsRenamedInodeOnce(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	require.NoError(t, rfs.CreateServerFile("left.bin", nil))
+	require.NoError(t, rfs.CreateServerFile("right.bin", nil))
+	entries, err := fs.ReadDir("/")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	source, destination := entries[0].Name(), entries[1].Name()
+	require.NoError(t, rfs.CreateServerFile(source, bytes.Repeat([]byte("a"), 80)))
+	_, err = fs.DiskUsage(false)
+	require.NoError(t, err)
+	var once sync.Once
+	fs.walkEntryHook = func() {
+		once.Do(func() {
+			fs.mu.Lock()
+			defer fs.mu.Unlock()
+			require.NoError(t, fs.unixFS.Replace(source, destination))
+		})
+	}
+	usage, err := fs.updateCachedDiskUsage()
+	require.NoError(t, err)
+	require.Equal(t, int64(80), usage)
+	require.Equal(t, diskUsage(t, rfs), usage)
+}
+
+func TestFailedStagedWriteRestoresCachedUsageWithoutWalk(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	require.NoError(t, rfs.CreateServerFile("target", bytes.Repeat([]byte("a"), 80)))
+	fs.SetDiskLimit(100)
+	usage, err := fs.DiskUsage(false)
+	require.NoError(t, err)
+	require.False(t, fs.walking)
+	reader := io.MultiReader(bytes.NewReader(bytes.Repeat([]byte("b"), 80)), failingScanReader{})
+	_, err = fs.writeStream("target", reader, 0o644, true)
+	require.Error(t, err)
+	require.Equal(t, usage, fs.CachedUsage())
+	require.Equal(t, diskUsage(t, rfs), fs.CachedUsage())
 }

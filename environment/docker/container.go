@@ -113,12 +113,26 @@ func (e *Environment) Attach(ctx context.Context) error {
 // still running. If that keeps happening, or attaching fails, the container is
 // terminated rather than left running without being managed.
 func (e *Environment) reattach() bool {
+	for {
+		attached, retry := e.recoverAttachment()
+		if !retry {
+			return attached
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (e *Environment) recoverAttachment() (attached, retry bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
 	c, err := e.ContainerInspect(ctx)
-	if err != nil || c.State == nil || !c.State.Running {
-		return false
+	if cerrdefs.IsNotFound(err) || (err == nil && c.State != nil && !c.State.Running) {
+		return false, false
+	}
+	if err != nil || c.State == nil {
+		e.log().WithField("error", err).Warn("unable to inspect container during recovery")
+		return false, true
 	}
 
 	e.mu.Lock()
@@ -134,12 +148,12 @@ func (e *Environment) reattach() bool {
 		e.log().Warn("lost the attached stream for a running container, attaching again")
 		err := e.Attach(ctx)
 		if err == nil {
-			return true
+			return true, false
 		}
 		// The container may have only just stopped, in which case it is handled like
 		// any other stop so that crash detection still applies.
 		if c, ierr := e.ContainerInspect(ctx); ierr == nil && c.State != nil && !c.State.Running {
-			return false
+			return false, false
 		}
 		e.log().WithField("error", err).Error("failed to attach to running container")
 	}
@@ -151,8 +165,9 @@ func (e *Environment) reattach() bool {
 	defer tcancel()
 	if err := e.Terminate(tctx, "SIGKILL"); err != nil {
 		e.log().WithField("error", err).Error("failed to terminate container")
+		return false, true
 	}
-	return true
+	return false, false
 }
 
 // InSituUpdate performs an in-place update of the Docker container's resource
@@ -360,7 +375,7 @@ func (e *Environment) Destroy() error {
 // instance. There is no confirmation that this data is sent successfully, only
 // that it gets pushed into the stdin.
 func (e *Environment) SendCommand(c string) error {
-	// Commands may not contain control characters, other than tabs.
+	// Commands may contain tabs and line breaks, but no other control characters.
 	if strings.ContainsFunc(c, func(r rune) bool {
 		return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0x7f
 	}) {
@@ -378,8 +393,13 @@ func (e *Environment) SendCommand(c string) error {
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Agent will think it has crashed and attempt to restart it.
-	if stop.Type == "command" && c == stop.Value {
-		e.SetState(environment.ProcessStoppingState)
+	if stop.Type == "command" {
+		for _, command := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
+			if command == stop.Value {
+				e.SetState(environment.ProcessStoppingState)
+				break
+			}
+		}
 	}
 
 	// The process may never read its input, so don't wait forever for there to be

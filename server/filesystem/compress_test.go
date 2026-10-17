@@ -610,3 +610,52 @@ func TestFilesystem_DecompressionReplacementQuota(t *testing.T) {
 		}
 	}
 }
+
+func TestGzipPreflightStopsBeforeOversizedStreamEnds(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	if _, err := gz.Write(bytes.Repeat([]byte("x"), 1024*1024)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := archive.Bytes()
+	data[len(data)-8] ^= 0xff
+	if err := rfs.CreateServerFile("oversized.gz", data); err != nil {
+		t.Fatal(err)
+	}
+	fs.SetDiskLimit(1024)
+	err := fs.SpaceAvailableForDecompression(context.Background(), "/", "oversized.gz")
+	if !IsErrorCode(err, ErrCodeDiskSpace) {
+		t.Fatalf("expected quota rejection before the corrupt trailer, got %v", err)
+	}
+}
+
+func TestGzipPreflightAllowsShrinkingFileAboveQuota(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	if err := rfs.CreateServerFile("large", bytes.Repeat([]byte("o"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	if _, err := gz.Write(bytes.Repeat([]byte("n"), 2048)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rfs.CreateServerFile("large.gz", archive.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.DiskUsage(false); err != nil {
+		t.Fatal(err)
+	}
+	fs.SetDiskLimit(1024)
+	if err := fs.SpaceAvailableForDecompression(context.Background(), "/", "large.gz"); err != nil {
+		t.Fatalf("shrinking an existing file must remain allowed, got %v", err)
+	}
+}

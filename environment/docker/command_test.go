@@ -8,6 +8,8 @@ import (
 	"github.com/docker/docker/api/types"
 
 	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/events"
+	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/system"
 )
 
@@ -69,5 +71,28 @@ func TestSendCommandDoesNotBlockForever(t *testing.T) {
 		}
 	case <-time.After(time.Second * 3):
 		t.Fatal("expected sending the command to time out")
+	}
+}
+
+func TestMultilineStopCommandSetsStoppingState(t *testing.T) {
+	for _, command := range []string{"stop", "say hi\nstop", "say hi\r\nstop\r\n"} {
+		t.Run(command, func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+			read := make(chan struct{})
+			go func() {
+				defer close(read)
+				b := make([]byte, 128)
+				_, _ = input.Read(b)
+			}()
+			if err := e.SendCommand(command); err != nil {
+				t.Fatal(err)
+			}
+			<-read
+			if e.State() != environment.ProcessStoppingState {
+				t.Fatal("stop command did not set the stopping state")
+			}
+		})
 	}
 }

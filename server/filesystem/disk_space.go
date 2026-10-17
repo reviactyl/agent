@@ -264,8 +264,14 @@ func (fs *Filesystem) directorySize(root string, trackWrites bool) (int64, error
 			}
 		}
 		if trackWrites && fs.walking && fs.walkObserved != nil {
+			previousSize, seen := fs.walkObserved[sysFileInfo.Ino]
 			fs.walkObserved[sysFileInfo.Ino] = info.Size()
 			delete(fs.walkUnobserved, sysFileInfo.Ino)
+			if seen {
+				fs.walkCompletedDelta += info.Size() - previousSize
+				fs.mu.Unlock()
+				return nil
+			}
 		}
 		if trackWrites {
 			fs.mu.Unlock()
@@ -319,6 +325,21 @@ func (fs *Filesystem) recordWalkFileSizeLocked(file ufs.File) {
 	}
 	fs.walkCompletedDelta += info.Size() - previousSize
 	fs.walkObserved[ino] = info.Size()
+}
+
+func (fs *Filesystem) forgetWalkFileLocked(info ufs.FileInfo) {
+	if !fs.walking || info == nil || !info.Mode().IsRegular() {
+		return
+	}
+	st, ok := info.Sys().(*unix.Stat_t)
+	if !ok || st.Nlink != 1 {
+		return
+	}
+	if size, seen := fs.walkObserved[st.Ino]; seen {
+		fs.walkCompletedDelta -= size
+		delete(fs.walkObserved, st.Ino)
+	}
+	delete(fs.walkUnobserved, st.Ino)
 }
 
 type lockedFilesystemWriter struct {
