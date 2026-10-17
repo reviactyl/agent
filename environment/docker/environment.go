@@ -44,7 +44,8 @@ type Environment struct {
 
 	// Controls the hijacked response stream which exists only when we're attached to
 	// the running container instance.
-	stream *types.HijackedResponse
+	stream           *types.HijackedResponse
+	streamGeneration uint64
 
 	emitter *events.Bus
 
@@ -96,6 +97,7 @@ func (e *Environment) Type() string {
 func (e *Environment) SetStream(s *types.HijackedResponse) {
 	e.mu.Lock()
 	e.stream = s
+	e.streamGeneration++
 	e.mu.Unlock()
 }
 

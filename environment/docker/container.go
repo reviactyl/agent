@@ -50,10 +50,24 @@ func (nw noopWriter) Write(b []byte) (int, error) {
 // for the purposes of attaching to the container, a second context is created
 // within the function for managing polling.
 func (e *Environment) Attach(ctx context.Context) error {
-	if e.IsAttached() {
+	e.mu.RLock()
+	generation := e.streamGeneration
+	attached := e.stream != nil
+	e.mu.RUnlock()
+	if attached {
 		return nil
 	}
+	c, err := e.ContainerInspect(ctx)
+	if err != nil {
+		return err
+	}
+	if c.ID == "" {
+		return errors.New("environment/docker: container has no ID")
+	}
+	return e.attach(ctx, c.ID, generation)
+}
 
+func (e *Environment) attach(ctx context.Context, containerID string, generation uint64) error {
 	opts := container.AttachOptions{
 		Stdin:  true,
 		Stdout: true,
@@ -61,12 +75,20 @@ func (e *Environment) Attach(ctx context.Context) error {
 		Stream: true,
 	}
 
-	// Set the stream again with the container.
-	if st, err := e.client.ContainerAttach(ctx, e.Id, opts); err != nil {
+	st, err := e.client.ContainerAttach(ctx, containerID, opts)
+	if err != nil {
 		return errors.WrapIf(err, "environment/docker: error while attaching to container")
-	} else {
-		e.SetStream(&st)
 	}
+	e.mu.Lock()
+	if e.streamGeneration != generation || e.stream != nil {
+		e.mu.Unlock()
+		st.Close()
+		return nil
+	}
+	e.streamGeneration++
+	generation = e.streamGeneration
+	e.stream = &st
+	e.mu.Unlock()
 
 	go func() { //nolint:gosec // polling intentionally outlives ctx, see below
 		// Don't use the context provided to the function, that'll cause the polling to
@@ -74,15 +96,21 @@ func (e *Environment) Attach(ctx context.Context) error {
 		// function is to avoid a hang situation when trying to attach to a container.
 		pollCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		defer e.stream.Close()
+		defer st.Close()
 		defer func() {
-			e.SetStream(nil)
-			// The stream can end without the container stopping, in which case it is
-			// attached to again rather than treating the server as stopped.
-			if e.reattach() {
+			e.mu.Lock()
+			if e.streamGeneration != generation {
+				e.mu.Unlock()
 				return
 			}
-			e.SetState(environment.ProcessOfflineState)
+			e.stream = nil
+			e.mu.Unlock()
+			// The stream can end without the container stopping, in which case it is
+			// attached to again rather than treating the server as stopped.
+			if e.reattach(containerID, generation) {
+				return
+			}
+			e.setRecoveryState(generation, environment.ProcessOfflineState)
 		}()
 
 		go func() {
@@ -95,7 +123,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 			}
 		}()
 
-		if err := system.ScanReader(e.stream.Reader, func(v []byte) {
+		if err := system.ScanReader(st.Reader, func(v []byte) {
 			e.logCallbackMx.Lock()
 			defer e.logCallbackMx.Unlock()
 			e.logCallback(v)
@@ -108,13 +136,11 @@ func (e *Environment) Attach(ctx context.Context) error {
 	return nil
 }
 
-// reattach is called when the attached stream ends, and attaches to the
-// container again if it is still running, returning true if the container is
-// still running. If that keeps happening, or attaching fails, the container is
-// terminated rather than left running without being managed.
-func (e *Environment) reattach() bool {
+// reattach retries recovery for the original container. It returns true when a
+// newer stream or lifecycle owns the process state.
+func (e *Environment) reattach(containerID string, generation uint64) bool {
 	for {
-		attached, retry := e.recoverAttachment()
+		attached, retry := e.recoverAttachment(containerID, generation)
 		if !retry {
 			return attached
 		}
@@ -122,11 +148,17 @@ func (e *Environment) reattach() bool {
 	}
 }
 
-func (e *Environment) recoverAttachment() (attached, retry bool) {
+func (e *Environment) recoverAttachment(containerID string, generation uint64) (attached, retry bool) {
+	e.mu.RLock()
+	current := e.streamGeneration == generation && e.stream == nil
+	e.mu.RUnlock()
+	if !current {
+		return true, false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
-	c, err := e.ContainerInspect(ctx)
+	c, err := e.client.ContainerInspect(ctx, containerID)
 	if cerrdefs.IsNotFound(err) || (err == nil && c.State != nil && !c.State.Running) {
 		return false, false
 	}
@@ -136,6 +168,10 @@ func (e *Environment) recoverAttachment() (attached, retry bool) {
 	}
 
 	e.mu.Lock()
+	if e.streamGeneration != generation {
+		e.mu.Unlock()
+		return true, false
+	}
 	if time.Since(e.reattachedAt) > time.Minute*5 {
 		e.reattachedAt = time.Now()
 		e.reattachedCount = 0
@@ -146,13 +182,13 @@ func (e *Environment) recoverAttachment() (attached, retry bool) {
 
 	if count <= 3 {
 		e.log().Warn("lost the attached stream for a running container, attaching again")
-		err := e.Attach(ctx)
+		err := e.attach(ctx, containerID, generation)
 		if err == nil {
 			return true, false
 		}
 		// The container may have only just stopped, in which case it is handled like
 		// any other stop so that crash detection still applies.
-		if c, ierr := e.ContainerInspect(ctx); ierr == nil && c.State != nil && !c.State.Running {
+		if c, ierr := e.client.ContainerInspect(ctx, containerID); ierr == nil && c.State != nil && !c.State.Running {
 			return false, false
 		}
 		e.log().WithField("error", err).Error("failed to attach to running container")
@@ -163,11 +199,29 @@ func (e *Environment) recoverAttachment() (attached, retry bool) {
 	// container running without being managed.
 	tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer tcancel()
-	if err := e.Terminate(tctx, "SIGKILL"); err != nil {
+	if !e.setRecoveryState(generation, environment.ProcessStoppingState) {
+		return true, false
+	}
+	if err := e.client.ContainerKill(tctx, containerID, "SIGKILL"); err != nil && !cerrdefs.IsNotFound(err) {
 		e.log().WithField("error", err).Error("failed to terminate container")
 		return false, true
 	}
 	return false, false
+}
+
+func (e *Environment) setRecoveryState(generation uint64, state string) bool {
+	e.mu.Lock()
+	if e.streamGeneration != generation {
+		e.mu.Unlock()
+		return false
+	}
+	previous := e.st.Load()
+	e.st.Store(state)
+	e.mu.Unlock()
+	if previous != state {
+		e.Events().Publish(environment.StateChangeEvent, state)
+	}
+	return true
 }
 
 // InSituUpdate performs an in-place update of the Docker container's resource

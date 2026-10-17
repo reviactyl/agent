@@ -92,6 +92,16 @@ func (e *Environment) Start(ctx context.Context) error {
 		}
 	}
 
+	e.mu.Lock()
+	e.streamGeneration++
+	stream := e.stream
+	e.stream = nil
+	e.reattachedAt = time.Time{}
+	e.reattachedCount = 0
+	e.mu.Unlock()
+	if stream != nil {
+		stream.Close()
+	}
 	e.SetState(environment.ProcessStartingState)
 
 	// Set this to true for now, we will set it to false once we reach the
