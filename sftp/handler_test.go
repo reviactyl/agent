@@ -4,13 +4,85 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/apex/log"
 	pkgsftp "github.com/pkg/sftp"
 
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/internal/database"
 	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/filesystem"
 )
+
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "sftp-tests-")
+	if err != nil {
+		panic(err)
+	}
+	config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{RootDirectory: root}})
+	if err := database.Initialize(); err != nil {
+		_ = os.RemoveAll(root)
+		panic(err)
+	}
+	code := m.Run()
+	if db, err := database.Instance().DB(); err == nil {
+		_ = db.Close()
+	}
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
+
+func TestHandlerFilewriteTruncatesOnlyWhenRequested(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		flags  uint32
+		offset int64
+		want   string
+	}{
+		{name: "resume", flags: 2, offset: 6, want: "ABCDEFGHI"},
+		{name: "overwrite", flags: 2, offset: 2, want: "ABGHIF"},
+		{name: "create and resume", flags: 2 | 8, offset: 6, want: "ABCDEFGHI"},
+		{name: "truncate", flags: 2 | 16, want: "GHI"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "upload.txt")
+			if err := os.WriteFile(path, []byte("ABCDEF"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fs, err := filesystem.New(root, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = fs.UnixFS().Close() })
+			srv, err := server.New(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := Handler{server: srv, fs: fs, events: &eventHandler{}, permissions: []string{"*"}, logger: log.WithField("test", tt.name)}
+			request := pkgsftp.NewRequest("Put", "/upload.txt")
+			request.Flags = tt.flags
+			writer, err := h.Filewrite(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = writer.(io.Closer).Close() })
+			if n, err := writer.WriteAt([]byte("GHI"), tt.offset); err != nil || n != 3 {
+				t.Fatalf("WriteAt = %d, %v", n, err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("contents = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 type writeAtFunc func([]byte, int64) (int, error)
 

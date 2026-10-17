@@ -197,7 +197,11 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if slot == nil {
 		return nil, sftp.ErrSSHFxFailure
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
+	flags := os.O_RDWR
+	if request.Pflags().Trunc {
+		flags |= os.O_TRUNC
+	}
+	f, err := h.fs.Touch(request.Filepath, flags)
 	if err != nil {
 		slot.close()
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
