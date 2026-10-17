@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -142,7 +141,7 @@ func postSystemUpdate(c *gin.Context) {
 // this agent instance.
 func getAllServers(c *gin.Context) {
 	servers := middleware.ExtractManager(c).All()
-	out := make([]server.APIResponse, len(servers), len(servers))
+	out := make([]server.APIResponse, len(servers))
 	for i, v := range servers {
 		out[i] = v.ToAPIResponse()
 	}
@@ -156,6 +155,14 @@ func postCreateServer(c *gin.Context) {
 
 	details := installer.ServerDetails{}
 	if err := c.BindJSON(&details); err != nil {
+		return
+	}
+
+	// A server can only exist once on an instance.
+	if _, ok := manager.Get(details.UUID); ok {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A server with this identifier already exists on this instance.",
+		})
 		return
 	}
 
@@ -174,7 +181,13 @@ func postCreateServer(c *gin.Context) {
 
 	// Plop that server instance onto the request so that it can be referenced in
 	// requests from here-on out.
-	manager.Add(install.Server())
+	if !manager.AddIfMissing(install.Server()) {
+		install.Server().CleanupForDestroy()
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A server with this identifier already exists on this instance.",
+		})
+		return
+	}
 
 	// Begin the installation process in the background to not block the request
 	// cycle. If there are any errors they will be logged and communicated back
@@ -222,19 +235,17 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
-	if err := c.BindJSON(&cfg); err != nil {
+	// Values missing from the request keep their current value.
+	update := cfg.PanelConfiguration()
+	if err := c.BindJSON(&update); err != nil {
 		return
 	}
 
-	// Keep the SSL certificates the same since the Panel will send through Lets Encrypt
-	// default locations. However, if we picked a different location manually we don't
-	// want to override that.
-	//
-	// If you pass through manual locations in the API call this logic will be skipped.
-	if strings.HasPrefix(cfg.Api.Ssl.KeyFile, "/etc/letsencrypt/live/") {
-		cfg.Api.Ssl.KeyFile = config.Get().Api.Ssl.KeyFile
-		cfg.Api.Ssl.CertificateFile = config.Get().Api.Ssl.CertificateFile
-	}
+	// Keep the SSL certificates the same since the Panel always sends the default Lets
+	// Encrypt locations, which would override any location picked manually.
+	update.Api.Ssl.CertificateFile = cfg.Api.Ssl.CertificateFile
+	update.Api.Ssl.KeyFile = cfg.Api.Ssl.KeyFile
+	cfg.ApplyPanelConfiguration(update)
 
 	// The token that everything authenticates against is a derived value that is
 	// not part of the payload sent by the Panel, so it has to be re-resolved from
@@ -287,14 +298,14 @@ func postDeauthorizeUser(c *gin.Context) {
 		for _, uuid := range data.Servers {
 			if s, ok := m.Get(uuid); ok {
 				tokens.DenyForServer(s.ID(), data.User)
-				s.Websockets().CancelAll()
+				s.Websockets().CancelUser(data.User)
 				s.Sftp().Cancel(data.User)
 			}
 		}
 	} else {
 		for _, s := range m.All() {
 			tokens.DenyForServer(s.ID(), data.User)
-			s.Websockets().CancelAll()
+			s.Websockets().CancelUser(data.User)
 			s.Sftp().Cancel(data.User)
 		}
 	}

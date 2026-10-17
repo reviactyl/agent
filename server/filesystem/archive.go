@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/juju/ratelimit"
 	"github.com/klauspost/pgzip"
-	ignore "github.com/sabhiram/go-gitignore"
 	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/config"
@@ -27,7 +27,7 @@ const memory = 4 * 1024
 var pool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, memory)
-		return b
+		return &b
 	},
 }
 
@@ -89,7 +89,7 @@ type Archive struct {
 func (a *Archive) Create(ctx context.Context, dst string) error {
 	// Using os.OpenFile here is expected, as long as `dst` is not a user
 	// provided path.
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // dst is never user provided, see above
 	if err != nil {
 		return err
 	}
@@ -144,6 +144,42 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 		return errors.New("filesystem: unsupported archive format")
 	}
 
+	// If we're specifically looking for only certain files, or have requested
+	// that certain files be ignored we'll update the callback function to reflect
+	// that request. Ignore patterns are compiled before anything is written so that
+	// an invalid list does not leave an empty archive behind.
+	var callback walkFunc
+	if len(a.Files) == 0 && len(a.Ignore) > 0 {
+		i, err := compileIgnore(a.Ignore)
+		if err != nil {
+			return errors.WrapIf(err, "filesystem: unable to compile archive ignore patterns")
+		}
+		// Time each evaluation and abort if the patterns prove disproportionately
+		// expensive for this server's file tree.
+		budget := newIgnoreMatchBudget(ignorePatternCount(a.Ignore))
+		callback = a.callback(func(_ int, _, relative string, d ufs.DirEntry) error {
+			if d.IsDir() {
+				relative = strings.TrimSuffix(relative, "/") + "/"
+			}
+			start := time.Now()
+			skip := i.MatchesPath(relative)
+			if err := budget.track(time.Since(start)); err != nil {
+				return err
+			}
+			if skip {
+				if d.IsDir() {
+					return ufs.SkipDir
+				}
+				return SkipThis
+			}
+			return nil
+		})
+	} else if len(a.Files) > 0 {
+		callback = a.withFilesCallback()
+	} else {
+		callback = a.callback()
+	}
+
 	if a.zw == nil {
 		// Choose which compression level to use based on the compression_level configuration option
 		var compressionLevel int
@@ -177,27 +213,6 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) (streamErr error) {
 	}
 
 	fs := a.Filesystem.unixFS
-
-	// If we're specifically looking for only certain files, or have requested
-	// that certain files be ignored we'll update the callback function to reflect
-	// that request.
-	var callback walkFunc
-	if len(a.Files) == 0 && len(a.Ignore) > 0 {
-		i := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
-		callback = a.callback(func(_ int, _, relative string, d ufs.DirEntry) error {
-			if d.IsDir() {
-				relative = strings.TrimSuffix(relative, "/") + "/"
-			}
-			if i.MatchesPath(relative) {
-				return SkipThis
-			}
-			return nil
-		})
-	} else if len(a.Files) > 0 {
-		callback = a.withFilesCallback()
-	} else {
-		callback = a.callback()
-	}
 
 	// Open the base directory we were provided.
 	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)
@@ -348,7 +363,7 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		if err != nil {
 			return err
 		}
-		var output io.Writer = writer
+		output := io.Writer(writer)
 		if a.Progress != nil {
 			a.Progress.Writer = writer
 			output = a.Progress
@@ -361,18 +376,16 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 	// following its target (which may be missing or outside the server).
 	var target string
 	if s.Mode()&fs.ModeSymlink != 0 {
-		buf := make([]byte, 4096)
-		n, err := unix.Readlinkat(dirfd, name, buf)
+		target, err = a.Filesystem.unixFS.Readlinkat(dirfd, name)
 		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
+			if errors.Is(err, ufs.ErrNotExist) {
 				return nil
 			}
 			return errors.WrapIff(err, "failed reading symlink '%s'", relative)
 		}
-		if n == len(buf) {
+		if len(target) >= 4096 {
 			return errors.New("filesystem: symlink target is too long for TAR archive")
 		}
-		target = string(buf[:n])
 	}
 
 	// Get the tar FileInfoHeader in order to add the file to the archive.
@@ -400,11 +413,9 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		buf = make([]byte, header.Size)
 	} else {
 		// Get a fixed-size buffer from the pool to save on allocations.
-		buf = pool.Get().([]byte)
-		defer func() {
-			buf = make([]byte, memory)
-			pool.Put(buf)
-		}()
+		bp := pool.Get().(*[]byte)
+		defer pool.Put(bp)
+		buf = *bp
 	}
 
 	// Open the file.

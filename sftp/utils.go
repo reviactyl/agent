@@ -34,7 +34,7 @@ type fxErr uint32
 func (e fxErr) As(target interface{}) bool {
 	// pkg/sftp checks errors against its private fxerr type before writing status packets.
 	v := reflect.ValueOf(target)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return false
 	}
 

@@ -12,11 +12,11 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/buger/jsonparser"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/environment"
@@ -24,6 +24,10 @@ import (
 )
 
 var ErrNotAttached = errors.Sentinel("not attached to instance")
+
+// commandWriteTimeout is the amount of time allowed for a command to be written
+// to the input of a server process.
+var commandWriteTimeout = time.Second * 10
 
 // A custom console writer that allows us to keep a function blocked until the
 // given stream is properly closed. This does nothing special, only exists to
@@ -46,10 +50,24 @@ func (nw noopWriter) Write(b []byte) (int, error) {
 // for the purposes of attaching to the container, a second context is created
 // within the function for managing polling.
 func (e *Environment) Attach(ctx context.Context) error {
-	if e.IsAttached() {
+	e.mu.RLock()
+	generation := e.streamGeneration
+	attached := e.stream != nil
+	e.mu.RUnlock()
+	if attached {
 		return nil
 	}
+	c, err := e.ContainerInspect(ctx)
+	if err != nil {
+		return err
+	}
+	if c.ID == "" {
+		return errors.New("environment/docker: container has no ID")
+	}
+	return e.attach(ctx, c.ID, generation)
+}
 
+func (e *Environment) attach(ctx context.Context, containerID string, generation uint64) error {
 	opts := container.AttachOptions{
 		Stdin:  true,
 		Stdout: true,
@@ -57,23 +75,42 @@ func (e *Environment) Attach(ctx context.Context) error {
 		Stream: true,
 	}
 
-	// Set the stream again with the container.
-	if st, err := e.client.ContainerAttach(ctx, e.Id, opts); err != nil {
+	st, err := e.client.ContainerAttach(ctx, containerID, opts)
+	if err != nil {
 		return errors.WrapIf(err, "environment/docker: error while attaching to container")
-	} else {
-		e.SetStream(&st)
 	}
+	e.mu.Lock()
+	if e.streamGeneration != generation || e.stream != nil {
+		e.mu.Unlock()
+		st.Close()
+		return nil
+	}
+	e.streamGeneration++
+	generation = e.streamGeneration
+	e.stream = &st
+	e.mu.Unlock()
 
-	go func() {
+	go func() { //nolint:gosec // polling intentionally outlives ctx, see below
 		// Don't use the context provided to the function, that'll cause the polling to
 		// exit unexpectedly. We want a custom context for this, the one passed to the
 		// function is to avoid a hang situation when trying to attach to a container.
 		pollCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		defer e.stream.Close()
+		defer st.Close()
 		defer func() {
-			e.SetState(environment.ProcessOfflineState)
-			e.SetStream(nil)
+			e.mu.Lock()
+			if e.streamGeneration != generation {
+				e.mu.Unlock()
+				return
+			}
+			e.stream = nil
+			e.mu.Unlock()
+			// The stream can end without the container stopping, in which case it is
+			// attached to again rather than treating the server as stopped.
+			if e.reattach(containerID, generation) {
+				return
+			}
+			e.setRecoveryState(generation, environment.ProcessOfflineState)
 		}()
 
 		go func() {
@@ -86,7 +123,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 			}
 		}()
 
-		if err := system.ScanReader(e.stream.Reader, func(v []byte) {
+		if err := system.ScanReader(st.Reader, func(v []byte) {
 			e.logCallbackMx.Lock()
 			defer e.logCallbackMx.Unlock()
 			e.logCallback(v)
@@ -97,6 +134,94 @@ func (e *Environment) Attach(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// reattach retries recovery for the original container. It returns true when a
+// newer stream or lifecycle owns the process state.
+func (e *Environment) reattach(containerID string, generation uint64) bool {
+	for {
+		attached, retry := e.recoverAttachment(containerID, generation)
+		if !retry {
+			return attached
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (e *Environment) recoverAttachment(containerID string, generation uint64) (attached, retry bool) {
+	e.mu.RLock()
+	current := e.streamGeneration == generation && e.stream == nil
+	e.mu.RUnlock()
+	if !current {
+		return true, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	c, err := e.client.ContainerInspect(ctx, containerID)
+	if cerrdefs.IsNotFound(err) || (err == nil && c.State != nil && !c.State.Running) {
+		return false, false
+	}
+	if err != nil || c.State == nil {
+		e.log().WithField("error", err).Warn("unable to inspect container during recovery")
+		return false, true
+	}
+
+	e.mu.Lock()
+	if e.streamGeneration != generation {
+		e.mu.Unlock()
+		return true, false
+	}
+	if time.Since(e.reattachedAt) > time.Minute*5 {
+		e.reattachedAt = time.Now()
+		e.reattachedCount = 0
+	}
+	e.reattachedCount++
+	count := e.reattachedCount
+	e.mu.Unlock()
+
+	if count <= 3 {
+		e.log().Warn("lost the attached stream for a running container, attaching again")
+		err := e.attach(ctx, containerID, generation)
+		if err == nil {
+			return true, false
+		}
+		// The container may have only just stopped, in which case it is handled like
+		// any other stop so that crash detection still applies.
+		if c, ierr := e.client.ContainerInspect(ctx, containerID); ierr == nil && c.State != nil && !c.State.Running {
+			return false, false
+		}
+		e.log().WithField("error", err).Error("failed to attach to running container")
+	}
+
+	e.log().Error("unable to stay attached to running container, terminating it")
+	// Attaching may have used up the time allowed by ctx, which would leave the
+	// container running without being managed.
+	tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer tcancel()
+	if !e.setRecoveryState(generation, environment.ProcessStoppingState) {
+		return true, false
+	}
+	if err := e.client.ContainerKill(tctx, containerID, "SIGKILL"); err != nil && !cerrdefs.IsNotFound(err) {
+		e.log().WithField("error", err).Error("failed to terminate container")
+		return false, true
+	}
+	return false, false
+}
+
+func (e *Environment) setRecoveryState(generation uint64, state string) bool {
+	e.mu.Lock()
+	if e.streamGeneration != generation {
+		e.mu.Unlock()
+		return false
+	}
+	previous := e.st.Load()
+	e.st.Store(state)
+	e.mu.Unlock()
+	if previous != state {
+		e.Events().Publish(environment.StateChangeEvent, state)
+	}
+	return true
 }
 
 // InSituUpdate performs an in-place update of the Docker container's resource
@@ -115,7 +240,7 @@ func (e *Environment) InSituUpdate() error {
 		// to the disk.
 		//
 		// We'll let a boot process make modifications to the container if needed at this point.
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		return errors.Wrap(err, "environment/docker: could not inspect container")
@@ -152,7 +277,7 @@ func (e *Environment) Create() error {
 	// container anyways.
 	if _, err := e.ContainerInspect(ctx); err == nil {
 		return nil
-	} else if !client.IsErrNotFound(err) {
+	} else if !cerrdefs.IsNotFound(err) {
 		return errors.WrapIf(err, "environment/docker: failed to inspect container")
 	}
 
@@ -210,7 +335,7 @@ func (e *Environment) Create() error {
 		networkMode = container.NetworkMode(networkName)
 
 		if _, err := e.client.NetworkInspect(ctx, networkName, network.InspectOptions{}); err != nil {
-			if !client.IsErrNotFound(err) {
+			if !cerrdefs.IsNotFound(err) {
 				return err
 			}
 
@@ -293,7 +418,7 @@ func (e *Environment) Destroy() error {
 	// exist on the system. We're just a step ahead of ourselves in that case.
 	//
 	// @see https://github.com/pterodactyl/panel/issues/2001
-	if err != nil && client.IsErrNotFound(err) {
+	if err != nil && cerrdefs.IsNotFound(err) {
 		return nil
 	}
 
@@ -304,21 +429,37 @@ func (e *Environment) Destroy() error {
 // instance. There is no confirmation that this data is sent successfully, only
 // that it gets pushed into the stdin.
 func (e *Environment) SendCommand(c string) error {
-	if !e.IsAttached() {
-		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	// Commands may contain tabs and line breaks, but no other control characters.
+	if strings.ContainsFunc(c, func(r rune) bool {
+		return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0x7f
+	}) {
+		return errors.New("environment/docker: command contains control characters")
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	stream := e.stream
+	stop := e.meta.Stop
+	e.mu.RUnlock()
+	if stream == nil {
+		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	}
 
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Agent will think it has crashed and attempt to restart it.
-	if e.meta.Stop.Type == "command" && c == e.meta.Stop.Value {
-		e.SetState(environment.ProcessStoppingState)
+	if stop.Type == "command" {
+		for _, command := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
+			if command == stop.Value {
+				e.SetState(environment.ProcessStoppingState)
+				break
+			}
+		}
 	}
 
-	_, err := e.stream.Conn.Write([]byte(c + "\n"))
+	// The process may never read its input, so don't wait forever for there to be
+	// room for the command.
+	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
+	_, err := stream.Conn.Write([]byte(c + "\n"))
 
 	return errors.Wrap(err, "environment/docker: could not write to container stream")
 }

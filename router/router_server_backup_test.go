@@ -21,6 +21,7 @@ import (
 	"github.com/reviactyl/agent/internal/models"
 	"github.com/reviactyl/agent/remote"
 	wserver "github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 func init() {
@@ -196,6 +197,23 @@ func TestPostServerRestoreBackupRejectsLoopbackDownloadURL(t *testing.T) {
 	case <-hit:
 		t.Fatal("expected loopback server not to receive restore download request")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestPostServerBackupRejectsInvalidIgnoreList(t *testing.T) {
+	client := backupTestRemoteClient{}
+	backupID := "11111111-1111-1111-1111-111111111111"
+	ignore := strings.Repeat("*a", filesystem.MaxIgnorePatternWildcards+1)
+	c, w, s := newBackupRestoreContext(t, client, backupID, fmt.Sprintf(`{"adapter":"agent","uuid":%q,"ignore":%q}`, backupID, ignore))
+	defer s.CtxCancel()
+
+	postServerBackup(c)
+
+	if c.Writer.Status() != http.StatusBadRequest {
+		t.Fatalf("expected invalid ignore list to be rejected, got status %d body %s", c.Writer.Status(), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "wildcards") {
+		t.Fatalf("expected error to describe the wildcard limit, got body %s", w.Body.String())
 	}
 }
 
@@ -378,7 +396,7 @@ func TestPostServerRestoreBackupPreflightPreservesFiles(t *testing.T) {
 			}
 			c, _, unused := newBackupRestoreContext(t, client, "11111111-1111-1111-1111-111111111111", body)
 			unused.CtxCancel()
-			s, err := wserver.NewEmptyManager(client).InitServer(remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"server"}`), ProcessConfiguration: &remote.ProcessConfiguration{}})
+			s, err := wserver.NewEmptyManager(client).InitServer("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}`), ProcessConfiguration: &remote.ProcessConfiguration{}})
 			if err != nil {
 				t.Fatal(err)
 			}

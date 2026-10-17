@@ -25,18 +25,40 @@ import (
 type Filesystem struct {
 	unixFS *ufs.Quota
 
-	mu                sync.RWMutex
+	// mu guards changes to the disk usage that must be checked against the
+	// limit, along with the fields tracking reservations below.
+	mu sync.RWMutex
+	// reserved is the space reserved by writes that have not finished yet.
+	reserved int64
+	// walking is set while the disk usage is being calculated, during which
+	// walkReserved is the space reserved by writes in progress at any point.
+	walking      bool
+	walkReserved int64
+	// walkCompleted counts managed usage changes that require another scan pass.
+	walkCompleted      int64
+	walkCompletedDelta int64
+	walkObserved       map[uint64]int64
+	// walkUnobserved holds the latest size of managed inodes changed after
+	// their directory was visited. It is discarded if a later visit sees them.
+	walkUnobserved map[uint64]int64
+
+	// lookupMu prevents the disk usage from being calculated more than once
+	// at the same time.
+	lookupMu          sync.Mutex
 	lastLookupTime    *usageLookupTime
 	lookupInProgress  atomic.Bool
 	diskCheckInterval time.Duration
 	denylist          *ignore.GitIgnore
 
 	isTest bool
+	// walkEntryHook runs after each regular file is counted during a tracked
+	// disk walk. Tests use it to complete writes after a directory listing.
+	walkEntryHook func()
 }
 
 // New creates a new Filesystem instance for a given server.
 func New(root string, size int64, denylist []string) (*Filesystem, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o755); err != nil { //nolint:gosec // mounted as the container's home directory; the parent data directory is 0700
 		return nil, err
 	}
 	unixFS, err := ufs.NewUnixFS(root, config.UseOpenat2())
@@ -94,19 +116,54 @@ func (fs *Filesystem) UnixFS() *ufs.UnixFS {
 // already. If  it is present, the file is opened using the defaults which will truncate
 // the contents. The opened file is then returned to the caller.
 func (fs *Filesystem) Touch(p string, flag int) (ufs.File, error) {
-	var currentSize int64
-	st, err := fs.unixFS.Stat(p)
-	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
-		return nil, err
-	} else if err == nil && !st.IsDir() {
-		currentSize = st.Size()
-	}
-
-	file, err := fs.unixFS.Touch(p, flag, 0o644)
+	file, currentSize, err := fs.openForWrite(p, flag, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	return newQuotaFile(fs, file, currentSize), nil
+}
+
+// openForWrite opens p with the given flags, creating it if it does not exist,
+// and returns it along with the size it had when it was opened. The size is read
+// from the opened file rather than from the path, since the path can be changed,
+// for example to a symlink, between being checked and being opened. If flag
+// includes O_TRUNC the file is truncated after its size is read.
+func (fs *Filesystem) openForWrite(p string, flag int, mode ufs.FileMode) (ufs.File, int64, error) {
+	file, err := fs.unixFS.Touch(p, flag&^ufs.O_TRUNC, mode)
+	if err != nil {
+		return nil, 0, err
+	}
+	st, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, 0, err
+	}
+	var size int64
+	if st.Mode().IsRegular() {
+		size = st.Size()
+	}
+	if flag&ufs.O_TRUNC != 0 {
+		fs.mu.Lock()
+		err := file.Truncate(0)
+		if err == nil {
+			fs.recordWalkFileSizeLocked(file)
+		}
+		fs.mu.Unlock()
+		if err != nil {
+			_ = file.Close()
+			return nil, 0, err
+		}
+	}
+	return file, size, nil
+}
+
+// checkNotDirectory returns an error if p is a directory.
+func (fs *Filesystem) checkNotDirectory(p string) error {
+	if st, err := fs.unixFS.Lstat(p); err == nil && st.IsDir() {
+		// TODO: resolved
+		return errors.WithStack(&Error{code: ErrCodeIsDirectory, resolved: ""})
+	}
+	return nil
 }
 
 // Writefile writes a file to the system. If the file does not already exist one
@@ -115,22 +172,14 @@ func (fs *Filesystem) Touch(p string, flag int) (ufs.File, error) {
 //
 // DEPRECATED: use `Write` instead.
 func (fs *Filesystem) Writefile(p string, r io.Reader) error {
-	var currentSize int64
-	st, err := fs.unixFS.Stat(p)
-	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
-		return errors.Wrap(err, "server/filesystem: writefile: failed to stat file")
-	} else if err == nil {
-		if st.IsDir() {
-			// TODO: resolved
-			return errors.WithStack(&Error{code: ErrCodeIsDirectory, resolved: ""})
-		}
-		currentSize = st.Size()
+	if err := fs.checkNotDirectory(p); err != nil {
+		return err
 	}
 
 	// Touch the file and return the handle to it at this point. This will
 	// create or truncate the file, and create any necessary parent directories
 	// if they are missing.
-	file, err := fs.unixFS.Touch(p, ufs.O_RDWR|ufs.O_TRUNC, 0o644)
+	file, currentSize, err := fs.openForWrite(p, ufs.O_RDWR|ufs.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("error touching file: %w", err)
 	}
@@ -138,10 +187,12 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 
 	// Do not use CopyBuffer here, it is wasteful as the file implements
 	// io.ReaderFrom, which causes it to not use the buffer anyways.
-	n, err := io.Copy(file, r)
+	n, err := io.Copy(lockedFilesystemWriter{fs: fs, file: file}, r)
 
 	// Adjust the disk usage to account for the old size and the new size of the file.
-	fs.unixFS.Add(n - currentSize)
+	fs.mu.Lock()
+	fs.addDisk(n - currentSize)
+	fs.mu.Unlock()
 
 	if err := fs.chownFile(p); err != nil {
 		return fmt.Errorf("error chowning file: %w", err)
@@ -153,62 +204,83 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 // Write streams to EOF when newSize is negative, enforcing quota as data arrives.
 func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
 	if newSize < 0 {
-		return fs.writeStream(p, r, mode)
-	}
-	var currentSize int64
-	st, err := fs.unixFS.Stat(p)
-	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
-		return errors.Wrap(err, "server/filesystem: writefile: failed to stat file")
-	} else if err == nil {
-		if st.IsDir() {
-			// TODO: resolved
-			return errors.WithStack(&Error{code: ErrCodeIsDirectory, resolved: ""})
-		}
-		currentSize = st.Size()
-	}
-
-	// Check that the new size we're writing to the disk can fit. If there is currently
-	// a file we'll subtract that current file size from the size of the buffer to determine
-	// the amount of new data we're writing (or amount we're removing if smaller).
-	if err := fs.HasSpaceFor(newSize - currentSize); err != nil {
+		_, err := fs.writeStream(p, r, mode, false)
 		return err
 	}
-
-	// Ensure the parent directories exist and are owned by the server user
-	// before creating the file. Touch would create any missing parents
-	// implicitly, but as the user Agent runs as; creating them here lets us
-	// chown the ones we add.
+	if err := fs.checkNotDirectory(p); err != nil {
+		return err
+	}
 	if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-
-	// Touch the file and return the handle to it at this point. This will
-	// create or truncate the file, and create any necessary parent directories
-	// if they are missing.
-	file, err := fs.unixFS.Touch(p, ufs.O_RDWR|ufs.O_TRUNC, mode)
+	_, statErr := fs.unixFS.Lstat(p)
+	existed := statErr == nil
+	if statErr != nil && !errors.Is(statErr, ufs.ErrNotExist) {
+		return errors.Wrap(statErr, "server/filesystem: writefile: failed to stat file")
+	}
+	file, currentSize, err := fs.openForWrite(p, ufs.O_RDWR, mode)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	if newSize == 0 {
-		// Subtract the previous size of the file if the new size is 0.
-		fs.unixFS.Add(-currentSize)
-	} else {
+	// Check that the new size we're writing to the disk can fit, and reserve it so that
+	// writes happening at the same time cannot each use the space that is left. If there
+	// is currently a file we'll subtract that current file size from the size of the buffer
+	// to determine the amount of new data we're writing (or amount we're removing if smaller).
+	if err := fs.reserveDisk(newSize - currentSize); err != nil {
+		if !existed {
+			_ = fs.unixFS.Remove(p)
+		}
+		return err
+	}
+	reserved := max(newSize-currentSize, 0)
+	// Release the reservation even if reading r panics, since the panic is
+	// recovered and the reservation would otherwise last until Agent restarts.
+	var used int64
+	defer func() { fs.releaseDisk(reserved, used) }()
+
+	fs.mu.Lock()
+	err = file.Truncate(0)
+	if err == nil {
+		fs.recordWalkFileSizeLocked(file)
+	}
+	fs.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	// The file is now empty.
+	used = -currentSize
+
+	var n int64
+	if newSize > 0 {
 		// Do not use CopyBuffer here, it is wasteful as the file implements
 		// io.ReaderFrom, which causes it to not use the buffer anyways.
-		var n int64
-		n, err = io.Copy(file, io.LimitReader(r, newSize))
-
-		// Adjust the disk usage to account for the old size and the new size of the file.
-		fs.unixFS.Add(n - currentSize)
+		n, err = io.Copy(lockedFilesystemWriter{fs: fs, file: file}, io.LimitReader(r, newSize))
 	}
+
+	// Adjust the disk usage to account for the old size and the new size of the file.
+	used = n - currentSize
 
 	if err := fs.chownFile(p); err != nil {
 		return err
 	}
 	// Return any remaining error.
 	return err
+}
+
+// WriteFrom writes the contents of r to p, creating the file or truncating it
+// if it exists, and returns the number of bytes written. Unlike Write, the size
+// of the contents does not need to be known ahead of time: each write is counted
+// against the disk limit as it happens. If writing fails the file is removed.
+func (fs *Filesystem) WriteFrom(p string, r io.Reader) (int64, error) {
+	return fs.writeStream(p, r, 0o644, true)
+}
+
+// WriteFromWithCredit streams to p using space that will be freed when
+// creditPath is replaced. Replace must be called after a successful write.
+func (fs *Filesystem) WriteFromWithCredit(p, creditPath string, r io.Reader) (int64, error) {
+	return fs.writeStreamWithCredit(p, r, 0o644, creditPath)
 }
 
 // CreateDirectory creates a new directory (name) at a specified path (p) for
@@ -219,6 +291,37 @@ func (fs *Filesystem) CreateDirectory(name string, p string) error {
 
 func (fs *Filesystem) Rename(oldpath, newpath string) error {
 	return fs.unixFS.RenameWithMkdirAll(oldpath, newpath, fs.mkdirAll)
+}
+
+// Replace atomically replaces newpath with oldpath and adjusts disk usage for
+// any file that was already at newpath.
+func (fs *Filesystem) Replace(oldpath, newpath string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	st, statErr := fs.unixFS.Lstat(newpath)
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	oldSize, err := replacementCredit(fs, newpath)
+	if err != nil {
+		return err
+	}
+	limit := fs.MaxDisk()
+	if limit == -1 || (limit > 0 && fs.CachedUsage()-oldSize > limit) {
+		return newFilesystemError(ErrCodeDiskSpace, nil)
+	}
+	if statErr == nil && st.Mode().IsRegular() {
+		if stat, ok := st.Sys().(*unix.Stat_t); ok {
+			if err := fs.unixFS.Chmod(oldpath, ufs.FileMode(stat.Mode&0o7777)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := fs.unixFS.Replace(oldpath, newpath); err != nil {
+		return err
+	}
+	fs.addDisk(-oldSize)
+	return nil
 }
 
 func (fs *Filesystem) Symlink(oldpath, newpath string) error {
@@ -377,10 +480,14 @@ func (fs *Filesystem) Copy(p string) error {
 	}
 	currentSize := info.Size()
 
-	// Check that copying this file wouldn't put the server over its limit.
-	if err := fs.HasSpaceFor(currentSize); err != nil {
+	// Check that copying this file wouldn't put the server over its limit, and reserve
+	// the space so that copies happening at the same time cannot each use it.
+	if err := fs.reserveDisk(currentSize); err != nil {
 		return err
 	}
+	// Release the reservation even if the copy panics, see Write.
+	var used int64
+	defer func() { fs.releaseDisk(currentSize, used) }()
 
 	base := info.Name()
 	extension := filepath.Ext(base)
@@ -394,20 +501,30 @@ func (fs *Filesystem) Copy(p string) error {
 		baseName = strings.TrimSuffix(baseName, ".tar")
 	}
 
-	newName, err := fs.findCopySuffix(dirfd, baseName, extension)
-	if err != nil {
-		return err
-	}
-	dst, err := fs.unixFS.OpenFileat(dirfd, newName, ufs.O_WRONLY|ufs.O_CREATE, info.Mode())
-	if err != nil {
-		return err
+	// Never write into an existing file, such as a copy made by another request
+	// at the same time.
+	var (
+		newName string
+		dst     ufs.File
+	)
+	for i := 0; ; i++ {
+		newName, err = fs.findCopySuffix(dirfd, baseName, extension)
+		if err == nil {
+			dst, err = fs.unixFS.OpenFileat(dirfd, newName, ufs.O_WRONLY|ufs.O_CREATE|ufs.O_EXCL, info.Mode())
+		}
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ufs.ErrExist) || i >= 10 {
+			return err
+		}
 	}
 	defer dst.Close()
 
 	// Do not use CopyBuffer here, it is wasteful as the file implements
 	// io.ReaderFrom, which causes it to not use the buffer anyways.
-	n, err := io.Copy(dst, io.LimitReader(source, currentSize))
-	fs.unixFS.Add(n)
+	n, err := io.Copy(lockedFilesystemWriter{fs: fs, file: dst}, io.LimitReader(source, currentSize))
+	used = n
 
 	if !fs.isTest {
 		if err := fs.unixFS.Lchownat(dirfd, newName, config.Get().System.User.Uid, config.Get().System.User.Gid); err != nil {
@@ -419,26 +536,19 @@ func (fs *Filesystem) Copy(p string) error {
 }
 
 // TruncateRootDirectory removes _all_ files and directories from a server's
-// data directory and resets the used disk space to zero.
+// data directory and resets the used disk space to zero. The directory itself
+// is kept, since it is mounted into the server's container.
 func (fs *Filesystem) TruncateRootDirectory() error {
-	if err := os.RemoveAll(fs.Path()); err != nil {
+	if err := fs.unixFS.RemoveContents("."); err != nil {
 		return err
 	}
-	if err := os.Mkdir(fs.Path(), 0o755); err != nil {
-		return err
-	}
-	_ = fs.unixFS.Close()
-	unixFS, err := ufs.NewUnixFS(fs.Path(), config.UseOpenat2())
-	if err != nil {
-		return err
-	}
-	var limit int64
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	// Space reserved by writes that are still in progress remains in use.
+	fs.unixFS.SetUsage(fs.reserved)
 	if fs.isTest {
-		limit = 0
-	} else {
-		limit = fs.unixFS.Limit()
+		fs.unixFS.SetLimit(0)
 	}
-	fs.unixFS = ufs.NewQuota(unixFS, limit)
 	return nil
 }
 

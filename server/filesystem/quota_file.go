@@ -51,18 +51,78 @@ func (f *quotaFile) WriteAt(p []byte, off int64) (int, error) {
 	})
 }
 
+// CheckSize checks whether replacing this file's contents with a file of the
+// given size would fit the disk limit, without changing the file.
+func (f *quotaFile) CheckSize(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if size <= f.size {
+		return nil
+	}
+	return f.fs.HasSpaceFor(size - f.size)
+}
+
+// ReplaceContents replaces the file's contents with data. Any growth is
+// reserved before the file is modified. The original contents are left in
+// place if there is not enough space, because the file is overwritten in
+// place and only then truncated to the new length.
+func (f *quotaFile) ReplaceContents(data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	previousSize := f.size
+	newSize := int64(len(data))
+	reserved := max(newSize-previousSize, 0)
+	if reserved > 0 {
+		if err := f.fs.reserveDisk(reserved); err != nil {
+			return err
+		}
+	}
+
+	if _, err := f.File.Seek(0, io.SeekStart); err != nil {
+		if reserved > 0 {
+			f.fs.releaseDisk(reserved, 0)
+		}
+		return err
+	}
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	defer func() {
+		f.fs.recordWalkFileSizeLocked(f.File)
+		f.fs.releaseDiskLocked(reserved, f.size-previousSize)
+	}()
+
+	n, err := f.File.Write(data)
+	f.size = max(f.size, int64(n))
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	if err := f.File.Truncate(newSize); err != nil {
+		return err
+	}
+	f.size = newSize
+	return nil
+}
+
 func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)) (int, error) {
 	previousSize := f.size
 	end, ok := quotaWriteEnd(off, len(p))
 	if !ok {
 		return 0, newFilesystemError(ErrCodeDiskSpace, nil)
 	}
-	if growth := end - previousSize; growth > 0 {
-		if err := f.fs.reserveDisk(growth); err != nil {
+	reserved := end - previousSize
+	if reserved > 0 {
+		if err := f.fs.reserveDisk(reserved); err != nil {
 			return 0, err
 		}
 	}
 
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 	n, err := write()
 	writtenEnd := previousSize
 	if n > 0 {
@@ -70,18 +130,16 @@ func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)
 		if writtenEnd > previousSize {
 			f.size = writtenEnd
 		}
+		f.fs.recordWalkFileSizeLocked(f.File)
 	}
 
-	if reserved := end - previousSize; reserved > 0 {
+	if reserved > 0 {
 		actual := int64(0)
 		if writtenEnd > previousSize {
 			actual = writtenEnd - previousSize
 		}
-		if actual < reserved {
-			f.fs.adjustDisk(actual - reserved)
-		}
+		f.fs.releaseDiskLocked(reserved, actual)
 	}
-
 	return n, err
 }
 

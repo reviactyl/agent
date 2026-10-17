@@ -11,12 +11,13 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
 
 	"github.com/reviactyl/agent/environment"
 	"github.com/reviactyl/agent/internal/ufs"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/server/backup"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 // Notifies the panel of a backup's state and returns an error if one is encountered
@@ -47,13 +48,16 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	if st.Mode()&os.ModeSymlink != 0 || st.Size() > 32*1024 {
-		// Don't read a symlinked ignore file, or a file larger than 32KiB in size.
+	if st.Mode()&os.ModeSymlink != 0 || st.Size() > filesystem.MaxIgnoreLength {
+		// Don't read a symlinked ignore file, or a file larger than the maximum list in size.
 		return "", nil
 	}
 	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", err
+	}
+	if err := filesystem.ValidateIgnore(string(b)); err != nil {
+		return "", errors.WrapIf(err, "backup: invalid ignore file")
 	}
 	return string(b), nil
 }
@@ -119,20 +123,17 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 
 // RestoreBackup calls the Restore function on the provided backup. Once this
 // restoration is completed an event is emitted to the websocket to notify the
-// Panel that is has been completed.
+// Panel that is has been completed. If truncate is set, all of the server's
+// files are deleted once it has stopped, before the backup is restored.
 //
 // In addition to the websocket event an API call is triggered to notify the
 // Panel of the new state.
-func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (err error) {
-	s.Config().SetSuspended(true)
+func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, truncate bool) (err error) {
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
-	defer func() {
-		s.Config().SetSuspended(false)
-		if reader != nil {
-			_ = reader.Close()
-		}
-	}()
+	if reader != nil {
+		defer reader.Close()
+	}
 	// Send an API call to the Panel as soon as this function is done running so that
 	// the Panel is informed of the restoration status of this backup.
 	defer func() {
@@ -142,13 +143,19 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	}()
 
 	// Don't try to restore the server until we have completely stopped the running
-	// instance, otherwise you'll likely hit all types of write errors due to the
-	// server being suspended.
+	// instance, otherwise you'll likely hit all types of write errors. The server
+	// cannot be started again while it is being restored.
 	if s.Environment.State() != environment.ProcessOfflineState {
 		if err = s.Environment.WaitForStop(s.Context(), 2*time.Minute, false); err != nil {
-			if !client.IsErrNotFound(err) {
+			if !cerrdefs.IsNotFound(err) {
 				return errors.WrapIf(err, "server/backup: restore: failed to wait for container stop")
 			}
+		}
+	}
+	if truncate {
+		s.Log().Info("deleting server files before restoring backup")
+		if err = s.Filesystem().TruncateRootDirectory(); err != nil {
+			return errors.WrapIf(err, "server/backup: restore: failed to delete server files")
 		}
 	}
 
@@ -200,6 +207,9 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			// from an archive supplied by the backup source.
 			directories = append(directories, restoredDirectory{file, info.Mode().Perm(), info.ModTime()})
 			directoryMu.Unlock()
+			return nil
+		}
+		if !info.Mode().IsRegular() {
 			return nil
 		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
