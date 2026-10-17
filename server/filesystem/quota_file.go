@@ -62,6 +62,68 @@ func (f *quotaFile) CheckSize(size int64) error {
 	return f.fs.HasSpaceFor(size - f.size)
 }
 
+// ReplaceContents replaces the file's contents with data. Any growth is
+// reserved before the file is modified. The original contents are left in
+// place if there is not enough space, because the file is overwritten in
+// place and only then truncated to the new length.
+func (f *quotaFile) ReplaceContents(data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	previousSize := f.size
+	newSize := int64(len(data))
+	reserved := max(newSize-previousSize, 0)
+	if reserved > 0 {
+		if err := f.fs.reserveDisk(reserved); err != nil {
+			return err
+		}
+	}
+
+	if _, err := f.File.Seek(0, io.SeekStart); err != nil {
+		if reserved > 0 {
+			f.fs.releaseDisk(reserved, 0)
+		}
+		return err
+	}
+
+	f.fs.mu.Lock()
+	n, err := f.File.Write(data)
+	if n > 0 {
+		f.fs.recordWalkFileSizeLocked(f.File)
+	}
+	f.fs.mu.Unlock()
+	if int64(n) > f.size {
+		f.size = int64(n)
+	}
+	used := max(f.size-previousSize, 0)
+
+	if err != nil {
+		if reserved > 0 {
+			f.fs.releaseDisk(reserved, used)
+		}
+		return err
+	}
+
+	if err := f.File.Truncate(newSize); err != nil {
+		if reserved > 0 {
+			f.fs.releaseDisk(reserved, used)
+		}
+		return err
+	}
+
+	if newSize != f.size {
+		f.fs.mu.Lock()
+		f.fs.recordWalkFileSizeLocked(f.File)
+		f.fs.mu.Unlock()
+		f.fs.adjustDisk(newSize - f.size)
+		f.size = newSize
+	}
+	if reserved > 0 {
+		f.fs.releaseDisk(reserved, used)
+	}
+	return nil
+}
+
 func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)) (int, error) {
 	previousSize := f.size
 	end, ok := quotaWriteEnd(off, len(p))
