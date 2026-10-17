@@ -146,7 +146,11 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
+	flags := os.O_RDWR
+	if request.Pflags().Trunc {
+		flags |= os.O_TRUNC
+	}
+	f, err := h.fs.Touch(request.Filepath, flags)
 	if err != nil {
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
