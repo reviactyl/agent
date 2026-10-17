@@ -168,48 +168,27 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.walkCompleted = 0
 	fs.walkCompletedDelta = 0
 	fs.walkObserved = make(map[uint64]int64)
+	fs.walkUnobserved = make(map[uint64]int64)
 	fs.mu.Unlock()
 
-	// If managed writes change disk usage during a scan, repeat it so those
-	// writes are reflected by the scan rather than double-counted as a delta.
-	const maxWalkPasses = 2
-	var size int64
-	var err error
-	for pass := 0; ; pass++ {
-		fs.mu.Lock()
-		fs.walkCompletedDelta = 0
-		fs.walkObserved = make(map[uint64]int64)
-		fs.mu.Unlock()
-
-		size, err = fs.directorySize("/", true)
-		fs.mu.Lock()
-		if err == nil && fs.walkCompleted > 0 && pass+1 < maxWalkPasses {
-			// The scan may have raced with completed writes. Try one more pass,
-			// but preserve the counter on the final pass so reconciliation below
-			// knows whether it must retain the tracked usage as a safety floor.
-			fs.walkCompleted = 0
-			fs.mu.Unlock()
-			continue
-		}
-		break
-	}
+	// One pass is sufficient: concurrent managed writes are reconciled against
+	// the inode observations made by this pass. In particular, changed inodes
+	// whose parent has already been visited remain in walkUnobserved.
+	size, err := fs.directorySize("/", true)
+	fs.mu.Lock()
 
 	// Always record the lookup, even if there is an error, so that a persistent error does not
 	// cause the disk to be walked on every call.
 	fs.lastLookupTime.Set(time.Now())
 
-	// Include writes still in progress. A successful walk can still lower stale
-	// cached usage when files were removed outside this process. Changes to files
-	// already seen by the final pass are added through walkCompletedDelta. A
-	// failed partial walk retains the cache as a floor because its total is
-	// incomplete.
+	// Include active reservations and managed changes made after an inode was
+	// observed. A partial walk cannot lower cached usage because its total is
+	// incomplete; a successful walk is free to reclaim externally removed data.
 	usage := size + fs.walkReserved + fs.walkCompletedDelta
-	if err != nil || fs.walkCompleted > 0 {
-		// A partial walk cannot lower the cache. Likewise, if managed writes
-		// completed during the final pass, a newly created inode may have been
-		// written after its directory was visited and therefore be absent from
-		// size and walkCompletedDelta. Keep the tracked usage as a floor in that
-		// case; a temporary over-count is safer than allowing writes past quota.
+	for _, unobservedSize := range fs.walkUnobserved {
+		usage += unobservedSize
+	}
+	if err != nil {
 		usage = max(usage, fs.unixFS.Usage())
 	}
 	fs.unixFS.SetUsage(usage)
@@ -218,6 +197,7 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.walkCompleted = 0
 	fs.walkCompletedDelta = 0
 	fs.walkObserved = nil
+	fs.walkUnobserved = nil
 	fs.mu.Unlock()
 
 	return usage, err
@@ -284,6 +264,7 @@ func (fs *Filesystem) directorySize(root string, trackWrites bool) (int64, error
 		}
 		if trackWrites && fs.walking && fs.walkObserved != nil {
 			fs.walkObserved[sysFileInfo.Ino] = info.Size()
+			delete(fs.walkUnobserved, sysFileInfo.Ino)
 		}
 		if trackWrites {
 			fs.mu.Unlock()
@@ -311,6 +292,7 @@ func (fs *Filesystem) recordWalkFileSizeLocked(file ufs.File) {
 	}
 	previousSize, seen := fs.walkObserved[stat.Ino]
 	if !seen {
+		fs.walkUnobserved[stat.Ino] = info.Size()
 		return
 	}
 	fs.walkCompletedDelta += info.Size() - previousSize

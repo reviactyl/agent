@@ -38,6 +38,9 @@ type Filesystem struct {
 	walkCompleted      int64
 	walkCompletedDelta int64
 	walkObserved       map[uint64]int64
+	// walkUnobserved holds the latest size of managed inodes changed after
+	// their directory was visited. It is discarded if a later visit sees them.
+	walkUnobserved map[uint64]int64
 
 	// lookupMu prevents the disk usage from being calculated more than once
 	// at the same time.
