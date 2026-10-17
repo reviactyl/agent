@@ -1,7 +1,6 @@
 package filesystem
 
 import (
-	"golang.org/x/sys/unix"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -9,6 +8,7 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/internal/ufs"
 )
@@ -183,12 +183,13 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 
 		size, err = fs.directorySize("/", true)
 		fs.mu.Lock()
-		if err == nil && fs.walkCompleted > 0 {
+		if err == nil && fs.walkCompleted > 0 && pass+1 < maxWalkPasses {
+			// The scan may have raced with completed writes. Try one more pass,
+			// but preserve the counter on the final pass so reconciliation below
+			// knows whether it must retain the tracked usage as a safety floor.
 			fs.walkCompleted = 0
-			if pass+1 < maxWalkPasses {
-				fs.mu.Unlock()
-				continue
-			}
+			fs.mu.Unlock()
+			continue
 		}
 		break
 	}
@@ -203,7 +204,12 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	// failed partial walk retains the cache as a floor because its total is
 	// incomplete.
 	usage := size + fs.walkReserved + fs.walkCompletedDelta
-	if err != nil {
+	if err != nil || fs.walkCompleted > 0 {
+		// A partial walk cannot lower the cache. Likewise, if managed writes
+		// completed during the final pass, a newly created inode may have been
+		// written after its directory was visited and therefore be absent from
+		// size and walkCompletedDelta. Keep the tracked usage as a floor in that
+		// case; a temporary over-count is safer than allowing writes past quota.
 		usage = max(usage, fs.unixFS.Usage())
 	}
 	fs.unixFS.SetUsage(usage)
