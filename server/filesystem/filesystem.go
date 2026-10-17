@@ -51,6 +51,9 @@ type Filesystem struct {
 	denylist          *ignore.GitIgnore
 
 	isTest bool
+	// walkEntryHook runs after each regular file is counted during a tracked
+	// disk walk. Tests use it to complete writes after a directory listing.
+	walkEntryHook func()
 }
 
 // New creates a new Filesystem instance for a given server.

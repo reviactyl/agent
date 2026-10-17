@@ -1,13 +1,18 @@
 package filesystem
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/reviactyl/agent/internal/ufs"
 )
 
 // A walk that fails part of the way through has only counted some of the files,
@@ -48,4 +53,62 @@ func TestQueuedDiskUsageLookupUsesRefreshedCache(t *testing.T) {
 
 	require.NoError(t, <-done)
 	assert.Equal(t, int64(12345), fs.CachedUsage())
+}
+
+// Real os.File handles return *syscall.Stat_t from Stat, which must still be
+// treated as an inode the walk can account for.
+func TestFileInodeAcceptsOSFileStat(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+
+	f, err := fs.Touch("upload.bin", ufs.O_RDWR)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	inner := f.(*quotaFile).File
+	info, err := inner.Stat()
+	require.NoError(t, err)
+	_, isSyscall := info.Sys().(*syscall.Stat_t)
+	require.True(t, isSyscall, "os.File.Stat should yield *syscall.Stat_t")
+
+	ino, ok := fileInode(info)
+	require.True(t, ok)
+	require.NotZero(t, ino)
+}
+
+// An SFTP-style upload that finishes after its directory has already been
+// listed must still be included in the walk total, otherwise later writes
+// can exceed the disk limit.
+func TestWalkCountsUploadCreatedAfterDirectoryVisit(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+
+	require.NoError(t, rfs.CreateServerFile("a.bin", []byte("0123456789")))
+	fs.SetDiskLimit(100)
+	usage, err := fs.DiskUsage(false)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), usage)
+
+	var once sync.Once
+	fs.walkEntryHook = func() {
+		once.Do(func() {
+			f, err := fs.Touch("upload.bin", ufs.O_RDWR)
+			require.NoError(t, err)
+			_, err = f.Write(bytes.Repeat([]byte("x"), 80))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+		})
+	}
+
+	usage, err = fs.updateCachedDiskUsage()
+	require.NoError(t, err)
+	require.Equal(t, int64(90), usage)
+	require.Equal(t, int64(90), fs.CachedUsage())
+	require.Equal(t, int64(90), diskUsage(t, rfs))
+
+	err = fs.Write("extra.bin", bytes.NewReader(bytes.Repeat([]byte("y"), 20)), 20, 0o644)
+	require.Error(t, err)
+	assert.True(t, IsErrorCode(err, ErrCodeDiskSpace), "extra write should be rejected as over quota")
+	assert.Equal(t, int64(90), diskUsage(t, rfs))
+	assert.Equal(t, int64(90), fs.CachedUsage())
 }

@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"emperror.dev/errors"
@@ -271,13 +272,30 @@ func (fs *Filesystem) directorySize(root string, trackWrites bool) (int64, error
 		}
 
 		size.Add(info.Size())
+		if trackWrites && fs.walkEntryHook != nil {
+			fs.walkEntryHook()
+		}
 		return nil
 	})
 	return size.Load(), errors.WrapIf(err, "server/filesystem: directorysize: failed to walk directory")
 }
 
+// fileInode returns the inode for info from either a UnixFS walk result or a
+// real os.File handle. os.File.Stat returns *syscall.Stat_t, while Lstatat
+// returns *unix.Stat_t.
+func fileInode(info ufs.FileInfo) (uint64, bool) {
+	switch st := info.Sys().(type) {
+	case *unix.Stat_t:
+		return st.Ino, true
+	case *syscall.Stat_t:
+		return st.Ino, true
+	default:
+		return 0, false
+	}
+}
+
 // recordWalkFileSizeLocked adjusts the current walk when a managed write
-// changes a file that the walk has already counted. The caller must hold fs.mu.
+// changes a file. The caller must hold fs.mu.
 func (fs *Filesystem) recordWalkFileSizeLocked(file ufs.File) {
 	if !fs.walking || fs.walkObserved == nil {
 		return
@@ -286,17 +304,21 @@ func (fs *Filesystem) recordWalkFileSizeLocked(file ufs.File) {
 	if err != nil || !info.Mode().IsRegular() {
 		return
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
+	ino, ok := fileInode(info)
 	if !ok {
-		return
+		var st unix.Stat_t
+		if err := unix.Fstat(int(file.Fd()), &st); err != nil {
+			return
+		}
+		ino = st.Ino
 	}
-	previousSize, seen := fs.walkObserved[stat.Ino]
+	previousSize, seen := fs.walkObserved[ino]
 	if !seen {
-		fs.walkUnobserved[stat.Ino] = info.Size()
+		fs.walkUnobserved[ino] = info.Size()
 		return
 	}
 	fs.walkCompletedDelta += info.Size() - previousSize
-	fs.walkObserved[stat.Ino] = info.Size()
+	fs.walkObserved[ino] = info.Size()
 }
 
 type lockedFilesystemWriter struct {
