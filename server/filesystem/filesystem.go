@@ -30,15 +30,14 @@ type Filesystem struct {
 	mu sync.RWMutex
 	// reserved is the space reserved by writes that have not finished yet.
 	reserved int64
-	// activeKnownSizeWrites prevents scans from lowering usage while a known-size
-	// write may have truncated its destination before finishing.
-	activeKnownSizeWrites int64
 	// walking is set while the disk usage is being calculated, during which
 	// walkReserved is the space reserved by writes in progress at any point.
 	walking      bool
 	walkReserved int64
 	// walkCompleted counts managed usage changes that require another scan pass.
-	walkCompleted int64
+	walkCompleted      int64
+	walkCompletedDelta int64
+	walkObserved       map[uint64]int64
 
 	// lookupMu prevents the disk usage from being calculated more than once
 	// at the same time.
@@ -138,7 +137,13 @@ func (fs *Filesystem) openForWrite(p string, flag int, mode ufs.FileMode) (ufs.F
 		size = st.Size()
 	}
 	if flag&ufs.O_TRUNC != 0 {
-		if err := file.Truncate(0); err != nil {
+		fs.mu.Lock()
+		err := file.Truncate(0)
+		if err == nil {
+			fs.recordWalkFileSizeLocked(file)
+		}
+		fs.mu.Unlock()
+		if err != nil {
 			_ = file.Close()
 			return nil, 0, err
 		}
@@ -176,10 +181,12 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 
 	// Do not use CopyBuffer here, it is wasteful as the file implements
 	// io.ReaderFrom, which causes it to not use the buffer anyways.
-	n, err := io.Copy(file, r)
+	n, err := io.Copy(lockedFilesystemWriter{fs: fs, file: file}, r)
 
 	// Adjust the disk usage to account for the old size and the new size of the file.
-	fs.unixFS.Add(n - currentSize)
+	fs.mu.Lock()
+	fs.addDisk(n - currentSize)
+	fs.mu.Unlock()
 
 	if err := fs.chownFile(p); err != nil {
 		return fmt.Errorf("error chowning file: %w", err)
@@ -222,20 +229,18 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 		return err
 	}
 	reserved := max(newSize-currentSize, 0)
-	fs.mu.Lock()
-	fs.activeKnownSizeWrites++
-	fs.mu.Unlock()
 	// Release the reservation even if reading r panics, since the panic is
 	// recovered and the reservation would otherwise last until Agent restarts.
 	var used int64
-	defer func() {
-		fs.releaseDisk(reserved, used)
-		fs.mu.Lock()
-		fs.activeKnownSizeWrites--
-		fs.mu.Unlock()
-	}()
+	defer func() { fs.releaseDisk(reserved, used) }()
 
-	if err := file.Truncate(0); err != nil {
+	fs.mu.Lock()
+	err = file.Truncate(0)
+	if err == nil {
+		fs.recordWalkFileSizeLocked(file)
+	}
+	fs.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	// The file is now empty.
@@ -245,7 +250,7 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 	if newSize > 0 {
 		// Do not use CopyBuffer here, it is wasteful as the file implements
 		// io.ReaderFrom, which causes it to not use the buffer anyways.
-		n, err = io.Copy(file, io.LimitReader(r, newSize))
+		n, err = io.Copy(lockedFilesystemWriter{fs: fs, file: file}, io.LimitReader(r, newSize))
 	}
 
 	// Adjust the disk usage to account for the old size and the new size of the file.
@@ -512,7 +517,7 @@ func (fs *Filesystem) Copy(p string) error {
 
 	// Do not use CopyBuffer here, it is wasteful as the file implements
 	// io.ReaderFrom, which causes it to not use the buffer anyways.
-	n, err := io.Copy(dst, io.LimitReader(source, currentSize))
+	n, err := io.Copy(lockedFilesystemWriter{fs: fs, file: dst}, io.LimitReader(source, currentSize))
 	used = n
 
 	if !fs.isTest {

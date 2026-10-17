@@ -138,6 +138,9 @@ func (w streamWriter) Write(p []byte) (int, error) {
 		return 0, newFilesystemError(ErrCodeDiskSpace, nil)
 	}
 	n, err := w.file.Write(p)
+	if n > 0 {
+		w.fs.recordWalkFileSizeLocked(w.file)
+	}
 	w.fs.addDisk(int64(n))
 	return n, err
 }

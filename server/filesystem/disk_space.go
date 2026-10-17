@@ -166,6 +166,8 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.walking = true
 	fs.walkReserved = fs.reserved
 	fs.walkCompleted = 0
+	fs.walkCompletedDelta = 0
+	fs.walkObserved = make(map[uint64]int64)
 	fs.mu.Unlock()
 
 	// If managed writes change disk usage during a scan, repeat it so those
@@ -173,9 +175,13 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	const maxWalkPasses = 2
 	var size int64
 	var err error
-	changedDuringFinalPass := false
 	for pass := 0; ; pass++ {
-		size, err = fs.DirectorySize("/")
+		fs.mu.Lock()
+		fs.walkCompletedDelta = 0
+		fs.walkObserved = make(map[uint64]int64)
+		fs.mu.Unlock()
+
+		size, err = fs.directorySize("/", true)
 		fs.mu.Lock()
 		if err == nil && fs.walkCompleted > 0 {
 			fs.walkCompleted = 0
@@ -183,7 +189,6 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 				fs.mu.Unlock()
 				continue
 			}
-			changedDuringFinalPass = true
 		}
 		break
 	}
@@ -193,18 +198,20 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 	fs.lastLookupTime.Set(time.Now())
 
 	// Include writes still in progress. A successful walk can still lower stale
-	// cached usage when files were removed outside this process. Keep the current
-	// cache as a floor when a write is active or the final pass changed during
-	// the scan, since either case can make the walk miss managed usage changes.
-	// Failed partial walks also retain the existing cache as a floor.
-	usage := size + fs.walkReserved
-	if err != nil || changedDuringFinalPass || fs.activeKnownSizeWrites > 0 {
+	// cached usage when files were removed outside this process. Changes to files
+	// already seen by the final pass are added through walkCompletedDelta. A
+	// failed partial walk retains the cache as a floor because its total is
+	// incomplete.
+	usage := size + fs.walkReserved + fs.walkCompletedDelta
+	if err != nil {
 		usage = max(usage, fs.unixFS.Usage())
 	}
 	fs.unixFS.SetUsage(usage)
 	fs.walking = false
 	fs.walkReserved = 0
 	fs.walkCompleted = 0
+	fs.walkCompletedDelta = 0
+	fs.walkObserved = nil
 	fs.mu.Unlock()
 
 	return usage, err
@@ -212,6 +219,10 @@ func (fs *Filesystem) walkDiskUsage() (int64, error) {
 
 // DirectorySize calculates the size of a directory and its descendants.
 func (fs *Filesystem) DirectorySize(root string) (int64, error) {
+	return fs.directorySize(root, false)
+}
+
+func (fs *Filesystem) directorySize(root string, trackWrites bool) (int64, error) {
 	dirfd, name, closeFd, err := fs.unixFS.SafePath(root)
 	defer closeFd()
 	if err != nil {
@@ -235,11 +246,20 @@ func (fs *Filesystem) DirectorySize(root string) (int64, error) {
 			return nil
 		}
 
+		if trackWrites {
+			fs.mu.Lock()
+		}
 		info, err := fs.unixFS.Lstatat(dirfd, name)
 		if errors.Is(err, ufs.ErrNotExist) {
+			if trackWrites {
+				fs.mu.Unlock()
+			}
 			return nil
 		}
 		if err != nil {
+			if trackWrites {
+				fs.mu.Unlock()
+			}
 			return errors.Wrap(err, "lstatat err")
 		}
 
@@ -248,16 +268,62 @@ func (fs *Filesystem) DirectorySize(root string) (int64, error) {
 			// Hard links have the same inode number
 			if slices.Contains(hardLinks, sysFileInfo.Ino) {
 				// Don't add hard links size twice
+				if trackWrites {
+					fs.mu.Unlock()
+				}
 				return nil
 			} else {
 				hardLinks = append(hardLinks, sysFileInfo.Ino)
 			}
+		}
+		if trackWrites && fs.walking && fs.walkObserved != nil {
+			fs.walkObserved[sysFileInfo.Ino] = info.Size()
+		}
+		if trackWrites {
+			fs.mu.Unlock()
 		}
 
 		size.Add(info.Size())
 		return nil
 	})
 	return size.Load(), errors.WrapIf(err, "server/filesystem: directorysize: failed to walk directory")
+}
+
+// recordWalkFileSizeLocked adjusts the current walk when a managed write
+// changes a file that the walk has already counted. The caller must hold fs.mu.
+func (fs *Filesystem) recordWalkFileSizeLocked(file ufs.File) {
+	if !fs.walking || fs.walkObserved == nil {
+		return
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return
+	}
+	stat, ok := info.Sys().(*unix.Stat_t)
+	if !ok {
+		return
+	}
+	previousSize, seen := fs.walkObserved[stat.Ino]
+	if !seen {
+		return
+	}
+	fs.walkCompletedDelta += info.Size() - previousSize
+	fs.walkObserved[stat.Ino] = info.Size()
+}
+
+type lockedFilesystemWriter struct {
+	fs   *Filesystem
+	file ufs.File
+}
+
+func (w lockedFilesystemWriter) Write(p []byte) (int, error) {
+	w.fs.mu.Lock()
+	defer w.fs.mu.Unlock()
+	n, err := w.file.Write(p)
+	if n > 0 {
+		w.fs.recordWalkFileSizeLocked(w.file)
+	}
+	return n, err
 }
 
 func (fs *Filesystem) HasSpaceFor(size int64) error {
@@ -300,7 +366,14 @@ func (fs *Filesystem) releaseDisk(reserved int64, used int64) {
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.releaseDiskLocked(reserved, used)
+}
 
+// releaseDiskLocked is releaseDisk with fs.mu already held.
+func (fs *Filesystem) releaseDiskLocked(reserved int64, used int64) {
+	if reserved < 0 {
+		reserved = 0
+	}
 	fs.reserved -= reserved
 	if fs.walking {
 		fs.walkReserved = max(fs.walkReserved-reserved, 0)

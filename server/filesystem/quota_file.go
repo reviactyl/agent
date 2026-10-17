@@ -75,6 +75,8 @@ func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)
 		}
 	}
 
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 	n, err := write()
 	writtenEnd := previousSize
 	if n > 0 {
@@ -82,6 +84,7 @@ func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)
 		if writtenEnd > previousSize {
 			f.size = writtenEnd
 		}
+		f.fs.recordWalkFileSizeLocked(f.File)
 	}
 
 	if reserved > 0 {
@@ -89,9 +92,8 @@ func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)
 		if writtenEnd > previousSize {
 			actual = writtenEnd - previousSize
 		}
-		f.fs.releaseDisk(reserved, actual)
+		f.fs.releaseDiskLocked(reserved, actual)
 	}
-
 	return n, err
 }
 
