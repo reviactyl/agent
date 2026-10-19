@@ -1,5 +1,5 @@
 package system
 
-var Version = "develop"
+var Version = "26.10.01"
 
 var InstallationType = "native"
