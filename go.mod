@@ -34,8 +34,8 @@ require (
 	github.com/iancoleman/strcase v0.3.0
 	github.com/icza/dyno v0.0.0-20230330125955-09f820a8d9c0
 	github.com/juju/ratelimit v1.0.2
-	github.com/klauspost/compress v1.20.1
-	github.com/klauspost/pgzip v1.2.7
+	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/pgzip v1.3.0
 	github.com/magiconair/properties v1.18.12
 	github.com/mattn/go-colorable v0.1.16
 	github.com/mholt/archives v0.1.5
