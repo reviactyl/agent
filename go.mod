@@ -15,7 +15,7 @@ require (
 	github.com/beevik/etree v1.8.1
 	github.com/buger/jsonparser v1.6.1
 	github.com/cenkalti/backoff/v4 v4.3.0
-	github.com/containerd/errdefs v0.3.0
+	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/creasty/defaults v1.11.0
 	github.com/distribution/reference v0.6.0
