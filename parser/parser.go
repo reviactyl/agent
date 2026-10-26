@@ -626,7 +626,8 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		//
 		// See the docblock for this function for more details, do not change this
 		// or you'll cause a flood of new issue reports no one wants to deal with.
-		s.WriteString(key + "=" + strings.Trim(strconv.QuoteToASCII(value), "\"") + "\n")
+		quoted := strconv.QuoteToASCII(value)
+		s.WriteString(key + "=" + quoted[1:len(quoted)-1] + "\n")
 	}
 
 	return rewrite(file, s.Bytes())
