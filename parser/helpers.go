@@ -41,10 +41,16 @@ func (cfr *ConfigurationFileReplacement) getKeyValue(value string) interface{} {
 		return v
 	}
 
-	// Try to parse into an int, if this fails just ignore the error and continue
-	// through, returning the string.
-	if v, err := strconv.Atoi(value); err == nil {
-		return v
+	if cfr.ReplaceWith.Type() == jsonparser.Number {
+		if v, err := strconv.Atoi(value); err == nil {
+			return v
+		}
+		if v, err := strconv.ParseUint(value, 10, 64); err == nil {
+			return v
+		}
+		if v, err := strconv.ParseFloat(value, 64); err == nil {
+			return v
+		}
 	}
 
 	return value

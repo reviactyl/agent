@@ -34,7 +34,7 @@ func TestSetAtPathway(t *testing.T) {
 			replacement: `{"match":"server.port","replace_with":"25566"}`,
 			value:       "25566",
 			path:        "server.port",
-			want:        "25566",
+			want:        `"25566"`,
 		},
 		{
 			name:        "if_value matches the key's value",
@@ -58,7 +58,7 @@ func TestSetAtPathway(t *testing.T) {
 			replacement: `{"match":"server.port","if_value":25565,"replace_with":"30000"}`,
 			value:       "30000",
 			path:        "server.port",
-			want:        "30000",
+			want:        `"30000"`,
 		},
 		{
 			name:        "regex if_value rewrites an existing value",
