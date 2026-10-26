@@ -7,6 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/apex/log"
 	pkgsftp "github.com/pkg/sftp"
@@ -223,18 +226,24 @@ func TestHandlerRejectsMalformedSetstatAttributes(t *testing.T) {
 		permissions: []string{PermissionFileUpdate},
 		logger:      log.WithField("test", t.Name()),
 	}
-	request := pkgsftp.NewRequest("Setstat", "/")
-	request.Flags = 1 // SSH_FILEXFER_ATTR_SIZE
-
-	if err := h.Filecmd(request); !errors.Is(err, pkgsftp.ErrSSHFxBadMessage) {
-		t.Fatalf("expected bad message, got %v", err)
-	}
-
-	request.Flags = sftpAttributeExtended
-	request.Attrs = make([]byte, 4)
-	binary.BigEndian.PutUint32(request.Attrs, ^uint32(0))
-	if err := h.Filecmd(request); !errors.Is(err, pkgsftp.ErrSSHFxBadMessage) {
-		t.Fatalf("expected extended attributes to be rejected, got %v", err)
+	for _, tt := range []struct {
+		name  string
+		flags uint32
+		attrs []byte
+	}{
+		{name: "missing size", flags: 1},
+		{name: "missing times", flags: 8},
+		{name: "truncated times", flags: 8, attrs: make([]byte, 4)},
+		{name: "mode with missing times", flags: 4 | 8, attrs: []byte{0, 0, 1, 128}},
+		{name: "extended attributes", flags: sftpAttributeExtended, attrs: []byte{255, 255, 255, 255}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request := pkgsftp.NewRequest("Setstat", "/")
+			request.Flags, request.Attrs = tt.flags, tt.attrs
+			if err := h.Filecmd(request); !errors.Is(err, pkgsftp.ErrSSHFxBadMessage) {
+				t.Fatalf("expected bad message, got %v", err)
+			}
+		})
 	}
 }
 
@@ -256,12 +265,83 @@ func TestSetstatMode(t *testing.T) {
 			request.Attrs = make([]byte, 4)
 			binary.BigEndian.PutUint32(request.Attrs, tt.mode)
 
-			mode, err := setstatMode(request)
+			mode := setstatMode(request.Attributes())
+			if uint32(mode) != tt.expected {
+				t.Fatalf("expected mode %04o, got %04o", tt.expected, mode)
+			}
+		})
+	}
+}
+
+func TestHandlerSetstatUpdatesOnlyRequestedAttributes(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		flags       uint32
+		initialMode os.FileMode
+		wantMode    os.FileMode
+	}{
+		{name: "timestamp only executable", flags: 8, initialMode: 0o751, wantMode: 0o751},
+		{name: "timestamp only special permissions", flags: 8, initialMode: 0o751 | os.ModeSetuid | os.ModeSetgid | os.ModeSticky, wantMode: 0o751 | os.ModeSetuid | os.ModeSetgid | os.ModeSticky},
+		{name: "mode and timestamp", flags: 4 | 8, initialMode: 0o751, wantMode: 0o640},
+		{name: "mode only", flags: 4, initialMode: 0o751, wantMode: 0o640},
+		{name: "no attributes", initialMode: 0o751, wantMode: 0o751},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "run.sh")
+			if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, tt.initialMode); err != nil {
+				t.Fatal(err)
+			}
+			oldTime := time.Unix(1600000000, 0)
+			if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+				t.Fatal(err)
+			}
+			fs, err := filesystem.New(root, 0, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if uint32(mode) != tt.expected {
-				t.Fatalf("expected mode %04o, got %04o", tt.expected, mode)
+			t.Cleanup(func() { _ = fs.UnixFS().Close() })
+			srv, err := server.New(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := Handler{server: srv, fs: fs, permissions: []string{PermissionFileUpdate}, logger: log.WithField("test", t.Name())}
+			request := pkgsftp.NewRequest("Setstat", "/run.sh")
+			request.Flags = tt.flags
+			if tt.flags&4 != 0 {
+				request.Attrs = binary.BigEndian.AppendUint32(request.Attrs, 0o640)
+			}
+			if tt.flags&8 != 0 {
+				request.Attrs = binary.BigEndian.AppendUint32(request.Attrs, 1700000000)
+				request.Attrs = binary.BigEndian.AppendUint32(request.Attrs, 1700000100)
+			}
+			if err := h.Filecmd(request); err != nil && !errors.Is(err, pkgsftp.ErrSSHFxOk) {
+				t.Fatal(err)
+			}
+			st, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Mode() != tt.wantMode {
+				t.Errorf("mode = %v, want %v", st.Mode(), tt.wantMode)
+			}
+			var stat unix.Stat_t
+			if err := unix.Stat(path, &stat); err != nil {
+				t.Fatal(err)
+			}
+			wantAtime, wantMtime := oldTime.Unix(), oldTime.Unix()
+			if tt.flags&8 != 0 {
+				wantAtime, wantMtime = 1700000000, 1700000100
+			}
+			if stat.Atim.Sec != wantAtime || stat.Mtim.Sec != wantMtime {
+				t.Errorf("atime/mtime = %d/%d, want %d/%d", stat.Atim.Sec, stat.Mtim.Sec, wantAtime, wantMtime)
+			}
+			request.Filepath = "/missing.sh"
+			if err := h.Filecmd(request); !errors.Is(err, pkgsftp.ErrSSHFxNoSuchFile) {
+				t.Fatalf("missing file: expected no such file, got %v", err)
 			}
 		})
 	}

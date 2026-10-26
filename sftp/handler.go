@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -218,17 +219,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	return quotaWriterAt{WriterAt: f, server: h.server, slot: slot}, nil
 }
 
-func setstatMode(request *sftp.Request) (os.FileMode, error) {
-	// pkg/sftp allocates the client-provided extended attribute count before
-	// validating the remaining packet length. Reject it before parsing to avoid
-	// allowing a small packet to request an effectively unbounded allocation.
-	if request.Flags&sftpAttributeExtended != 0 {
-		return 0, sftp.ErrSSHFxBadMessage
-	}
-	attrs := request.Attributes()
-	if attrs == nil {
-		return 0, sftp.ErrSSHFxBadMessage
-	}
+func setstatMode(attrs *sftp.FileStat) os.FileMode {
 	mode := attrs.FileMode().Perm()
 	// If the client passes an invalid FileMode just use the default 0644.
 	if mode == 0o000 {
@@ -238,7 +229,7 @@ func setstatMode(request *sftp.Request) (os.FileMode, error) {
 	if attrs.FileMode().IsDir() {
 		mode = 0o755
 	}
-	return mode, nil
+	return mode
 }
 
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
@@ -259,17 +250,34 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		mode, err := setstatMode(request)
-		if err != nil {
-			return err
+		// Reject extended attributes before pkg/sftp can allocate their client-provided count.
+		if request.Flags&sftpAttributeExtended != 0 {
+			return sftp.ErrSSHFxBadMessage
 		}
-		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
+		attrs := request.Attributes()
+		if attrs == nil {
+			return sftp.ErrSSHFxBadMessage
+		}
+		flags := request.AttrFlags()
+		var err error
+		if !flags.Permissions && !flags.Acmodtime {
+			_, err = h.fs.UnixFS().Stat(request.Filepath)
+		}
+		if flags.Permissions {
+			err = h.fs.Chmod(request.Filepath, setstatMode(attrs))
+		}
+		if err == nil && flags.Acmodtime {
+			err = h.fs.Chtimes(request.Filepath, time.Unix(int64(attrs.Atime), 0), time.Unix(int64(attrs.Mtime), 0))
+		}
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return sftp.ErrSSHFxNoSuchFile
 			}
 			l.WithField("error", err).Error("failed to perform setstat on item")
 			return sftp.ErrSSHFxFailure
 		}
+		return sftp.ErrSSHFxOk
+
 	// Support renaming a file (aka Move).
 	case "Rename":
 		if !h.can(PermissionFileUpdate) {
