@@ -25,7 +25,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{RootDirectory: root}})
+	config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{RootDirectory: root, DiskCheckInterval: 60}})
 	if err := database.Initialize(); err != nil {
 		_ = os.RemoveAll(root)
 		panic(err)
@@ -82,6 +82,95 @@ func TestHandlerFilewriteTruncatesOnlyWhenRequested(t *testing.T) {
 			}
 			if string(got) != tt.want {
 				t.Fatalf("contents = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandlerFilewriteReplacementQuota(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		limit       int64
+		exists      bool
+		flags       uint32
+		data        string
+		offset      int64
+		want        string
+		openDenied  bool
+		writeDenied bool
+	}{
+		{name: "over quota smaller", limit: 8, exists: true, flags: 2 | 16, data: "abc", want: "abc"},
+		{name: "over quota still over after shrinking", limit: 2, exists: true, flags: 2 | 16, data: "abc", want: "abc"},
+		{name: "over quota larger", limit: 8, exists: true, flags: 2 | 16, data: "abcdefghijkl", want: "", writeDenied: true},
+		{name: "over quota new file", limit: 8, flags: 2 | 8 | 16, data: "abc", openDenied: true},
+		{name: "over quota overwrite", limit: 8, exists: true, flags: 2, data: "abc", want: "abcDEF"},
+		{name: "over quota resume grows", limit: 8, exists: true, flags: 2, data: "abc", offset: 6, want: "ABCDEF", writeDenied: true},
+		{name: "under quota smaller", limit: 30, exists: true, flags: 2 | 16, data: "abc", want: "abc"},
+		{name: "under quota larger", limit: 30, exists: true, flags: 2 | 16, data: "abcdefghijkl", want: "abcdefghijkl"},
+		{name: "under quota new file", limit: 30, flags: 2 | 8 | 16, data: "abc", want: "abc"},
+		{name: "writes disabled", limit: -1, exists: true, flags: 2 | 16, data: "abc", openDenied: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "other.txt"), []byte("1234567890"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "upload.txt")
+			if tt.exists {
+				if err := os.WriteFile(path, []byte("ABCDEF"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fs, err := filesystem.New(root, tt.limit, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = fs.UnixFS().Close() })
+			srv, err := server.New(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := Handler{server: srv, fs: fs, events: &eventHandler{}, permissions: []string{"*"}, logger: log.WithField("test", tt.name)}
+			request := pkgsftp.NewRequest("Put", "/upload.txt")
+			request.Flags = tt.flags
+			writer, err := h.Filewrite(request)
+			if tt.openDenied {
+				if !errors.Is(err, ErrSSHQuotaExceeded) {
+					t.Fatalf("open error = %v, want quota exceeded", err)
+				}
+				if tt.exists {
+					got, err := os.ReadFile(path)
+					if err != nil || string(got) != "ABCDEF" {
+						t.Fatalf("denied open changed file: %q, %v", got, err)
+					}
+				} else if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("denied open created file: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, writeErr := writer.WriteAt([]byte(tt.data), tt.offset)
+			if err := writer.(io.Closer).Close(); err != nil {
+				t.Fatal(err)
+			}
+			if tt.writeDenied {
+				if n != 0 || !errors.Is(writeErr, ErrSSHQuotaExceeded) {
+					t.Fatalf("write = %d, %v, want quota exceeded", n, writeErr)
+				}
+			} else if n != len(tt.data) || writeErr != nil {
+				t.Fatalf("write = %d, %v", n, writeErr)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("contents = %q, want %q", got, tt.want)
+			}
+			if usage := fs.CachedUsage(); usage != 10+int64(len(tt.want)) {
+				t.Fatalf("cached usage = %d, want %d", usage, 10+len(tt.want))
 			}
 		})
 	}
