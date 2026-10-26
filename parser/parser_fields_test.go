@@ -119,3 +119,35 @@ func TestConfigurationFilePreservesReplacementScalarTypes(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigurationFileRejectsOutOfRangeIntegersWithoutRewriting(t *testing.T) {
+	for _, format := range []ConfigurationParser{Json, Yaml} {
+		for _, raw := range []string{"18446744073709551617", "-9223372036854775809"} {
+			for _, condition := range []string{"", "original"} {
+				t.Run(string(format)+"/"+raw+"/if_value="+condition, func(t *testing.T) {
+					path := filepath.Join(t.TempDir(), "config")
+					content := `{"value":"original"}`
+					if format == Yaml {
+						content = "value: original\n"
+					}
+					require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+					file, err := os.OpenFile(path, os.O_RDWR, 0)
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, file.Close()) })
+					cf := ConfigurationFile{Replace: []ConfigurationFileReplacement{
+						replacement(t, `{"match":"value","if_value":"`+condition+`","replace_with":`+raw+`}`),
+					}}
+					if format == Json {
+						err = cf.parseJsonFile(file)
+					} else {
+						err = cf.parseYamlFile(file)
+					}
+					require.ErrorContains(t, err, "integer replacement exceeds supported range")
+					output, err := os.ReadFile(path)
+					require.NoError(t, err)
+					require.Equal(t, content, string(output))
+				})
+			}
+		}
+	}
+}

@@ -35,25 +35,30 @@ var configMatchRegex = regexp.MustCompile(`{{\s?config\.([\w.-]+)\s?}}`)
 var xmlValueMatchRegex = regexp.MustCompile(`^\[([\w]+)='(.*)'\]$`)
 
 // Gets the value of a key based on the value type defined.
-func (cfr *ConfigurationFileReplacement) getKeyValue(value string) interface{} {
+func (cfr *ConfigurationFileReplacement) getKeyValue(value string) (interface{}, error) {
 	if cfr.ReplaceWith.Type() == jsonparser.Boolean {
 		v, _ := strconv.ParseBool(value)
-		return v
+		return v, nil
 	}
 
 	if cfr.ReplaceWith.Type() == jsonparser.Number {
 		if v, err := strconv.Atoi(value); err == nil {
-			return v
+			return v, nil
 		}
 		if v, err := strconv.ParseUint(value, 10, 64); err == nil {
-			return v
+			return v, nil
 		}
-		if v, err := strconv.ParseFloat(value, 64); err == nil {
-			return v
+		if !strings.ContainsAny(value, ".eE") {
+			return nil, errors.New("parser: integer replacement exceeds supported range")
 		}
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil, errors.Wrap(err, "parser: invalid numeric replacement")
+		}
+		return v, nil
 	}
 
-	return value
+	return value, nil
 }
 
 // Iterate over an unstructured JSON/YAML/etc. interface and set all of the required
@@ -186,10 +191,6 @@ func setValueAtPath(c *gabs.Container, path string, value interface{}) error {
 // Sets the value at a specific pathway, but checks if we were looking for a specific
 // value or not before doing it.
 func (cfr *ConfigurationFileReplacement) SetAtPathway(c *gabs.Container, path string, value string) error {
-	if cfr.IfValue == "" {
-		return setValueAtPath(c, path, cfr.getKeyValue(value))
-	}
-
 	// Check if we are replacing instead of overwriting.
 	if strings.HasPrefix(cfr.IfValue, "regex:") {
 		// Doing a regex replacement requires an existing value.
@@ -211,11 +212,15 @@ func (cfr *ConfigurationFileReplacement) SetAtPathway(c *gabs.Container, path st
 		return nil
 	}
 
-	if c.ExistsP(path) && valueAtPath(c, path) != cfr.IfValue {
+	if cfr.IfValue != "" && c.ExistsP(path) && valueAtPath(c, path) != cfr.IfValue {
 		return nil
 	}
 
-	return setValueAtPath(c, path, cfr.getKeyValue(value))
+	v, err := cfr.getKeyValue(value)
+	if err != nil {
+		return err
+	}
+	return setValueAtPath(c, path, v)
 }
 
 // Returns the value at the path as plain text: strings without their JSON quotes, and
