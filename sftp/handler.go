@@ -169,11 +169,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		return nil, sftp.ErrSSHFxOpUnsupported
 	}
 	l := h.logger.WithField("source", request.Filepath)
-	// If the user doesn't have enough space left on the server it should respond with an
-	// error since we won't be letting them write this file to the disk.
-	if !h.fs.HasSpaceAvailable(false) {
-		return nil, ErrSSHQuotaExceeded
-	}
+	hasSpace := h.fs.HasSpaceAvailable(false)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -193,6 +189,10 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	// permission checking after the fact.
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
+	}
+	// Existing files retain their original size as credit in the quota writer.
+	if !hasSpace && (permission == PermissionFileCreate || h.fs.MaxDisk() == -1) {
+		return nil, ErrSSHQuotaExceeded
 	}
 	slot := h.openFile()
 	if slot == nil {
