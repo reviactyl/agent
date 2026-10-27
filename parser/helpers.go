@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -225,7 +226,7 @@ func (cfr *ConfigurationFileReplacement) SetAtPathway(c *gabs.Container, path st
 		return nil
 	}
 
-	if cfr.IfValue != "" && c.ExistsP(path) && valueAtPath(c, path) != cfr.IfValue {
+	if cfr.IfValue != "" && c.ExistsP(path) && !matchesConfigurationValue(c, path, cfr.IfValue) {
 		return nil
 	}
 
@@ -234,6 +235,19 @@ func (cfr *ConfigurationFileReplacement) SetAtPathway(c *gabs.Container, path st
 		return err
 	}
 	return setValueAtPath(c, path, v)
+}
+
+func matchesConfigurationValue(c *gabs.Container, path, expected string) bool {
+	if valueAtPath(c, path) == expected {
+		return true
+	}
+	number, ok := c.Path(path).Data().(json.Number)
+	if !ok || !json.Valid([]byte(expected)) {
+		return false
+	}
+	actualValue, actualOK := new(big.Rat).SetString(number.String())
+	expectedValue, expectedOK := new(big.Rat).SetString(expected)
+	return actualOK && expectedOK && actualValue.Cmp(expectedValue) == 0
 }
 
 // Returns the value at the path as plain text: strings without their JSON quotes, and
