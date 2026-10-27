@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"emperror.dev/errors"
+	"github.com/Jeffail/gabs/v2"
 	"github.com/apex/log"
 	"github.com/beevik/etree"
 	"github.com/buger/jsonparser"
@@ -454,8 +455,7 @@ func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 }
 
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
-// value is set regardless in the file. See the commentary in parseYamlFile for more details
-// about what is happening during this process.
+// value is set regardless in the file.
 func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
@@ -483,22 +483,16 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 		return err
 	}
 
-	// Unmarshal the yaml data into a JSON interface such that we can work with
-	// any arbitrary data structure. If we don't do this, I can't use gabs which
-	// makes working with unknown JSON significantly easier.
-	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
+	var root interface{}
+	if i != nil {
+		root = dyno.ConvertMapI2MapS(i)
+	}
+	data, err := f.replaceConfigurationValues(gabs.Wrap(root))
 	if err != nil {
 		return err
 	}
 
-	// Now that the data is converted, treat it just like JSON and pass it to the
-	// iterator function to update values as necessary.
-	data, err := f.IterateOverJson(jsonBytes)
-	if err != nil {
-		return err
-	}
-
-	// Remarshal the JSON into YAML format before saving it back to the disk.
+	// Marshal the updated data into YAML before saving it back to disk.
 	marshaled, err := yaml.Marshal(data.Data())
 	if err != nil {
 		return err

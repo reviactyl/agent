@@ -1,6 +1,9 @@
 package parser
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -73,11 +76,21 @@ func (cfr *ConfigurationFileReplacement) getKeyValue(value string) (interface{},
 // will work, however foo.*.bar.*.baz will not, since we'll only be splitting at the
 // first wildcard, and not subsequent ones.
 func (f *ConfigurationFile) IterateOverJson(data []byte) (*gabs.Container, error) {
-	parsed, err := gabs.ParseJSON(data)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	parsed, err := gabs.ParseJSONDecoder(decoder)
 	if err != nil {
 		return nil, err
 	}
 
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("parser: unexpected data after JSON document")
+	}
+	return f.replaceConfigurationValues(parsed)
+}
+
+func (f *ConfigurationFile) replaceConfigurationValues(parsed *gabs.Container) (*gabs.Container, error) {
 	for _, v := range f.Replace {
 		value, err := f.LookupConfigurationValue(v)
 		if err != nil {

@@ -151,3 +151,69 @@ func TestConfigurationFileRejectsOutOfRangeIntegersWithoutRewriting(t *testing.T
 		}
 	}
 }
+
+func TestConfigurationFilePreservesUnrelatedLargeIDs(t *testing.T) {
+	for _, format := range []ConfigurationParser{Json, Yaml} {
+		for _, id := range []string{"9007199254740993", "9223372036854775809", "18446744073709551615"} {
+			t.Run(string(format)+"/"+id, func(t *testing.T) {
+				content := `{"id":` + id + `,"nested":{"id":` + id + `},"ids":[` + id + `],"value":"original"}`
+				if format == Yaml {
+					content = "id: " + id + "\nnested:\n  id: " + id + "\nids: [" + id + "]\nvalue: original\n"
+				}
+				path := filepath.Join(t.TempDir(), "config")
+				require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+				file, err := os.OpenFile(path, os.O_RDWR, 0)
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, file.Close()) })
+				cf := ConfigurationFile{Replace: []ConfigurationFileReplacement{
+					replacement(t, `{"match":"value","replace_with":"updated"}`),
+				}}
+				if format == Json {
+					err = cf.parseJsonFile(file)
+				} else {
+					err = cf.parseYamlFile(file)
+				}
+				require.NoError(t, err)
+				output, err := os.ReadFile(path)
+				require.NoError(t, err)
+				var document yaml.Node
+				require.NoError(t, yaml.Unmarshal(output, &document))
+				root := document.Content[0]
+				values := make(map[string]*yaml.Node)
+				for i := 0; i < len(root.Content); i += 2 {
+					values[root.Content[i].Value] = root.Content[i+1]
+				}
+				for _, node := range []*yaml.Node{values["id"], values["nested"].Content[1], values["ids"].Content[0]} {
+					require.Equal(t, "!!int", node.Tag, "written config: %s", output)
+					require.Equal(t, id, node.Value, "written config: %s", output)
+				}
+				require.Equal(t, "updated", values["value"].Value)
+			})
+		}
+	}
+}
+
+func TestJSONRewriteRejectsTrailingContent(t *testing.T) {
+	for _, content := range []string{`{"id":9007199254740993} {}`, `{"id":9007199254740993} garbage`} {
+		cf := ConfigurationFile{}
+		_, err := cf.IterateOverJson([]byte(content))
+		require.Error(t, err)
+	}
+}
+
+func TestYAMLRewriteNullRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("null\n"), 0o600))
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+	cf := ConfigurationFile{Replace: []ConfigurationFileReplacement{
+		replacement(t, `{"match":"value","replace_with":"updated"}`),
+	}}
+	require.NoError(t, cf.parseYamlFile(file))
+	output, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var got map[string]string
+	require.NoError(t, yaml.Unmarshal(output, &got))
+	require.Equal(t, "updated", got["value"])
+}
