@@ -14,7 +14,6 @@ import (
 	"github.com/buger/jsonparser"
 	"github.com/icza/dyno"
 	"github.com/magiconair/properties"
-	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v3"
 
 	"github.com/reviactyl/agent/config"
@@ -382,8 +381,7 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 
 // Parses an ini file.
 func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
-	// Wrap the file in a NopCloser so the ini package doesn't close the file.
-	cfg, err := ini.Load(io.NopCloser(io.LimitReader(file, maxConfigFileSize)))
+	cfg, err := loadINIDocument(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
@@ -419,38 +417,19 @@ func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 		}
 
 		k := path[0]
-		s := cfg.Section("")
+		section := ""
 		// Passing a key of foo.bar will look for "bar" in the "[foo]" section of the file.
 		if len(path) == 2 {
 			k = path[1]
-			s = cfg.Section(path[0])
+			section = path[0]
 		}
 
-		// If no section was found, create that new section now and then set the
-		// section value we're using to be the new one.
-		if s == nil {
-			s, err = cfg.NewSection(path[0])
-			if err != nil {
-				return err
-			}
-		}
-
-		// If the key exists in the file go ahead and set the value, otherwise try to
-		// create it in the section.
-		if s.HasKey(k) {
-			s.Key(k).SetValue(value)
-		} else {
-			if _, err := s.NewKey(k, value); err != nil {
-				return err
-			}
+		if err := cfg.set(section, k, value); err != nil {
+			return err
 		}
 	}
 
-	var buf bytes.Buffer
-	if _, err := cfg.WriteTo(&buf); err != nil {
-		return err
-	}
-	return rewrite(file, buf.Bytes())
+	return rewrite(file, cfg.bytes())
 }
 
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
