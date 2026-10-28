@@ -1,6 +1,10 @@
 package parser
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -73,11 +77,21 @@ func (cfr *ConfigurationFileReplacement) getKeyValue(value string) (interface{},
 // will work, however foo.*.bar.*.baz will not, since we'll only be splitting at the
 // first wildcard, and not subsequent ones.
 func (f *ConfigurationFile) IterateOverJson(data []byte) (*gabs.Container, error) {
-	parsed, err := gabs.ParseJSON(data)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	parsed, err := gabs.ParseJSONDecoder(decoder)
 	if err != nil {
 		return nil, err
 	}
 
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("parser: unexpected data after JSON document")
+	}
+	return f.replaceConfigurationValues(parsed)
+}
+
+func (f *ConfigurationFile) replaceConfigurationValues(parsed *gabs.Container) (*gabs.Container, error) {
 	for _, v := range f.Replace {
 		value, err := f.LookupConfigurationValue(v)
 		if err != nil {
@@ -212,7 +226,7 @@ func (cfr *ConfigurationFileReplacement) SetAtPathway(c *gabs.Container, path st
 		return nil
 	}
 
-	if cfr.IfValue != "" && c.ExistsP(path) && valueAtPath(c, path) != cfr.IfValue {
+	if cfr.IfValue != "" && c.ExistsP(path) && !matchesConfigurationValue(c, path, cfr.IfValue) {
 		return nil
 	}
 
@@ -221,6 +235,19 @@ func (cfr *ConfigurationFileReplacement) SetAtPathway(c *gabs.Container, path st
 		return err
 	}
 	return setValueAtPath(c, path, v)
+}
+
+func matchesConfigurationValue(c *gabs.Container, path, expected string) bool {
+	if valueAtPath(c, path) == expected {
+		return true
+	}
+	number, ok := c.Path(path).Data().(json.Number)
+	if !ok || !json.Valid([]byte(expected)) {
+		return false
+	}
+	actualValue, actualOK := new(big.Rat).SetString(number.String())
+	expectedValue, expectedOK := new(big.Rat).SetString(expected)
+	return actualOK && expectedOK && actualValue.Cmp(expectedValue) == 0
 }
 
 // Returns the value at the path as plain text: strings without their JSON quotes, and

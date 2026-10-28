@@ -132,3 +132,30 @@ func TestConfigurationFileKeepsReplacementsWithNumericMatch(t *testing.T) {
 		t.Fatalf("expected both replacements to survive decoding, got %d", len(f.Replace))
 	}
 }
+
+func TestIterateOverJSONNumericConditions(t *testing.T) {
+	for _, tc := range []struct{ value, condition, want string }{
+		{"1.0", "1", `"updated"`},
+		{"1e3", "1000", `"updated"`},
+		{"1.50", "1.5", `"updated"`},
+		{"9007199254740993", "9007199254740993", `"updated"`},
+		{"9007199254740993", "9007199254740992", "9007199254740993"},
+		{"1.0", `"01"`, "1.0"},
+		{`"1.0"`, "1", `"1.0"`},
+	} {
+		t.Run(tc.value+"/"+tc.condition, func(t *testing.T) {
+			cf := ConfigurationFile{Replace: []ConfigurationFileReplacement{replacement(t,
+				`{"match":"value","if_value":`+tc.condition+`,"replace_with":"updated"}`)}}
+			got, err := cf.IterateOverJson([]byte(`{"value":` + tc.value + `,"id":9007199254740993}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if value := got.Path("value").String(); value != tc.want {
+				t.Fatalf("got %s, want %s", value, tc.want)
+			}
+			if id := got.Path("id").String(); id != "9007199254740993" {
+				t.Fatalf("unrelated ID changed: %s", id)
+			}
+		})
+	}
+}
