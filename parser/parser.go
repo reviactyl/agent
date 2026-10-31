@@ -520,6 +520,41 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 
 // decodePropertiesSurrogates handles UTF-16 pairs unsupported by the properties lexer.
 func decodePropertiesSurrogates(b []byte) []byte {
+	var joined bytes.Buffer
+	lineStart := true
+	for i := 0; i < len(b); i++ {
+		if lineStart {
+			end := bytes.IndexAny(b[i:], "\r\n")
+			if end < 0 {
+				end = len(b) - i
+			}
+			line := bytes.TrimLeft(b[i:i+end], " \t\f")
+			if len(line) > 0 && (line[0] == '#' || line[0] == '!') {
+				joined.Write(b[i : i+end])
+				i += end - 1
+				lineStart = false
+				continue
+			}
+		}
+		lineStart = b[i] == '\n' || b[i] == '\r'
+		if b[i] == '\\' && i+1 < len(b) {
+			if b[i+1] == '\r' || b[i+1] == '\n' {
+				i++
+				if b[i] == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+					i++
+				}
+				for i+1 < len(b) && strings.ContainsRune(" \t\f", rune(b[i+1])) {
+					i++
+				}
+				lineStart = false
+				continue
+			}
+			joined.WriteByte(b[i])
+			i++
+		}
+		joined.WriteByte(b[i])
+	}
+	b = joined.Bytes()
 	var out bytes.Buffer
 	for i := 0; i < len(b); {
 		if b[i] == '\\' && i+1 < len(b) {
@@ -625,16 +660,30 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		//
 		// See the docblock for this function for more details, do not change this
 		// or you'll cause a flood of new issue reports no one wants to deal with.
-		s.WriteString(key + "=")
-		for _, r := range value {
-			if r > 0xffff {
-				hi, lo := utf16.EncodeRune(r)
-				fmt.Fprintf(s, `\u%04x\u%04x`, hi, lo)
-			} else {
-				quoted := strconv.QuoteToASCII(string(r))
-				s.WriteString(quoted[1 : len(quoted)-1])
+		start := 0
+		for i, r := range key {
+			if r <= 0xffff {
+				continue
 			}
+			s.WriteString(key[start:i])
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(s, `\u%04x\u%04x`, hi, lo)
+			start = i + len(string(r))
 		}
+		s.WriteString(key[start:] + "=")
+		start = 0
+		for i, r := range value {
+			if r <= 0xffff {
+				continue
+			}
+			quoted := strconv.QuoteToASCII(value[start:i])
+			s.WriteString(quoted[1 : len(quoted)-1])
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(s, `\u%04x\u%04x`, hi, lo)
+			start = i + len(string(r))
+		}
+		quoted := strconv.QuoteToASCII(value[start:])
+		s.WriteString(quoted[1 : len(quoted)-1])
 		s.WriteByte('\n')
 	}
 

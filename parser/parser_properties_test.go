@@ -46,15 +46,22 @@ func TestPropertiesRewritePreservesMOTDAndFollowingProperty(t *testing.T) {
 }
 
 func TestPropertiesRewriteNonBMPUnicode(t *testing.T) {
-	for i, tc := range []struct{ value, escaped string }{
-		{"Welcome 😀", `Welcome \ud83d\ude00`},
-		{"𐀀😀􏿿", `\ud800\udc00\ud83d\ude00\udbff\udfff`},
-		{`literal \U0001f600`, `literal \\U0001f600`},
-		{"Hello §世界", `Hello \u00a7\u4e16\u754c`},
+	for i, tc := range []struct{ value, escaped, input string }{
+		{"Welcome 😀", `Welcome \ud83d\ude00`, ""},
+		{"𐀀😀􏿿", `\ud800\udc00\ud83d\ude00\udbff\udfff`, ""},
+		{`literal \U0001f600`, `literal \\U0001f600`, ""},
+		{"Hello §世界", `Hello \u00a7\u4e16\u754c`, ""},
+		{"Welcome 😀", `Welcome \ud83d\ude00`, `Welcome \ud83d\` + "\n \t\f" + `\ude00`},
+		{"Welcome 😀", `Welcome \ud83d\ude00`, `Welcome \ud83d\` + "\r\n \t\f" + `\ude00`},
+		{"Welcome 😀", `Welcome \ud83d\ude00`, `Welcome \ud83d\` + "\r \t\f" + `\ude00`},
 	} {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "server.properties")
-			require.NoError(t, os.WriteFile(path, []byte("motd="+strings.ReplaceAll(tc.value, `\`, `\\`)+"\nserver-port=25565\n"), 0o600))
+			input := strings.ReplaceAll(tc.value, `\`, `\\`)
+			if tc.input != "" {
+				input = tc.input
+			}
+			require.NoError(t, os.WriteFile(path, []byte("motd="+input+"\nserver-port=25565\n"+`\ud83d\ude00=value`+"\n"), 0o600))
 			file, err := os.OpenFile(path, os.O_RDWR, 0)
 			require.NoError(t, err)
 			defer file.Close()
@@ -66,6 +73,7 @@ func TestPropertiesRewriteNonBMPUnicode(t *testing.T) {
 			content, err := os.ReadFile(path)
 			require.NoError(t, err)
 			require.Contains(t, string(content), "motd="+tc.escaped+"\n")
+			require.Contains(t, string(content), `\ud83d\ude00=value`)
 			require.Contains(t, string(content), "server-port=25565\n")
 
 			if _, err := exec.LookPath("java"); err != nil {
@@ -83,6 +91,7 @@ public class ReadProperties {
   Properties p = new Properties();
   try (InputStream in = new FileInputStream(args[0])) { p.load(in); }
   if (!args[1].equals(p.getProperty("motd"))) throw new AssertionError(p.getProperty("motd"));
+  if (!"value".equals(p.getProperty("\ud83d\ude00"))) throw new AssertionError("emoji key changed");
   if (!"25565".equals(p.getProperty("server-port"))) throw new AssertionError("port changed");
  }
 }`), 0o600))
