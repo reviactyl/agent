@@ -3,10 +3,12 @@ package filesystem
 import (
 	"archive/tar"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	iofs "io/fs"
 	"math"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/klauspost/compress/zip"
 	"github.com/mholt/archives"
+	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/internal/ufs"
 )
@@ -295,8 +298,10 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 	}
 
 	// Decompress and extract archive
+	extracted := make(map[string]struct{})
 	return ex.Extract(ctx, opts.Reader, func(ctx context.Context, f archives.FileInfo) error {
 		p := filepath.Join(opts.Directory, f.NameInArchive)
+		delete(extracted, path.Clean(f.NameInArchive))
 		// If it is ignored, just don't do anything with the entry and skip over it.
 		if !opts.KeepDenylist {
 			if err := fs.IsIgnored(p); err != nil {
@@ -347,6 +352,63 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return nil
 		}
 		if h, ok := f.Header.(*tar.Header); ok && h.Typeflag == tar.TypeLink {
+			target := path.Clean(h.Linkname)
+			if !opts.KeepDenylist {
+				if err := fs.IsIgnored(filepath.Join(opts.Directory, target)); err != nil {
+					return nil
+				}
+			}
+			if _, ok := extracted[target]; !ok || target == path.Clean(f.NameInArchive) {
+				return fmt.Errorf("invalid or unavailable TAR hard-link target %q", h.Linkname)
+			}
+			source, err := fs.unixFS.Lstat(filepath.Join(opts.Directory, target))
+			if err != nil {
+				return wrapError(err, opts.FileName)
+			}
+			if !source.Mode().IsRegular() {
+				return fmt.Errorf("TAR hard-link target %q is not a regular file", h.Linkname)
+			}
+			if existing, err := fs.unixFS.Lstat(p); err == nil {
+				if existing.IsDir() {
+					return newFilesystemError(ErrCodeIsDirectory, nil)
+				}
+				if os.SameFile(source, existing) {
+					extracted[path.Clean(f.NameInArchive)] = struct{}{}
+					return nil
+				}
+			}
+			if err := fs.HasSpaceFor(0); err != nil {
+				return err
+			}
+			if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
+				return wrapError(err, opts.FileName)
+			}
+			temporary := filepath.Join(filepath.Dir(p), ".extract-"+rand.Text())
+			if err := fs.unixFS.Link(filepath.Join(opts.Directory, target), temporary); err != nil {
+				return wrapError(err, opts.FileName)
+			}
+			defer func() { _ = fs.unixFS.UnixFS.Remove(temporary) }()
+			if err := func() error {
+				fs.mu.Lock()
+				defer fs.mu.Unlock()
+				previous, err := fs.unixFS.Lstat(p)
+				if err != nil && !errors.Is(err, ufs.ErrNotExist) {
+					return err
+				}
+				credit, err := replacementCredit(fs, p)
+				if err != nil {
+					return err
+				}
+				if err := fs.unixFS.Replace(temporary, p); err != nil {
+					return err
+				}
+				fs.forgetWalkFileLocked(previous)
+				fs.addDisk(-credit)
+				return nil
+			}(); err != nil {
+				return wrapError(err, opts.FileName)
+			}
+			extracted[path.Clean(f.NameInArchive)] = struct{}{}
 			return nil
 		}
 		r, err := f.Open()
@@ -354,13 +416,24 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return err
 		}
 		defer r.Close()
-		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
-			return wrapError(err, opts.FileName)
+		var writeErr error
+		if existing, err := fs.unixFS.Lstat(p); err == nil && existing.Mode().IsRegular() {
+			if st, ok := existing.Sys().(*unix.Stat_t); ok && st.Nlink > 1 {
+				_, writeErr = fs.writeStream(p, r, f.Mode(), true)
+			} else {
+				writeErr = fs.Write(p, r, f.Size(), f.Mode())
+			}
+		} else {
+			writeErr = fs.Write(p, r, f.Size(), f.Mode())
+		}
+		if writeErr != nil {
+			return wrapError(writeErr, opts.FileName)
 		}
 		// Update the file modification time to the one set in the archive.
 		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
 			return wrapError(err, opts.FileName)
 		}
+		extracted[path.Clean(f.NameInArchive)] = struct{}{}
 		return nil
 	})
 }

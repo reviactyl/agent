@@ -1029,3 +1029,21 @@ func (fs *UnixFS) unsafeIsPathInsideOfBase(path string) bool {
 		fs.basePath+"/",
 	)
 }
+
+// Link creates a hard link without following the source's final symlink.
+func (fs *UnixFS) Link(oldpath, newpath string) error {
+	oldfd, oldname, closeOld, err := fs.safePath(oldpath)
+	defer closeOld()
+	if err != nil {
+		return err
+	}
+	newfd, newname, closeNew, err := fs.safePath(newpath)
+	defer closeNew()
+	if err != nil {
+		return err
+	}
+	if err := ignoringEINTR(func() error { return unix.Linkat(oldfd, oldname, newfd, newname, 0) }); err != nil {
+		return &LinkError{Op: "link", Old: oldpath, New: newpath, Err: convertErrorType(err)}
+	}
+	return nil
+}

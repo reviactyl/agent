@@ -118,7 +118,10 @@ func TestDecompressExtractsEntriesByType(t *testing.T) {
 	target, err := os.Readlink(filepath.Join(root, "link"))
 	require.NoError(t, err)
 	assert.Equal(t, "file.txt", target)
-	for _, name := range []string{"hard", "device", "pipe"} {
+	content, err := os.ReadFile(filepath.Join(root, "hard"))
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(content))
+	for _, name := range []string{"device", "pipe"} {
 		_, err := os.Lstat(filepath.Join(root, name))
 		assert.ErrorIs(t, err, os.ErrNotExist, name)
 	}

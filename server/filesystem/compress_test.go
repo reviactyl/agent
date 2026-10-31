@@ -659,3 +659,141 @@ func TestGzipPreflightAllowsShrinkingFileAboveQuota(t *testing.T) {
 		t.Fatalf("shrinking an existing file must remain allowed, got %v", err)
 	}
 }
+
+func TestFilesystem_DecompressTarHardlinks(t *testing.T) {
+	for _, target := range []string{"original.txt", "missing.txt"} {
+		t.Run(target, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = fs.unixFS.Close(); _ = os.RemoveAll(rfs.root) })
+			var buf bytes.Buffer
+			w := tar.NewWriter(&buf)
+			content := "hard-linked contents\n"
+			if err := w.WriteHeader(&tar.Header{Name: "original.txt", Mode: 0o640, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(w, content); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"nested/linked.txt", "another.txt"} {
+				if err := w.WriteHeader(&tar.Header{Name: name, Linkname: target, Typeflag: tar.TypeLink}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := rfs.CreateServerFile("fixture.tar", buf.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			if err := fs.CreateDirectory("output", "/"); err != nil {
+				t.Fatal(err)
+			}
+			err := fs.DecompressFile(context.Background(), "output", "../fixture.tar")
+			if target == "missing.txt" {
+				if err == nil {
+					t.Fatal("missing hard-link target must fail extraction")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fs.DecompressFile(context.Background(), "output", "../fixture.tar"); err != nil {
+				t.Fatal(err)
+			}
+			usage, err := fs.DiskUsage(false)
+			if err != nil || usage != int64(buf.Len()+len(content)) {
+				t.Fatalf("usage = %d, error = %v", usage, err)
+			}
+			original, err := os.Stat(filepath.Join(rfs.root, "server/output/original.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"original.txt", "nested/linked.txt", "another.txt"} {
+				linked, err := os.Stat(filepath.Join(rfs.root, "server/output", name))
+				if err != nil || !os.SameFile(original, linked) {
+					t.Fatalf("%s does not share original inode: %v", name, err)
+				}
+				got, err := os.ReadFile(filepath.Join(rfs.root, "server/output", name))
+				if err != nil || string(got) != content {
+					t.Fatalf("%s: contents %q, error %v", name, got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDecompressHardlinkedReplacementPreservesFilesOnQuotaFailure(t *testing.T) {
+	for _, format := range []string{"tar", "zip"} {
+		for _, fail := range []bool{true, false} {
+			t.Run(format+strconv.FormatBool(fail), func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = fs.unixFS.Close(); _ = os.RemoveAll(rfs.root) })
+				if err := rfs.CreateServerFile("target", []byte("old")); err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.unixFS.Link("target", "other"); err != nil {
+					t.Fatal(err)
+				}
+				var buf bytes.Buffer
+				content := "replacement"
+				if format == "tar" {
+					w := tar.NewWriter(&buf)
+					if err := w.WriteHeader(&tar.Header{Name: "target", Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := io.WriteString(w, content); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					w := zip.NewWriter(&buf)
+					f, err := w.Create("target")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := io.WriteString(f, content); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := rfs.CreateServerFile("fixture."+format, buf.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+				before, err := fs.DiskUsage(false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fail {
+					fs.SetDiskLimit(before + 4)
+				} else {
+					fs.SetDiskLimit(before + 100)
+				}
+				err = fs.DecompressFile(context.Background(), "/", "fixture."+format)
+				if fail && !IsErrorCode(err, ErrCodeDiskSpace) {
+					t.Fatalf("expected quota failure, got %v", err)
+				}
+				if !fail && err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range []string{"target", "other"} {
+					want := "old"
+					if name == "target" && !fail {
+						want = content
+					}
+					got, err := os.ReadFile(filepath.Join(rfs.root, "server", name))
+					if err != nil || string(got) != want {
+						t.Fatalf("%s: %q, %v; want %q", name, got, err, want)
+					}
+				}
+				if fail && fs.CachedUsage() != before {
+					t.Fatalf("failed write changed usage: %d -> %d", before, fs.CachedUsage())
+				}
+			})
+		}
+	}
+}
