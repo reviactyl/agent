@@ -387,7 +387,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			if err := fs.unixFS.Link(filepath.Join(opts.Directory, target), temporary); err != nil {
 				return wrapError(err, opts.FileName)
 			}
-			defer fs.unixFS.UnixFS.Remove(temporary)
+			defer func() { _ = fs.unixFS.UnixFS.Remove(temporary) }()
 			if err := func() error {
 				fs.mu.Lock()
 				defer fs.mu.Unlock()
