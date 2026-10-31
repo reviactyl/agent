@@ -3,7 +3,10 @@ package parser
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/magiconair/properties"
@@ -27,6 +30,9 @@ func TestPropertiesRewritePreservesMOTDAndFollowingProperty(t *testing.T) {
 			defer file.Close()
 
 			require.NoError(t, cf.parsePropertiesFile(file))
+			_, err = file.Seek(0, 0)
+			require.NoError(t, err)
+			require.NoError(t, cf.parsePropertiesFile(file))
 			content, err := os.ReadFile(path)
 			require.NoError(t, err)
 			require.Contains(t, string(content), "\nserver-port=25565\n")
@@ -35,6 +41,55 @@ func TestPropertiesRewritePreservesMOTDAndFollowingProperty(t *testing.T) {
 			require.Equal(t, motd, parsed.GetString("motd", "missing"))
 			require.Equal(t, "25565", parsed.GetString("server-port", "missing"))
 			require.Equal(t, []string{"motd", "server-port"}, parsed.Keys())
+		})
+	}
+}
+
+func TestPropertiesRewriteNonBMPUnicode(t *testing.T) {
+	for i, tc := range []struct{ value, escaped string }{
+		{"Welcome 😀", `Welcome \ud83d\ude00`},
+		{"𐀀😀􏿿", `\ud800\udc00\ud83d\ude00\udbff\udfff`},
+		{`literal \U0001f600`, `literal \\U0001f600`},
+		{"Hello §世界", `Hello \u00a7\u4e16\u754c`},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "server.properties")
+			require.NoError(t, os.WriteFile(path, []byte("motd="+strings.ReplaceAll(tc.value, `\`, `\\`)+"\nserver-port=25565\n"), 0o600))
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			require.NoError(t, err)
+			defer file.Close()
+			cf := ConfigurationFile{}
+			require.NoError(t, cf.parsePropertiesFile(file))
+			_, err = file.Seek(0, 0)
+			require.NoError(t, err)
+			require.NoError(t, cf.parsePropertiesFile(file))
+			content, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Contains(t, string(content), "motd="+tc.escaped+"\n")
+			require.Contains(t, string(content), "server-port=25565\n")
+
+			if _, err := exec.LookPath("java"); err != nil {
+				t.Skip("Java required for Properties.load integration check")
+			}
+			if _, err := exec.LookPath("javac"); err != nil {
+				t.Skip("javac required for Properties.load integration check")
+			}
+			source := filepath.Join(t.TempDir(), "ReadProperties.java")
+			require.NoError(t, os.WriteFile(source, []byte(`
+import java.io.*;
+import java.util.Properties;
+public class ReadProperties {
+ public static void main(String[] args) throws Exception {
+  Properties p = new Properties();
+  try (InputStream in = new FileInputStream(args[0])) { p.load(in); }
+  if (!args[1].equals(p.getProperty("motd"))) throw new AssertionError(p.getProperty("motd"));
+  if (!"25565".equals(p.getProperty("server-port"))) throw new AssertionError("port changed");
+ }
+}`), 0o600))
+			output, err := exec.Command("javac", source).CombinedOutput()
+			require.NoError(t, err, "%s", output)
+			output, err = exec.Command("java", "-cp", filepath.Dir(source), "ReadProperties", path, tc.value).CombinedOutput()
+			require.NoError(t, err, "%s", output)
 		})
 	}
 }

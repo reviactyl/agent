@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"emperror.dev/errors"
 	"github.com/Jeffail/gabs/v2"
@@ -516,6 +518,30 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 	return rewrite(file, b.Bytes())
 }
 
+// decodePropertiesSurrogates handles UTF-16 pairs unsupported by the properties lexer.
+func decodePropertiesSurrogates(b []byte) []byte {
+	var out bytes.Buffer
+	for i := 0; i < len(b); {
+		if b[i] == '\\' && i+1 < len(b) {
+			if i+12 <= len(b) && b[i+1] == 'u' && b[i+6] == '\\' && b[i+7] == 'u' {
+				hi, errHi := strconv.ParseUint(string(b[i+2:i+6]), 16, 16)
+				lo, errLo := strconv.ParseUint(string(b[i+8:i+12]), 16, 16)
+				if errHi == nil && errLo == nil && hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff {
+					out.WriteRune(utf16.DecodeRune(rune(hi), rune(lo)))
+					i += 12
+					continue
+				}
+			}
+			out.Write(b[i : i+2])
+			i += 2
+			continue
+		}
+		out.WriteByte(b[i])
+		i++
+	}
+	return out.Bytes()
+}
+
 // parsePropertiesFile parses a properties file and updates the values within it
 // to match those that are passed. Once completed the new file is written to the
 // disk. This will cause comments not present at the head of the file to be
@@ -564,7 +590,7 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		return errors.WithStackIf(err)
 	}
 
-	p, err := properties.Load(b, properties.UTF8)
+	p, err := properties.Load(decodePropertiesSurrogates(b), properties.UTF8)
 	if err != nil {
 		return errors.Wrap(err, "parser: could not load properties file for configuration update")
 	}
@@ -599,8 +625,17 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		//
 		// See the docblock for this function for more details, do not change this
 		// or you'll cause a flood of new issue reports no one wants to deal with.
-		quoted := strconv.QuoteToASCII(value)
-		s.WriteString(key + "=" + quoted[1:len(quoted)-1] + "\n")
+		s.WriteString(key + "=")
+		for _, r := range value {
+			if r > 0xffff {
+				hi, lo := utf16.EncodeRune(r)
+				fmt.Fprintf(s, `\u%04x\u%04x`, hi, lo)
+			} else {
+				quoted := strconv.QuoteToASCII(string(r))
+				s.WriteString(quoted[1 : len(quoted)-1])
+			}
+		}
+		s.WriteByte('\n')
 	}
 
 	return rewrite(file, s.Bytes())
