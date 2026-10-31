@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"emperror.dev/errors"
 	"github.com/Jeffail/gabs/v2"
@@ -516,6 +518,65 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 	return rewrite(file, b.Bytes())
 }
 
+// decodePropertiesSurrogates handles UTF-16 pairs unsupported by the properties lexer.
+func decodePropertiesSurrogates(b []byte) []byte {
+	var joined bytes.Buffer
+	lineStart := true
+	for i := 0; i < len(b); i++ {
+		if lineStart {
+			end := bytes.IndexAny(b[i:], "\r\n")
+			if end < 0 {
+				end = len(b) - i
+			}
+			line := bytes.TrimLeft(b[i:i+end], " \t\f")
+			if len(line) > 0 && (line[0] == '#' || line[0] == '!') {
+				joined.Write(b[i : i+end])
+				i += end - 1
+				lineStart = false
+				continue
+			}
+		}
+		lineStart = b[i] == '\n' || b[i] == '\r'
+		if b[i] == '\\' && i+1 < len(b) {
+			if b[i+1] == '\r' || b[i+1] == '\n' {
+				i++
+				if b[i] == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+					i++
+				}
+				for i+1 < len(b) && strings.ContainsRune(" \t\f", rune(b[i+1])) {
+					i++
+				}
+				lineStart = false
+				continue
+			}
+			joined.WriteByte(b[i])
+			i++
+		}
+		joined.WriteByte(b[i])
+	}
+	b = joined.Bytes()
+	var out bytes.Buffer
+	for i := 0; i < len(b); {
+		if b[i] == '\\' && i+1 < len(b) {
+			if i+12 <= len(b) && b[i+1] == 'u' && b[i+6] == '\\' && b[i+7] == 'u' {
+				hi, errHi := strconv.ParseUint(string(b[i+2:i+6]), 16, 16)
+				lo, errLo := strconv.ParseUint(string(b[i+8:i+12]), 16, 16)
+				if errHi == nil && errLo == nil && hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff {
+					out.WriteRune(utf16.DecodeRune(rune(hi), rune(lo)))
+					i += 12
+					continue
+				}
+			}
+			out.Write(b[i : i+2])
+			i += 2
+			continue
+		}
+		out.WriteByte(b[i])
+		i++
+	}
+	return out.Bytes()
+}
+
 // parsePropertiesFile parses a properties file and updates the values within it
 // to match those that are passed. Once completed the new file is written to the
 // disk. This will cause comments not present at the head of the file to be
@@ -564,7 +625,7 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		return errors.WithStackIf(err)
 	}
 
-	p, err := properties.Load(b, properties.UTF8)
+	p, err := properties.Load(decodePropertiesSurrogates(b), properties.UTF8)
 	if err != nil {
 		return errors.Wrap(err, "parser: could not load properties file for configuration update")
 	}
@@ -599,8 +660,31 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		//
 		// See the docblock for this function for more details, do not change this
 		// or you'll cause a flood of new issue reports no one wants to deal with.
-		quoted := strconv.QuoteToASCII(value)
-		s.WriteString(key + "=" + quoted[1:len(quoted)-1] + "\n")
+		start := 0
+		for i, r := range key {
+			if r <= 0xffff {
+				continue
+			}
+			s.WriteString(key[start:i])
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(s, `\u%04x\u%04x`, hi, lo)
+			start = i + len(string(r))
+		}
+		s.WriteString(key[start:] + "=")
+		start = 0
+		for i, r := range value {
+			if r <= 0xffff {
+				continue
+			}
+			quoted := strconv.QuoteToASCII(value[start:i])
+			s.WriteString(quoted[1 : len(quoted)-1])
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(s, `\u%04x\u%04x`, hi, lo)
+			start = i + len(string(r))
+		}
+		quoted := strconv.QuoteToASCII(value[start:])
+		s.WriteString(quoted[1 : len(quoted)-1])
+		s.WriteByte('\n')
 	}
 
 	return rewrite(file, s.Bytes())
