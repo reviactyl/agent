@@ -391,6 +391,10 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			if err := func() error {
 				fs.mu.Lock()
 				defer fs.mu.Unlock()
+				previous, err := fs.unixFS.Lstat(p)
+				if err != nil && !errors.Is(err, ufs.ErrNotExist) {
+					return err
+				}
 				credit, err := replacementCredit(fs, p)
 				if err != nil {
 					return err
@@ -398,6 +402,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 				if err := fs.unixFS.Replace(temporary, p); err != nil {
 					return err
 				}
+				fs.forgetWalkFileLocked(previous)
 				fs.addDisk(-credit)
 				return nil
 			}(); err != nil {
@@ -411,15 +416,18 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return err
 		}
 		defer r.Close()
+		var writeErr error
 		if existing, err := fs.unixFS.Lstat(p); err == nil && existing.Mode().IsRegular() {
 			if st, ok := existing.Sys().(*unix.Stat_t); ok && st.Nlink > 1 {
-				if err := fs.unixFS.Remove(p); err != nil {
-					return wrapError(err, opts.FileName)
-				}
+				_, writeErr = fs.writeStream(p, r, f.Mode(), true)
+			} else {
+				writeErr = fs.Write(p, r, f.Size(), f.Mode())
 			}
+		} else {
+			writeErr = fs.Write(p, r, f.Size(), f.Mode())
 		}
-		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
-			return wrapError(err, opts.FileName)
+		if writeErr != nil {
+			return wrapError(writeErr, opts.FileName)
 		}
 		// Update the file modification time to the one set in the archive.
 		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {

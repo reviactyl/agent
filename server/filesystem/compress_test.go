@@ -722,3 +722,78 @@ func TestFilesystem_DecompressTarHardlinks(t *testing.T) {
 		})
 	}
 }
+
+func TestDecompressHardlinkedReplacementPreservesFilesOnQuotaFailure(t *testing.T) {
+	for _, format := range []string{"tar", "zip"} {
+		for _, fail := range []bool{true, false} {
+			t.Run(format+strconv.FormatBool(fail), func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = fs.unixFS.Close(); _ = os.RemoveAll(rfs.root) })
+				if err := rfs.CreateServerFile("target", []byte("old")); err != nil {
+					t.Fatal(err)
+				}
+				if err := fs.unixFS.Link("target", "other"); err != nil {
+					t.Fatal(err)
+				}
+				var buf bytes.Buffer
+				content := "replacement"
+				if format == "tar" {
+					w := tar.NewWriter(&buf)
+					if err := w.WriteHeader(&tar.Header{Name: "target", Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := io.WriteString(w, content); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					w := zip.NewWriter(&buf)
+					f, err := w.Create("target")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := io.WriteString(f, content); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := rfs.CreateServerFile("fixture."+format, buf.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+				before, err := fs.DiskUsage(false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fail {
+					fs.SetDiskLimit(before + 4)
+				} else {
+					fs.SetDiskLimit(before + 100)
+				}
+				err = fs.DecompressFile(context.Background(), "/", "fixture."+format)
+				if fail && !IsErrorCode(err, ErrCodeDiskSpace) {
+					t.Fatalf("expected quota failure, got %v", err)
+				}
+				if !fail && err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range []string{"target", "other"} {
+					want := "old"
+					if name == "target" && !fail {
+						want = content
+					}
+					got, err := os.ReadFile(filepath.Join(rfs.root, "server", name))
+					if err != nil || string(got) != want {
+						t.Fatalf("%s: %q, %v; want %q", name, got, err, want)
+					}
+				}
+				if fail && fs.CachedUsage() != before {
+					t.Fatalf("failed write changed usage: %d -> %d", before, fs.CachedUsage())
+				}
+			})
+		}
+	}
+}

@@ -1,7 +1,9 @@
 package filesystem
 
 import (
+	"archive/tar"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mholt/archives"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -247,4 +250,43 @@ func TestFailedStagedWriteRestoresCachedUsageWithoutWalk(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, usage, fs.CachedUsage())
 	require.Equal(t, diskUsage(t, rfs), fs.CachedUsage())
+}
+
+func TestHardlinkReplacementUpdatesActiveDiskScan(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = fs.unixFS.Close(); _ = os.RemoveAll(rfs.root) })
+	require.NoError(t, rfs.CreateServerFile("source", []byte("source")))
+	require.NoError(t, rfs.CreateServerFile("destination", bytes.Repeat([]byte("x"), 80)))
+	previous, err := fs.unixFS.Lstat("destination")
+	require.NoError(t, err)
+	ino, ok := fileInode(previous)
+	require.True(t, ok)
+	_, err = fs.DiskUsage(false)
+	require.NoError(t, err)
+	var archive bytes.Buffer
+	w := tar.NewWriter(&archive)
+	require.NoError(t, w.WriteHeader(&tar.Header{Name: "source", Mode: 0o644, Size: 6, Typeflag: tar.TypeReg}))
+	_, err = w.Write([]byte("source"))
+	require.NoError(t, err)
+	require.NoError(t, w.WriteHeader(&tar.Header{Name: "destination", Linkname: "source", Typeflag: tar.TypeLink}))
+	require.NoError(t, w.Close())
+	replaced := false
+	fs.walkEntryHook = func() {
+		fs.mu.Lock()
+		_, observed := fs.walkObserved[ino]
+		fs.mu.Unlock()
+		if replaced || !observed {
+			return
+		}
+		replaced = true
+		require.NoError(t, fs.extractStream(context.Background(), extractStreamOptions{Directory: "/", Format: archives.Tar{}, Reader: bytes.NewReader(archive.Bytes())}))
+	}
+	usage, err := fs.updateCachedDiskUsage()
+	require.NoError(t, err)
+	require.True(t, replaced)
+	require.Equal(t, int64(6), usage)
+	fs.walkEntryHook = nil
+	fresh, err := fs.updateCachedDiskUsage()
+	require.NoError(t, err)
+	require.Equal(t, fresh, usage)
 }
