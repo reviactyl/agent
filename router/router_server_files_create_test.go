@@ -1,8 +1,11 @@
 package router
 
 import (
+	"bufio"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +14,38 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestCreateFileInterruptedBodyCanBeRetried(t *testing.T) {
+	u := newUploadTest(t, 1, 0)
+	address, err := url.Parse(u.url)
+	require.NoError(t, err)
+	conn, err := net.Dial("tcp", address.Host)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = fmt.Fprintf(conn, "POST /api/servers/%s/files/create?file=retry.txt HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer test-token\r\nContent-Length: 20\r\n\r\npartial", uploadTestServerUuid, address.Host)
+	require.NoError(t, err)
+	require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+	_, err = os.Lstat(filepath.Join(u.root, "retry.txt"))
+	require.True(t, os.IsNotExist(err))
+	entries, err := os.ReadDir(u.root)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	req, err := http.NewRequest(http.MethodPost, u.url+"/api/servers/"+uploadTestServerUuid+"/files/create?file=retry.txt", strings.NewReader("complete"))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	response, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+	data, err := os.ReadFile(filepath.Join(u.root, "retry.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "complete", string(data))
+}
 
 func TestCreateFileRefusesExistingTargets(t *testing.T) {
 	u := newUploadTest(t, 1, 0)
