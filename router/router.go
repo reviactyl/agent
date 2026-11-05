@@ -138,6 +138,7 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 			files.PUT("/rename", putServerRenameFiles)
 			files.POST("/copy", postServerCopyFile)
 			files.POST("/write", postServerWriteFile)
+			files.POST("/create", postServerCreateFile)
 			files.POST("/create-directory", postServerCreateDirectory)
 			files.POST("/delete", postServerDeleteFiles)
 			files.POST("/compress", postServerCompressFiles)

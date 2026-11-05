@@ -20,6 +20,18 @@ func (fs *Filesystem) writeStream(p string, r io.Reader, mode ufs.FileMode, repl
 }
 
 func (fs *Filesystem) writeStreamWithCredit(p string, r io.Reader, mode ufs.FileMode, creditPath string) (_ int64, err error) {
+	return fs.writeStreamFile(p, r, mode, creditPath, -1)
+}
+
+func (fs *Filesystem) writeStreamFile(p string, r io.Reader, mode ufs.FileMode, creditPath string, createSize int64) (_ int64, err error) {
+	if createSize >= 0 {
+		if _, err := fs.unixFS.Lstat(p); err == nil {
+			return 0, ufs.ErrExist
+		} else if !errors.Is(err, ufs.ErrNotExist) {
+			return 0, err
+		}
+		r = io.LimitReader(r, createSize)
+	}
 	if fs.MaxDisk() == -1 {
 		return 0, newFilesystemError(ErrCodeDiskSpace, nil)
 	}
@@ -58,12 +70,18 @@ func (fs *Filesystem) writeStreamWithCredit(p string, r io.Reader, mode ufs.File
 	if closeErr != nil {
 		return n, closeErr
 	}
+	if createSize >= 0 && n != createSize {
+		return n, io.ErrUnexpectedEOF
+	}
 	if err := fs.chownFile(staged); err != nil {
 		return n, err
 	}
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if createSize >= 0 {
+		return n, fs.unixFS.Link(staged, p)
+	}
 	var removedSize int64
 	st, err := fs.unixFS.Lstat(p)
 	if err != nil && !errors.Is(err, ufs.ErrNotExist) {

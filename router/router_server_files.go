@@ -229,6 +229,14 @@ func postServerDeleteFiles(c *gin.Context) {
 
 // Writes the contents of the request to a file on a server.
 func postServerWriteFile(c *gin.Context) {
+	writeServerFile(c, false)
+}
+
+func postServerCreateFile(c *gin.Context) {
+	writeServerFile(c, true)
+}
+
+func writeServerFile(c *gin.Context, createOnly bool) {
 	s := ExtractServer(c)
 
 	f := c.Query("file")
@@ -247,7 +255,15 @@ func postServerWriteFile(c *gin.Context) {
 		return
 	}
 
-	if err := s.Filesystem().Write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
+	write := s.Filesystem().Write
+	if createOnly {
+		write = s.Filesystem().Create
+	}
+	if err := write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
+		if createOnly && (errors.Is(err, os.ErrExist) || filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory)) {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "A file or directory with this name already exists."})
+			return
+		}
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Cannot write file, name conflicts with an existing directory by the same name.",

@@ -207,6 +207,19 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 		_, err := fs.writeStream(p, r, mode, false)
 		return err
 	}
+	return fs.write(p, r, newSize, mode)
+}
+
+// Create writes a new file without replacing an existing directory entry.
+func (fs *Filesystem) Create(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
+	if newSize < 0 {
+		return fmt.Errorf("file creation requires a content length")
+	}
+	_, err := fs.writeStreamFile(p, r, mode, "", newSize)
+	return err
+}
+
+func (fs *Filesystem) write(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
 	if err := fs.checkNotDirectory(p); err != nil {
 		return err
 	}
