@@ -207,6 +207,18 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 		_, err := fs.writeStream(p, r, mode, false)
 		return err
 	}
+	return fs.write(p, r, newSize, mode, ufs.O_RDWR)
+}
+
+// Create writes a new file without replacing an existing directory entry.
+func (fs *Filesystem) Create(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
+	if newSize < 0 {
+		return fmt.Errorf("file creation requires a content length")
+	}
+	return fs.write(p, r, newSize, mode, ufs.O_RDWR|ufs.O_EXCL)
+}
+
+func (fs *Filesystem) write(p string, r io.Reader, newSize int64, mode ufs.FileMode, flags int) error {
 	if err := fs.checkNotDirectory(p); err != nil {
 		return err
 	}
@@ -218,7 +230,7 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 	if statErr != nil && !errors.Is(statErr, ufs.ErrNotExist) {
 		return errors.Wrap(statErr, "server/filesystem: writefile: failed to stat file")
 	}
-	file, currentSize, err := fs.openForWrite(p, ufs.O_RDWR, mode)
+	file, currentSize, err := fs.openForWrite(p, flags, mode)
 	if err != nil {
 		return err
 	}
