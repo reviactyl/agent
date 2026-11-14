@@ -22,6 +22,11 @@ func startTestServer(t *testing.T, limits connectionLimits) string {
 }
 
 func startTestServerWithAuth(t *testing.T, limits connectionLimits, auth func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error)) string {
+	addr, _ := startTestServerWithAuthAndServer(t, limits, auth)
+	return addr
+}
+
+func startTestServerWithAuthAndServer(t *testing.T, limits connectionLimits, auth func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error)) (string, *SFTPServer) {
 	t.Helper()
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -43,7 +48,7 @@ func startTestServerWithAuth(t *testing.T, limits connectionLimits, auth func(ss
 	go func() {
 		_ = srv.serve(listener, conf)
 	}()
-	return listener.Addr().String()
+	return listener.Addr().String(), srv
 }
 
 // dial opens a connection from the given loopback address and reports whether
@@ -144,7 +149,7 @@ func TestConnectionKey(t *testing.T) {
 func TestAuthenticatedConnectionsAreLimitedPerUser(t *testing.T) {
 	limits := defaultLimits
 	limits.maxPerUser = 2
-	addr := startTestServerWithAuth(t, limits, func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+	addr, srv := startTestServerWithAuthAndServer(t, limits, func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
 		return &ssh.Permissions{}, nil
 	})
 	connect := func(user string) (*ssh.Client, error) {
@@ -178,6 +183,19 @@ func TestAuthenticatedConnectionsAreLimitedPerUser(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = c.Close() })
 		clients = append(clients, c)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		srv.sessions.mu.Lock()
+		counted := srv.sessions.total
+		srv.sessions.mu.Unlock()
+		if counted == len(clients) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the first connections to be counted before opening another, got %d", counted)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if c, err := connect("user.12345678"); err == nil {
 		t.Cleanup(func() { _ = c.Close() })
