@@ -74,15 +74,19 @@ func writeCpuBurst(l *log.Entry, pid int, burst int64) {
 }
 
 func writeBurstFile(pid int, burst int64) error {
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
-	if err != nil {
-		return err
-	}
-	f, err := resolveCgroupCpuFile(string(b), cgroupV2())
+	f, err := cpuBurstFile(pid)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(f, []byte(strconv.FormatInt(burst, 10)), 0o644) //nolint:gosec // an existing cgroupfs file, the mode is never applied
+}
+
+func cpuBurstFile(pid int) (string, error) {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
+	if err != nil {
+		return "", err
+	}
+	return resolveCgroupCpuFile(string(b), cgroupV2())
 }
 
 // logBurstFailure warns the first time a burst cannot be applied and stays at
@@ -125,7 +129,33 @@ func (e *Environment) applyCpuBurst(ctx context.Context) {
 // clearCpuBurst zeroes the CFS burst for the given container process. This must
 // happen before a quota change is applied since the kernel rejects a quota lower
 // than the current burst. It runs even when bursting is disabled so a value set
-// before the feature was turned off cannot block future quota changes.
-func (e *Environment) clearCpuBurst(pid int) {
-	writeCpuBurst(e.log(), pid, 0)
+// before the feature was turned off cannot block future quota changes. The
+// returned function restores the previous value if the resource update fails.
+func (e *Environment) clearCpuBurst(pid int) func() {
+	if pid <= 0 {
+		return func() {}
+	}
+	f, err := cpuBurstFile(pid)
+	if err != nil {
+		logBurstFailure(e.log().WithError(err), 0)
+		return func() {}
+	}
+	return e.clearCpuBurstFile(f)
+}
+
+func (e *Environment) clearCpuBurstFile(f string) func() {
+	previous, err := os.ReadFile(f) //nolint:gosec // resolved kernel cgroupfs path
+	if err != nil {
+		logBurstFailure(e.log().WithError(err), 0)
+		return func() {}
+	}
+	if err := os.WriteFile(f, []byte("0"), 0o644); err != nil { //nolint:gosec // existing cgroupfs file
+		logBurstFailure(e.log().WithError(err), 0)
+		return func() {}
+	}
+	return func() {
+		if err := os.WriteFile(f, previous, 0o644); err != nil { //nolint:gosec // existing cgroupfs file
+			e.log().WithError(err).Warn("failed to restore cpu burst after resource update failure")
+		}
+	}
 }

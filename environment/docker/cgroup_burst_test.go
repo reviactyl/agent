@@ -1,6 +1,12 @@
 package docker
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestCpuBurstMicroseconds(t *testing.T) {
 	tests := []struct {
@@ -102,4 +108,32 @@ func TestResolveCgroupCpuFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClearCpuBurstRollback(t *testing.T) {
+	for _, previous := range []string{"0", "40000\n"} {
+		t.Run(previous, func(t *testing.T) {
+			f := filepath.Join(t.TempDir(), "cpu.max.burst")
+			require.NoError(t, os.WriteFile(f, []byte(previous), 0600))
+			e := &Environment{Id: "test"}
+			restore := e.clearCpuBurstFile(f)
+			b, err := os.ReadFile(f)
+			require.NoError(t, err)
+			require.Equal(t, "0", string(b), "clear before Docker lowers quota")
+			restore()
+			b, err = os.ReadFile(f)
+			require.NoError(t, err)
+			require.Equal(t, previous, string(b), "restore the actual previous value")
+		})
+	}
+}
+
+func TestClearCpuBurstWithoutReadableSnapshot(t *testing.T) {
+	e := &Environment{Id: "test"}
+	f := filepath.Join(t.TempDir(), "missing-burst")
+	restore := e.clearCpuBurstFile(f)
+	restore()
+	_, err := os.Stat(f)
+	require.True(t, os.IsNotExist(err), "do not clear burst without a rollback value")
+	e.clearCpuBurst(0)()
 }
