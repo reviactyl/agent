@@ -210,8 +210,23 @@ func postCreateServer(c *gin.Context) {
 	// cycle. If there are any errors they will be logged and communicated back
 	// to the Panel where a reinstall may take place.
 	go func(i *installer.Installer) {
+		installed := false
+		defer func() {
+			if !installed {
+				if err := manager.FailInstallation(i.Server()); err != nil {
+					i.Server().Log().WithError(err).Error("failed to retain installation recovery configuration")
+					manager.Remove(func(match *server.Server) bool { return match == i.Server() })
+				}
+				i.Server().CleanupForDestroy()
+				_ = i.Server().Filesystem().UnixFS().Close()
+			}
+		}()
+
 		if err := i.Server().CreateEnvironment(); err != nil {
 			i.Server().Log().WithField("error", err).Error("failed to create server environment during install process")
+			if err := i.Server().SyncInstallState(false, false); err != nil {
+				i.Server().Log().WithField("error", err).Warn("failed to notify panel of server install state")
+			}
 			return
 		}
 
@@ -219,6 +234,7 @@ func postCreateServer(c *gin.Context) {
 			log.WithFields(log.Fields{"server": i.Server().ID(), "error": err}).Error("failed to run install process for server")
 			return
 		}
+		installed = true
 
 		if i.StartOnCompletion {
 			log.WithField("server_id", i.Server().ID()).Debug("starting server after successful installation")

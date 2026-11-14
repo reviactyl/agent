@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,9 +23,10 @@ import (
 )
 
 type Manager struct {
-	mu      sync.RWMutex
-	client  remote.Client
-	servers []*Server
+	mu             sync.RWMutex
+	client         remote.Client
+	servers        []*Server
+	failedInstalls map[string]*remote.ServerConfigurationResponse
 }
 
 // NewManager returns a new server manager instance. This will boot up all the
@@ -74,6 +76,7 @@ func (m *Manager) Keys() []string {
 func (m *Manager) Put(s []*Server) {
 	m.mu.Lock()
 	m.servers = s
+	m.failedInstalls = nil
 	m.mu.Unlock()
 }
 
@@ -81,13 +84,14 @@ func (m *Manager) Put(s []*Server) {
 func (m *Manager) All() []*Server {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.servers
+	return slices.Clone(m.servers)
 }
 
 // Add adds an item to the collection store.
 func (m *Manager) Add(s *Server) {
 	m.mu.Lock()
 	m.servers = append(m.servers, s)
+	delete(m.failedInstalls, s.ID())
 	m.mu.Unlock()
 }
 
@@ -102,7 +106,72 @@ func (m *Manager) AddIfMissing(s *Server) bool {
 		}
 	}
 	m.servers = append(m.servers, s)
+	delete(m.failedInstalls, s.ID())
 	return true
+}
+
+// FailInstallation unregisters only the failed instance and keeps its configuration
+// available to authenticated reinstall and delete requests.
+func (m *Manager) FailInstallation(s *Server) error {
+	settings, err := json.Marshal(s.cfg.snapshot())
+	if err != nil {
+		return err
+	}
+	data := &remote.ServerConfigurationResponse{Settings: settings, ProcessConfiguration: s.ProcessConfiguration()}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s.Context().Err() != nil {
+		return nil
+	}
+	for i, current := range m.servers {
+		if current != s {
+			continue
+		}
+		m.servers = append(m.servers[:i], m.servers[i+1:]...)
+		if m.failedInstalls == nil {
+			m.failedInstalls = make(map[string]*remote.ServerConfigurationResponse)
+		}
+		m.failedInstalls[s.ID()] = data
+		break
+	}
+	return nil
+}
+
+func (m *Manager) PrepareForDeletion(s *Server) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s.CtxCancel()
+	delete(m.failedInstalls, s.ID())
+}
+
+func (m *Manager) RecoverFailedInstallation(uuid string) (*Server, error) {
+	m.mu.RLock()
+	data := m.failedInstalls[uuid]
+	m.mu.RUnlock()
+	if data == nil {
+		return nil, nil
+	}
+	s, err := m.InitServer(uuid, *data)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, current := range m.servers {
+		if current.ID() == uuid {
+			s.CleanupForDestroy()
+			_ = s.Filesystem().UnixFS().Close()
+			return current, nil
+		}
+	}
+	if m.failedInstalls[uuid] != data {
+		s.CleanupForDestroy()
+		_ = s.Filesystem().UnixFS().Close()
+		return nil, nil
+	}
+	m.servers = append(m.servers, s)
+	delete(m.failedInstalls, uuid)
+	return s, nil
 }
 
 // Get returns a single server instance and a boolean value indicating if it was
@@ -151,6 +220,13 @@ func (m *Manager) Remove(filter func(match *Server) bool) {
 		}
 	}
 	m.servers = r
+}
+
+func (m *Manager) RemoveByID(uuid string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.servers = slices.DeleteFunc(m.servers, func(s *Server) bool { return s.ID() == uuid })
+	delete(m.failedInstalls, uuid)
 }
 
 // PersistStates writes the current environment states to the disk for each
