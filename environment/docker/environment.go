@@ -29,6 +29,8 @@ type Metadata struct {
 var _ environment.ProcessEnvironment = (*Environment)(nil)
 
 type Environment struct {
+	ctx context.Context
+
 	mu        sync.RWMutex
 	commandMu *semaphore.Weighted
 
@@ -68,13 +70,14 @@ type Environment struct {
 // ID that is used to reference the container from here on out. This should be
 // unique per-server (we use the UUID by default). The container does not need
 // to exist at this point.
-func New(id string, m *Metadata, c *environment.Configuration) (*Environment, error) {
+func New(ctx context.Context, id string, m *Metadata, c *environment.Configuration) (*Environment, error) {
 	cli, err := environment.Docker()
 	if err != nil {
 		return nil, err
 	}
 
 	e := &Environment{
+		ctx:           ctx,
 		Id:            id,
 		Configuration: c,
 		meta:          m,

@@ -54,9 +54,9 @@ func TestRecoveryKeepsWatchingAfterDockerFailures(t *testing.T) {
 			cli, err := client.NewClientWithOpts(client.WithHost(strings.Replace(docker.URL, "http://", "tcp://", 1)), client.WithVersion("1.45"))
 			require.NoError(t, err)
 			defer cli.Close()
-			e := &Environment{Id: "test", client: cli, meta: &Metadata{}, st: system.NewAtomicString(environment.ProcessRunningState), emitter: events.NewBus()}
+			e := &Environment{ctx: context.Background(), Id: "test", client: cli, meta: &Metadata{}, st: system.NewAtomicString(environment.ProcessRunningState), emitter: events.NewBus()}
 			done := make(chan bool, 1)
-			go func() { done <- e.reattach("test", 0) }()
+			go func() { done <- e.reattach(context.Background(), "test", 0) }()
 			select {
 			case attached := <-done:
 				require.False(t, attached, "recovery ends only after observing the stopped container")
@@ -123,9 +123,9 @@ func TestStaleRecoveryCannotKillNewAttachment(t *testing.T) {
 	cli, err := client.NewClientWithOpts(client.WithHost(strings.Replace(docker.URL, "http://", "tcp://", 1)), client.WithVersion("1.45"))
 	require.NoError(t, err)
 	defer cli.Close()
-	e := &Environment{Id: "test", client: cli, meta: &Metadata{}, Configuration: &environment.Configuration{}, st: system.NewAtomicString(environment.ProcessRunningState), emitter: events.NewBus(), reattachedAt: time.Now(), reattachedCount: 3}
+	e := &Environment{ctx: context.Background(), Id: "test", client: cli, meta: &Metadata{}, Configuration: &environment.Configuration{}, st: system.NewAtomicString(environment.ProcessRunningState), emitter: events.NewBus(), reattachedAt: time.Now(), reattachedCount: 3}
 	done := make(chan bool, 1)
-	go func() { done <- e.reattach("old", 0) }()
+	go func() { done <- e.reattach(context.Background(), "old", 0) }()
 	select {
 	case <-killStarted:
 	case <-time.After(5 * time.Second):
@@ -147,4 +147,129 @@ func TestStaleRecoveryCannotKillNewAttachment(t *testing.T) {
 	require.Zero(t, replacementKills.Load())
 	require.True(t, e.IsAttached())
 	require.Equal(t, environment.ProcessRunningState, e.State())
+}
+
+func TestRecoveryCancellation(t *testing.T) {
+	for _, phase := range []string{"before", "backoff", "inspect", "attach", "kill"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			var requests atomic.Int32
+			docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				isInspect := strings.HasSuffix(r.URL.Path, "/json")
+				isAttach := strings.HasSuffix(r.URL.Path, "/attach")
+				isKill := strings.HasSuffix(r.URL.Path, "/kill")
+				if (phase == "inspect" && isInspect) || (phase == "attach" && isAttach) || (phase == "kill" && isKill) {
+					once.Do(func() { close(started) })
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
+				} else if phase == "backoff" {
+					once.Do(func() { close(started) })
+				} else if isInspect {
+					_, _ = w.Write([]byte(`{"Id":"test","State":{"Running":true}}`))
+					return
+				}
+				http.Error(w, "unavailable", http.StatusInternalServerError)
+			}))
+			defer docker.Close()
+			defer close(release)
+			cli, err := client.NewClientWithOpts(client.WithHost(strings.Replace(docker.URL, "http://", "tcp://", 1)), client.WithVersion("1.45"))
+			require.NoError(t, err)
+			defer cli.Close()
+			e := &Environment{Id: "test", client: cli, st: system.NewAtomicString(environment.ProcessRunningState), emitter: events.NewBus()}
+			defer e.SetStream(nil)
+			if phase == "before" {
+				cancel()
+			}
+			done := make(chan bool, 1)
+			go func() { done <- e.reattach(ctx, "test", 0) }()
+			state := e.State()
+			if phase != "before" {
+				select {
+				case <-started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("recovery did not reach " + phase)
+				}
+				state = e.State()
+				cancel()
+			}
+			select {
+			case canceled := <-done:
+				require.True(t, canceled, "cancellation must not trigger offline/crash handling")
+			case <-time.After(400 * time.Millisecond):
+				t.Fatal("cancellation did not interrupt " + phase)
+			}
+			count := requests.Load()
+			time.Sleep(1100 * time.Millisecond)
+			require.Equal(t, count, requests.Load(), "canceled recovery must not issue more Docker requests")
+			require.Equal(t, state, e.State())
+			if phase == "before" {
+				require.Zero(t, count)
+			}
+		})
+	}
+}
+
+func TestAttachmentLifetimeAndRecovery(t *testing.T) {
+	cfg, err := config.NewAtPath(t.TempDir() + "/config.yml")
+	require.NoError(t, err)
+	cfg.AuthenticationToken = "test-token"
+	cfg.Docker.UsePerformantInspect = false
+	config.Set(cfg)
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+	var unavailable atomic.Bool
+	var failures atomic.Int32
+	var attachments atomic.Int32
+	connections := make(chan net.Conn, 2)
+	docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/json"):
+			if unavailable.Load() {
+				failures.Add(1)
+				http.Error(w, "unavailable", http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"Id":"test","State":{"Running":true}}`))
+		case strings.HasSuffix(r.URL.Path, "/attach"):
+			conn, rw, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			_, _ = rw.WriteString("HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
+			_ = rw.Flush()
+			attachments.Add(1)
+			connections <- conn
+		default:
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+		}
+	}))
+	defer docker.Close()
+	cli, err := client.NewClientWithOpts(client.WithHost(strings.Replace(docker.URL, "http://", "tcp://", 1)), client.WithVersion("1.45"))
+	require.NoError(t, err)
+	defer cli.Close()
+	e := &Environment{ctx: lifetime, Id: "test", client: cli, st: system.NewAtomicString(environment.ProcessRunningState), emitter: events.NewBus()}
+	request, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	require.NoError(t, e.Attach(request))
+	conn := <-connections
+	defer conn.Close()
+	cancelRequest()
+	require.True(t, e.IsAttached(), "short attach request cancellation must not detach the server")
+	unavailable.Store(true)
+	require.NoError(t, conn.Close())
+	require.Eventually(t, func() bool { return failures.Load() >= 2 }, 4*time.Second, 10*time.Millisecond)
+	unavailable.Store(false)
+	require.Eventually(t, func() bool { return attachments.Load() == 2 && e.IsAttached() }, 4*time.Second, 10*time.Millisecond)
+	conn = <-connections
+	defer conn.Close()
+	cancelLifetime()
+	require.Eventually(t, func() bool { return !e.IsAttached() }, time.Second, 10*time.Millisecond, "server cancellation must close the stream and end recovery")
+	require.Equal(t, environment.ProcessRunningState, e.State(), "cancellation must not trigger crash detection")
 }
