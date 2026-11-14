@@ -889,6 +889,30 @@ func TestWriteUnknownSize(t *testing.T) {
 	}
 }
 
+func TestWriteRejectsShortBody(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+
+	err := fs.Write("short.txt", bytes.NewBufferString("short"), 10, 0o644)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	data, err := os.ReadFile(filepath.Join(rfs.root, "server", "short.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "short" {
+		t.Fatalf("contents = %q, want short body", data)
+	}
+	if usage := fs.CachedUsage(); usage != int64(len(data)) {
+		t.Fatalf("cached usage = %d, want %d", usage, len(data))
+	}
+
+	if err := fs.Write("complete.txt", bytes.NewBufferString("complete"), 8, 0o644); err != nil {
+		t.Fatalf("matching write failed: %v", err)
+	}
+}
+
 type streamReadFunc func([]byte) (int, error)
 
 func (r streamReadFunc) Read(p []byte) (int, error) { return r(p) }
