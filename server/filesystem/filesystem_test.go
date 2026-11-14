@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -684,6 +685,218 @@ func TestFilesystem_Copy(t *testing.T) {
 			_ = fs.TruncateRootDirectory()
 		})
 	})
+}
+
+func TestCopyFailureRemovesPartialDestination(t *testing.T) {
+	if os.Getenv("REV148_COPY_HELPER") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestCopyFailureRemovesPartialDestination$", "-test.v")
+		cmd.Env = append(os.Environ(), "REV148_COPY_HELPER=1")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("copy subprocess: %v\n%s", err, output)
+		}
+		t.Log(string(output))
+		return
+	}
+
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	contents := bytes.Repeat([]byte("copy data"), 16384)
+	if err := fs.Write("source.txt", bytes.NewReader(contents), int64(len(contents)), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Write("source copy.txt", bytes.NewBufferString("existing"), 8, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	usage := fs.CachedUsage()
+	var original syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &original); err != nil {
+		t.Fatal(err)
+	}
+	signal.Ignore(syscall.SIGXFSZ)
+	limited := original
+	limited.Cur = 49152
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &limited); err != nil {
+		t.Fatal(err)
+	}
+	err := fs.Copy("source.txt")
+	if restoreErr := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &original); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("copy error = %v, want EFBIG", err)
+	}
+	if info, err := rfs.StatServerFile("source copy 1.txt"); !os.IsNotExist(err) {
+		t.Fatalf("failed copy left destination: info=%v, error=%v", info, err)
+	}
+	entries, err := fs.ReadDir("/")
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("file list after failure: %v, %v", entries, err)
+	}
+	if fs.CachedUsage() != usage || fs.reserved != 0 {
+		t.Fatalf("failed copy usage = %d, reserved = %d, want %d and 0", fs.CachedUsage(), fs.reserved, usage)
+	}
+	if err := fs.Copy("source.txt"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	for name, want := range map[string][]byte{"source.txt": contents, "source copy.txt": []byte("existing"), "source copy 1.txt": contents} {
+		data, err := os.ReadFile(filepath.Join(rfs.root, "server", name))
+		if err != nil || !bytes.Equal(data, want) {
+			t.Fatalf("%s contents changed: %v", name, err)
+		}
+	}
+	info, err := rfs.StatServerFile("source copy 1.txt")
+	if err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("copy permissions: %v, %v", info, err)
+	}
+	if fs.CachedUsage() != usage+int64(len(contents)) {
+		t.Fatalf("successful copy usage = %d", fs.CachedUsage())
+	}
+	t.Logf("EFBIG after 49152 bytes; no partial destination; source and existing copy preserved; retry copied %d bytes", len(contents))
+}
+
+func TestRemoveFailedCopyPreservesOtherEntries(t *testing.T) {
+	for _, replacement := range []string{"file", "symlink", "directory", "missing", "renamed", "hardlink"} {
+		t.Run(replacement, func(t *testing.T) {
+			fs, rfs := NewFs()
+			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+			if err := rfs.CreateServerFileFromString("partial.txt", "partial"); err != nil {
+				t.Fatal(err)
+			}
+			dirfd, name, closeFd, err := fs.unixFS.SafePath("partial.txt")
+			defer closeFd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := fs.unixFS.OpenFileat(dirfd, name, ufs.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			path := filepath.Join(rfs.root, "server", name)
+			other := filepath.Join(rfs.root, "server", "other.txt")
+			switch replacement {
+			case "renamed":
+				err = os.Rename(path, other)
+			case "hardlink":
+				err = os.Link(path, other)
+			default:
+				err = os.Remove(path)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch replacement {
+			case "file":
+				err = os.WriteFile(path, []byte("replacement"), 0o600)
+			case "symlink":
+				err = os.WriteFile(other, []byte("replacement"), 0o600)
+				if err == nil {
+					err = os.Symlink("other.txt", path)
+				}
+			case "directory":
+				err = os.Mkdir(path, 0o700)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			freed, err := fs.removeFailedCopy(dirfd, name, file)
+			if err != nil || freed != (replacement != "renamed" && replacement != "hardlink") {
+				t.Fatalf("cleanup freed=%t, error=%v", freed, err)
+			}
+			if replacement == "file" || replacement == "symlink" {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != "replacement" {
+					t.Fatalf("replacement changed: %q, %v", data, err)
+				}
+			} else if replacement == "directory" {
+				if info, err := os.Stat(path); err != nil || !info.IsDir() {
+					t.Fatalf("replacement directory changed: %v, %v", info, err)
+				}
+			} else if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatalf("partial entry remains: %v", err)
+			}
+			if replacement == "renamed" || replacement == "hardlink" {
+				data, err := os.ReadFile(other)
+				if err != nil || string(data) != "partial" {
+					t.Fatalf("retained link changed: %q, %v", data, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRemoveFailedCopyReportsCleanupError(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	file, err := fs.unixFS.OpenFile("partial.txt", ufs.O_CREATE|ufs.O_WRONLY|ufs.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	freed, err := fs.removeFailedCopy(-1, "partial.txt", file)
+	if freed || !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("cleanup freed=%t, error=%v, want EBADF", freed, err)
+	}
+	if _, err := fs.unixFS.Lstat("partial.txt"); err != nil {
+		t.Fatalf("failed cleanup removed the file: %v", err)
+	}
+}
+
+func TestRemoveFailedCopyReconcilesDiskWalk(t *testing.T) {
+	for _, observed := range []bool{false, true} {
+		for _, unlinked := range []bool{false, true} {
+			t.Run(fmt.Sprintf("observed=%t/unlinked=%t", observed, unlinked), func(t *testing.T) {
+				fs, rfs := NewFs()
+				t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+				if err := rfs.CreateServerFileFromString("partial.txt", "partial"); err != nil {
+					t.Fatal(err)
+				}
+				file, err := fs.unixFS.Open("partial.txt")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				info, err := file.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				ino, ok := fileInode(info)
+				if !ok {
+					t.Fatal("file has no inode")
+				}
+				fs.walking = true
+				fs.walkObserved = make(map[uint64]int64)
+				fs.walkUnobserved = make(map[uint64]int64)
+				if observed {
+					fs.walkObserved[ino] = info.Size()
+				} else {
+					fs.walkUnobserved[ino] = info.Size()
+				}
+				if unlinked {
+					if err := fs.unixFS.Remove("partial.txt"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				dirfd, name, closeFd, err := fs.unixFS.SafePath("partial.txt")
+				defer closeFd()
+				if err != nil {
+					t.Fatal(err)
+				}
+				freed, err := fs.removeFailedCopy(dirfd, name, file)
+				if err != nil || !freed || len(fs.walkObserved) != 0 || len(fs.walkUnobserved) != 0 {
+					t.Fatalf("cleanup freed=%t, error=%v, walk=%v/%v", freed, err, fs.walkObserved, fs.walkUnobserved)
+				}
+				var wantDelta int64
+				if observed {
+					wantDelta = -info.Size()
+				}
+				if fs.walkCompletedDelta != wantDelta {
+					t.Fatalf("walk delta=%d, want %d", fs.walkCompletedDelta, wantDelta)
+				}
+			})
+		}
+	}
 }
 
 func TestFilesystem_Delete(t *testing.T) {

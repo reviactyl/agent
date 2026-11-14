@@ -541,6 +541,13 @@ func (fs *Filesystem) Copy(p string) error {
 	// io.ReaderFrom, which causes it to not use the buffer anyways.
 	n, err := io.Copy(lockedFilesystemWriter{fs: fs, file: dst}, io.LimitReader(source, currentSize))
 	used = n
+	if err != nil {
+		freed, cleanupErr := fs.removeFailedCopy(dirfd, newName, dst)
+		if freed {
+			used = 0
+		}
+		return errors.Combine(err, errors.WrapIf(cleanupErr, "failed to remove incomplete copy"))
+	}
 
 	if !fs.isTest {
 		if err := fs.unixFS.Lchownat(dirfd, newName, config.Get().System.User.Uid, config.Get().System.User.Gid); err != nil {
@@ -549,6 +556,47 @@ func (fs *Filesystem) Copy(p string) error {
 	}
 	// Return the error from io.Copy.
 	return err
+}
+
+func (fs *Filesystem) removeFailedCopy(dirfd int, name string, file ufs.File) (freed bool, err error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	var opened unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &opened); err != nil {
+		return false, err
+	}
+	defer func() {
+		if err != nil {
+			return
+		}
+		if err = unix.Fstat(int(file.Fd()), &opened); err != nil {
+			return
+		}
+		freed = opened.Nlink == 0
+		if freed && fs.walking {
+			if size, seen := fs.walkObserved[opened.Ino]; seen {
+				fs.walkCompletedDelta -= size
+				delete(fs.walkObserved, opened.Ino)
+			}
+			delete(fs.walkUnobserved, opened.Ino)
+		}
+	}()
+	info, err := fs.unixFS.Lstatat(dirfd, name)
+	if errors.Is(err, ufs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	current := info.Sys().(*unix.Stat_t)
+	if current.Dev != opened.Dev || current.Ino != opened.Ino {
+		return false, nil
+	}
+	if err := unix.Unlinkat(dirfd, name, 0); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // TruncateRootDirectory removes _all_ files and directories from a server's
