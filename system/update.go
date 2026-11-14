@@ -284,6 +284,30 @@ fi`
 	return true, nil
 }
 
+// RecoverInterruptedUpdate preserves recovery files until the failed supervisor
+// is stopped or systemd confirms its collected unit no longer exists.
+func RecoverInterruptedUpdate(ctx context.Context, update *InstalledUpdate) error {
+	if update == nil {
+		return errors.New("missing installed Agent update")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	unit := fmt.Sprintf("reviactyl-agent-update-%d", os.Getpid())
+	output, err := exec.CommandContext(ctx, "systemctl", "stop", unit).CombinedOutput() // #nosec G204 -- fixed systemctl command and PID-derived supervisor unit
+	if err != nil {
+		state, _ := exec.CommandContext(ctx, "systemctl", "show", "--property=LoadState", "--value", unit).Output() // #nosec G204 -- fixed systemctl command and PID-derived supervisor unit
+		if strings.TrimSpace(string(state)) != "not-found" {
+			return fmt.Errorf("stop interrupted Agent update supervisor: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+	}
+	if _, err := os.Lstat(update.BackupPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect interrupted Agent update backup: %w", err)
+	}
+	return RollbackInstalledUpdate(update)
+}
+
 func RollbackInstalledUpdate(update *InstalledUpdate) error {
 	if update == nil {
 		return errors.New("missing installed Agent update")

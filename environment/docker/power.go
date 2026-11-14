@@ -154,6 +154,10 @@ func (e *Environment) Stop(ctx context.Context) error {
 	s := e.meta.Stop
 	e.mu.RUnlock()
 
+	if e.IsAttached() && s.Type == remote.ProcessStopCommand {
+		return e.sendCommand(ctx, s.Value)
+	}
+
 	// If the process is already offline don't switch it back to stopping. Just leave it how
 	// it is and continue through to the stop handling for the process.
 	if e.st.Load() != environment.ProcessOfflineState {
@@ -181,13 +185,6 @@ func (e *Environment) Stop(ctx context.Context) error {
 
 		return e.SignalContainer(ctx, signal)
 
-	}
-
-	// Handle command based stops
-	// Only attempt to send the stop command to the instance if we are actually attached to
-	// the instance. If we are not for some reason, just send the container stop event.
-	if e.IsAttached() && s.Type == remote.ProcessStopCommand {
-		return e.SendCommand(s.Value)
 	}
 
 	if s.Type == "" {
