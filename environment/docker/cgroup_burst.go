@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -22,6 +23,42 @@ var cgroupV2 = sync.OnceValue(func() bool {
 })
 
 var burstWarning sync.Once
+
+var cpuBurstLocks = struct {
+	sync.Mutex
+	entries map[string]*cpuBurstLock
+}{entries: make(map[string]*cpuBurstLock)}
+
+type cpuBurstLock struct {
+	token chan struct{}
+	users int
+}
+
+func lockCpuBurst(ctx context.Context, containerID string) (func(), error) {
+	cpuBurstLocks.Lock()
+	entry := cpuBurstLocks.entries[containerID]
+	if entry == nil {
+		entry = &cpuBurstLock{token: make(chan struct{}, 1)}
+		cpuBurstLocks.entries[containerID] = entry
+	}
+	entry.users++
+	cpuBurstLocks.Unlock()
+	release := func() {
+		cpuBurstLocks.Lock()
+		entry.users--
+		if entry.users == 0 {
+			delete(cpuBurstLocks.entries, containerID)
+		}
+		cpuBurstLocks.Unlock()
+	}
+	select {
+	case entry.token <- struct{}{}:
+		return func() { <-entry.token; release() }, nil
+	case <-ctx.Done():
+		release()
+		return nil, ctx.Err()
+	}
+}
 
 // cpuBurstMicroseconds returns the burst allowance in microseconds for the given
 // CFS quota and configured percentage. The kernel rejects a burst larger than the
@@ -74,15 +111,19 @@ func writeCpuBurst(l *log.Entry, pid int, burst int64) {
 }
 
 func writeBurstFile(pid int, burst int64) error {
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
-	if err != nil {
-		return err
-	}
-	f, err := resolveCgroupCpuFile(string(b), cgroupV2())
+	f, err := cpuBurstFile(pid)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(f, []byte(strconv.FormatInt(burst, 10)), 0o644) //nolint:gosec // an existing cgroupfs file, the mode is never applied
+}
+
+func cpuBurstFile(pid int) (string, error) {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
+	if err != nil {
+		return "", err
+	}
+	return resolveCgroupCpuFile(string(b), cgroupV2())
 }
 
 // logBurstFailure warns the first time a burst cannot be applied and stays at
@@ -104,6 +145,17 @@ func logBurstFailure(l *log.Entry, burst int64) {
 // the CFS quota in microseconds it was created with. This is a no-op when
 // bursting is disabled or the container has no CPU limit.
 func SetCpuBurst(ctx context.Context, cli *client.Client, containerID string, quota int64) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	unlock, err := lockCpuBurst(ctx, containerID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	setCpuBurst(ctx, cli, containerID, quota)
+}
+
+func setCpuBurst(ctx context.Context, cli *client.Client, containerID string, quota int64) {
 	cfg := config.Get().Docker.CpuBurst
 	if !cfg.Enabled || quota <= 0 {
 		return
@@ -125,7 +177,33 @@ func (e *Environment) applyCpuBurst(ctx context.Context) {
 // clearCpuBurst zeroes the CFS burst for the given container process. This must
 // happen before a quota change is applied since the kernel rejects a quota lower
 // than the current burst. It runs even when bursting is disabled so a value set
-// before the feature was turned off cannot block future quota changes.
-func (e *Environment) clearCpuBurst(pid int) {
-	writeCpuBurst(e.log(), pid, 0)
+// before the feature was turned off cannot block future quota changes. The
+// returned function restores the previous value if the resource update fails.
+func (e *Environment) clearCpuBurst(pid int) func() {
+	if pid <= 0 {
+		return func() {}
+	}
+	f, err := cpuBurstFile(pid)
+	if err != nil {
+		logBurstFailure(e.log().WithError(err), 0)
+		return func() {}
+	}
+	return e.clearCpuBurstFile(f)
+}
+
+func (e *Environment) clearCpuBurstFile(f string) func() {
+	previous, err := os.ReadFile(f) //nolint:gosec // resolved kernel cgroupfs path
+	if err != nil {
+		logBurstFailure(e.log().WithError(err), 0)
+		return func() {}
+	}
+	if err := os.WriteFile(f, []byte("0"), 0o644); err != nil { //nolint:gosec // existing cgroupfs file
+		logBurstFailure(e.log().WithError(err), 0)
+		return func() {}
+	}
+	return func() {
+		if err := os.WriteFile(f, previous, 0o644); err != nil { //nolint:gosec // existing cgroupfs file
+			e.log().WithError(err).Warn("failed to restore cpu burst after resource update failure")
+		}
+	}
 }

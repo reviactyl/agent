@@ -92,12 +92,12 @@ func CaptureErrors() gin.HandlerFunc {
 // SetAccessControlHeaders sets the access request control headers on all of
 // the requests.
 func SetAccessControlHeaders() gin.HandlerFunc {
-	cfg := config.Get()
-	origins := cfg.AllowedOrigins
-	location := cfg.PanelLocation
-	allowPrivateNetwork := cfg.AllowCORSPrivateNetwork
-
 	return func(c *gin.Context) {
+		cfg := config.Get()
+		origins := cfg.AllowedOrigins
+		location := cfg.PanelLocation
+		allowPrivateNetwork := cfg.AllowCORSPrivateNetwork
+
 		c.Header("Access-Control-Allow-Origin", location)
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")

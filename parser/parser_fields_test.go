@@ -32,6 +32,37 @@ func TestMissingConfigurationKeyKeepsPlaceholder(t *testing.T) {
 	assert.Equal(t, "{{config.docker.missing}}", got, "a missing key should leave the placeholder in place")
 }
 
+func TestConfigurationPlaceholderExpansion(t *testing.T) {
+	f := ConfigurationFile{configuration: []byte(`{"docker":{"interface":"eth0","network":{"interface":"172.18.0.1"}},"name":"$1-${value}-$$","nested":"{{config.docker.interface}}","enabled":true,"port":25565,"items":["first"]}`)}
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"distinct", "{{config.docker.interface}}:{{config.docker.network.interface}}", "eth0:172.18.0.1"},
+		{"repeated and distinct", "{{config.docker.interface}}/{{config.docker.network.interface}}/{{config.docker.interface}}", "eth0/172.18.0.1/eth0"},
+		{"literal text", "prefix [{{ config.docker.interface }}]:{{config.docker.network.interface}} suffix $1", "prefix [eth0]:172.18.0.1 suffix $1"},
+		{"known then unknown", "{{config.docker.interface}}:{{config.missing}}", "eth0:{{config.missing}}"},
+		{"unknown then known", "{{config.missing}}:{{config.docker.network.interface}}", "{{config.missing}}:172.18.0.1"},
+		{"non scalar then known", "{{config.docker}}:{{config.items}}:{{config.docker.interface}}", "{{config.docker}}:{{config.items}}:eth0"},
+		{"literal dollar values", "{{config.name}}:{{config.docker.interface}}", "$1-${value}-$$:eth0"},
+		{"single pass", "{{config.nested}}:{{config.docker.network.interface}}", "{{config.docker.interface}}:172.18.0.1"},
+		{"scalar values", "{{config.enabled}}:{{config.port}}", "true:25565"},
+		{"no placeholders", "literal $1 {{other.value}}", "literal $1 {{other.value}}"},
+		{"unknown only", "{{config.missing}}", "{{config.missing}}"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := json.Marshal(tc.value)
+			require.NoError(t, err)
+			cfr := replacement(t, `{"match":"value","replace_with":`+string(value)+`}`)
+			got, err := f.LookupConfigurationValue(cfr)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // A configuration file entry that is missing a field is refused when it is decoded.
 func TestConfigurationFileWithoutParserKeyReturnsError(t *testing.T) {
 	var f ConfigurationFile
