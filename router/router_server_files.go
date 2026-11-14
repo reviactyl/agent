@@ -201,29 +201,32 @@ func postServerDeleteFiles(c *gin.Context) {
 		return
 	}
 
-	g, ctx := errgroup.WithContext(context.Background())
-
-	// Loop over the array of files passed in and delete them. If any of the file deletions
-	// fail just abort the process entirely.
-	for _, p := range data.Files {
-		pi := path.Join(data.Root, p)
-
-		g.Go(func() error {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				return s.Filesystem().Delete(pi)
-			}
-		})
-	}
-
-	if err := g.Wait(); err != nil {
+	if err := deleteFiles(c.Request.Context(), data.Root, data.Files, s.Filesystem().Delete); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+func deleteFiles(requestCtx context.Context, root string, files []string, remove func(string) error) error {
+	g, ctx := errgroup.WithContext(requestCtx)
+	g.SetLimit(4)
+	for _, p := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return remove(path.Join(root, p))
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return requestCtx.Err()
 }
 
 // Writes the contents of the request to a file on a server.
@@ -277,10 +280,7 @@ func writeServerFile(c *gin.Context, createOnly bool) {
 	c.Status(http.StatusNoContent)
 }
 
-// Returns all of the currently in-progress file downloads and their current download
-// progress. The progress is also pushed out via a websocket event allowing you to just
-// call this once to get current downloads, and then listen to targeted websocket events
-// with the current progress for everything.
+// Returns active downloads and recent background failures for this server.
 func getServerPullingFiles(c *gin.Context) {
 	s := ExtractServer(c)
 	c.JSON(http.StatusOK, gin.H{
@@ -327,10 +327,11 @@ func postServerPullRemoteFile(c *gin.Context) {
 	}
 
 	dl := downloader.New(s, downloader.DownloadRequest{
-		Directory: data.RootPath,
-		URL:       u,
-		FileName:  data.FileName,
-		UseHeader: data.UseHeader,
+		Directory:     data.RootPath,
+		URL:           u,
+		FileName:      data.FileName,
+		UseHeader:     data.UseHeader,
+		RetainFailure: !data.Foreground,
 	})
 	// Do not allow more than three simultaneous remote file downloads at one time.
 	if dl == nil {
@@ -492,7 +493,8 @@ func postServerDecompressFiles(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
 	lg.Debug("checking if space is available for file decompression")
-	err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File)
+	ctx := c.Request.Context()
+	err := s.Filesystem().SpaceAvailableForDecompression(ctx, data.RootPath, data.File)
 	if err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
 			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
@@ -504,7 +506,7 @@ func postServerDecompressFiles(c *gin.Context) {
 	}
 
 	lg.Info("starting file decompression")
-	if err := s.Filesystem().DecompressFile(context.Background(), data.RootPath, data.File); err != nil {
+	if err := s.Filesystem().DecompressFile(ctx, data.RootPath, data.File); err != nil {
 		// If the file is busy for some reason just return a nicer error to the user since there is not
 		// much we specifically can do. They'll need to stop the running server process in order to overwrite
 		// a file like this.

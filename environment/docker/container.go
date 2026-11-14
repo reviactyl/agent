@@ -563,7 +563,7 @@ func (e *Environment) Readlog(lines int) ([]string, error) {
 		out = append(out, scanner.Text())
 	}
 
-	return out, nil
+	return out, errors.WithStack(scanner.Err())
 }
 
 // Pulls the image from Docker. If there is an error while pulling the image
