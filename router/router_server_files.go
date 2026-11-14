@@ -136,6 +136,13 @@ func putServerRenameFiles(c *gin.Context) {
 	}
 
 	if err := g.Wait(); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+				"error": "The requested resource was not found on the system.",
+			})
+			return
+		}
+
 		if errors.Is(err, os.ErrExist) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Cannot move or rename file, destination already exists.",

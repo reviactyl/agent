@@ -25,8 +25,7 @@ func TestRenameFileReportsMissingSource(t *testing.T) {
 	res := renameFileRequest(t, u, "missing.txt", "renamed.txt")
 	defer res.Body.Close()
 
-	require.NotEqual(t, http.StatusNoContent, res.StatusCode)
-	require.GreaterOrEqual(t, res.StatusCode, http.StatusBadRequest)
+	require.Equal(t, http.StatusNotFound, res.StatusCode)
 	_, err := os.Stat(filepath.Join(u.root, "renamed.txt"))
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
