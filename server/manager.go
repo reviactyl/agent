@@ -308,7 +308,7 @@ func (m *Manager) InitServer(uuid string, data remote.ServerConfigurationRespons
 		Image: s.Config().Container.Image,
 	}
 
-	if env, err := docker.New(s.ID(), &meta, envCfg); err != nil {
+	if env, err := docker.New(s.Context(), s.ID(), &meta, envCfg); err != nil {
 		return nil, err
 	} else {
 		s.Environment = env

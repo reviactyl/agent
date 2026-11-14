@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -13,10 +14,12 @@ import (
 	"github.com/apex/log"
 	"github.com/buger/jsonparser"
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/reviactyl/agent/config"
@@ -48,9 +51,8 @@ func (nw noopWriter) Write(b []byte) (int, error) {
 // you have started the container, but after you've ensured it exists.
 //
 // Calling this function will poll resources for the container in the background
-// until the container is stopped. The context provided to this function is used
-// for the purposes of attaching to the container, a second context is created
-// within the function for managing polling.
+// until the container is stopped or the server is deleted. The provided context
+// bounds the initial attach request; polling and recovery use the server lifetime.
 func (e *Environment) Attach(ctx context.Context) error {
 	e.mu.RLock()
 	generation := e.streamGeneration
@@ -70,14 +72,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 }
 
 func (e *Environment) attach(ctx context.Context, containerID string, generation uint64) error {
-	opts := container.AttachOptions{
-		Stdin:  true,
-		Stdout: true,
-		Stderr: true,
-		Stream: true,
-	}
-
-	st, err := e.client.ContainerAttach(ctx, containerID, opts)
+	st, err := e.attachStream(ctx, containerID)
 	if err != nil {
 		return errors.WrapIf(err, "environment/docker: error while attaching to container")
 	}
@@ -92,14 +87,13 @@ func (e *Environment) attach(ctx context.Context, containerID string, generation
 	e.stream = &st
 	e.mu.Unlock()
 
-	go func() { //nolint:gosec // polling intentionally outlives ctx, see below
-		// Don't use the context provided to the function, that'll cause the polling to
-		// exit unexpectedly. We want a custom context for this, the one passed to the
-		// function is to avoid a hang situation when trying to attach to a container.
-		pollCtx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		defer st.Close()
+	go func() {
+		pollCtx, cancel := context.WithCancel(e.ctx)
+		stopClose := context.AfterFunc(pollCtx, st.Close)
 		defer func() {
+			cancel()
+			stopClose()
+			st.Close()
 			e.mu.Lock()
 			if e.streamGeneration != generation {
 				e.mu.Unlock()
@@ -109,7 +103,7 @@ func (e *Environment) attach(ctx context.Context, containerID string, generation
 			e.mu.Unlock()
 			// The stream can end without the container stopping, in which case it is
 			// attached to again rather than treating the server as stopped.
-			if e.reattach(containerID, generation) {
+			if e.reattach(e.ctx, containerID, generation) {
 				return
 			}
 			e.setRecoveryState(generation, environment.ProcessOfflineState)
@@ -138,29 +132,76 @@ func (e *Environment) attach(ctx context.Context, containerID string, generation
 	return nil
 }
 
+// Docker's hijack handshake does not close its connection on context cancellation.
+func (e *Environment) attachStream(ctx context.Context, containerID string) (types.HijackedResponse, error) {
+	var stopClose func() bool
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(e.client.DaemonHost()),
+		client.WithVersion(e.client.ClientVersion()),
+		client.WithDialContext(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			conn, err := e.client.Dialer()(ctx)
+			if err == nil {
+				stopClose = context.AfterFunc(ctx, func() { _ = conn.Close() })
+			}
+			return conn, err
+		}),
+	)
+	if err != nil {
+		return types.HijackedResponse{}, err
+	}
+	defer cli.Close()
+	defer func() {
+		if stopClose != nil {
+			stopClose()
+		}
+	}()
+	st, err := cli.ContainerAttach(ctx, containerID, container.AttachOptions{
+		Stdin: true, Stdout: true, Stderr: true, Stream: true,
+	})
+	if ctx.Err() != nil {
+		if err == nil {
+			st.Close()
+		}
+		return types.HijackedResponse{}, ctx.Err()
+	}
+	return st, err
+}
+
 // reattach retries recovery for the original container. It returns true when a
-// newer stream or lifecycle owns the process state.
-func (e *Environment) reattach(containerID string, generation uint64) bool {
+// newer stream or lifecycle owns the process state, or recovery was canceled.
+func (e *Environment) reattach(ctx context.Context, containerID string, generation uint64) bool {
 	for {
-		attached, retry := e.recoverAttachment(containerID, generation)
+		attached, retry := e.recoverAttachment(ctx, containerID, generation)
 		if !retry {
 			return attached
 		}
-		time.Sleep(time.Second)
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return true
+		case <-timer.C:
+		}
 	}
 }
 
-func (e *Environment) recoverAttachment(containerID string, generation uint64) (attached, retry bool) {
+func (e *Environment) recoverAttachment(ctx context.Context, containerID string, generation uint64) (attached, retry bool) {
+	if ctx.Err() != nil {
+		return true, false
+	}
 	e.mu.RLock()
 	current := e.streamGeneration == generation && e.stream == nil
 	e.mu.RUnlock()
 	if !current {
 		return true, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	rctx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 
-	c, err := e.client.ContainerInspect(ctx, containerID)
+	c, err := e.client.ContainerInspect(rctx, containerID)
+	if ctx.Err() != nil {
+		return true, false
+	}
 	if cerrdefs.IsNotFound(err) || (err == nil && c.State != nil && !c.State.Running) {
 		return false, false
 	}
@@ -184,27 +225,37 @@ func (e *Environment) recoverAttachment(containerID string, generation uint64) (
 
 	if count <= 3 {
 		e.log().Warn("lost the attached stream for a running container, attaching again")
-		err := e.attach(ctx, containerID, generation)
+		err := e.attach(rctx, containerID, generation)
 		if err == nil {
+			return true, false
+		}
+		if ctx.Err() != nil {
 			return true, false
 		}
 		// The container may have only just stopped, in which case it is handled like
 		// any other stop so that crash detection still applies.
-		if c, ierr := e.client.ContainerInspect(ctx, containerID); ierr == nil && c.State != nil && !c.State.Running {
+		if c, ierr := e.client.ContainerInspect(rctx, containerID); ierr == nil && c.State != nil && !c.State.Running {
 			return false, false
 		}
 		e.log().WithField("error", err).Error("failed to attach to running container")
 	}
 
+	if ctx.Err() != nil {
+		return true, false
+	}
 	e.log().Error("unable to stay attached to running container, terminating it")
 	// Attaching may have used up the time allowed by ctx, which would leave the
 	// container running without being managed.
-	tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
+	tctx, tcancel := context.WithTimeout(ctx, time.Second*30)
 	defer tcancel()
 	if !e.setRecoveryState(generation, environment.ProcessStoppingState) {
 		return true, false
 	}
-	if err := e.client.ContainerKill(tctx, containerID, "SIGKILL"); err != nil && !cerrdefs.IsNotFound(err) {
+	err = e.client.ContainerKill(tctx, containerID, "SIGKILL")
+	if ctx.Err() != nil {
+		return true, false
+	}
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		e.log().WithField("error", err).Error("failed to terminate container")
 		return false, true
 	}
