@@ -149,18 +149,21 @@ type Download struct {
 	req        DownloadRequest
 	server     *server.Server
 	progress   float64
-	cancelFunc *context.CancelFunc
+	cancelFunc context.CancelFunc
+	canceled   bool
 }
 
 // New starts a new tracked download which allows for cancellation later on by calling
-// the Downloader.Cancel function.
+// Download.Cancel. It returns nil if the server already has three downloads.
 func New(s *server.Server, r DownloadRequest) *Download {
 	dl := Download{
 		Identifier: uuid.Must(uuid.NewRandom()).String(),
 		req:        r,
 		server:     s,
 	}
-	instance.track(&dl)
+	if !instance.track(&dl) {
+		return nil
+	}
 	return &dl
 }
 
@@ -199,7 +202,14 @@ func (dl *Download) MarshalJSON() ([]byte, error) {
 // completed the download will be removed from the cache.
 func (dl *Download) Execute() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*12)
-	dl.cancelFunc = &cancel
+	dl.mu.Lock()
+	if dl.canceled {
+		dl.mu.Unlock()
+		cancel()
+		return context.Canceled
+	}
+	dl.cancelFunc = cancel
+	dl.mu.Unlock()
 	defer dl.Cancel()
 
 	// At this point we have verified the destination is not within the local network, so we can
@@ -269,8 +279,12 @@ func (dl *Download) Execute() error {
 // Cancel cancels a running download and frees up the associated resources. If a file is being
 // written a partial file will remain present on the disk.
 func (dl *Download) Cancel() {
-	if dl.cancelFunc != nil {
-		(*dl.cancelFunc)()
+	dl.mu.Lock()
+	dl.canceled = true
+	cancel := dl.cancelFunc
+	dl.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	instance.remove(dl.Identifier)
 }
@@ -316,10 +330,13 @@ type Downloader struct {
 }
 
 // track tracks a download in the internal cache for this instance.
-func (d *Downloader) track(dl *Download) {
+func (d *Downloader) track(dl *Download) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	sid := dl.server.ID()
+	if len(d.serverCache[sid]) >= 3 {
+		return false
+	}
 	if _, ok := d.downloadCache[dl.Identifier]; !ok {
 		d.downloadCache[dl.Identifier] = dl
 		if _, ok := d.serverCache[sid]; !ok {
@@ -327,6 +344,7 @@ func (d *Downloader) track(dl *Download) {
 		}
 		d.serverCache[sid] = append(d.serverCache[sid], dl.Identifier)
 	}
+	return true
 }
 
 // find finds a given download entry using the provided ID and returns it.

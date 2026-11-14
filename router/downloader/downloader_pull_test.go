@@ -3,6 +3,7 @@ package downloader
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -129,4 +130,113 @@ func TestDownloadConnectionFailureIsDownloadError(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, IsDownloadError(err), "got %v", err)
 	require.ErrorIs(t, err, ErrDownloadFailed)
+}
+
+func TestDownloadConcurrentAdmission(t *testing.T) {
+	s := newPullTestServer(t)
+	t.Cleanup(s.CleanupForDestroy)
+	start := make(chan struct{})
+	results := make(chan *Download, 4)
+	for range 4 {
+		go func() {
+			<-start
+			results <- New(s, DownloadRequest{})
+		}()
+	}
+	close(start)
+	var admitted []*Download
+	for range 4 {
+		if dl := <-results; dl != nil {
+			admitted = append(admitted, dl)
+		}
+	}
+	t.Cleanup(func() {
+		for _, dl := range admitted {
+			dl.Cancel()
+		}
+	})
+	require.Len(t, admitted, 3)
+	require.Len(t, ByServer(s.ID()), 3)
+	require.Nil(t, New(s, DownloadRequest{}))
+
+	const otherID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+	other, err := server.NewEmptyManager(nil).InitServer(otherID, remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"` + otherID + `"}`)})
+	require.NoError(t, err)
+	t.Cleanup(other.CleanupForDestroy)
+	independent := New(other, DownloadRequest{})
+	require.NotNil(t, independent)
+	defer independent.Cancel()
+
+	admitted[0].Cancel()
+	replacement := New(s, DownloadRequest{})
+	require.NotNil(t, replacement)
+	defer replacement.Cancel()
+	require.Len(t, ByServer(s.ID()), 3)
+	require.Nil(t, New(s, DownloadRequest{}))
+}
+
+func TestDownloadAdmissionReleasesSlot(t *testing.T) {
+	for _, outcome := range []string{"complete", "cancel", "failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			s := newPullTestServer(t)
+			t.Cleanup(s.CleanupForDestroy)
+			started, release := make(chan struct{}), make(chan struct{})
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(started)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+				if outcome == "failure" {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+				_, _ = w.Write([]byte("downloaded"))
+			}))
+			defer origin.Close()
+			u, err := url.Parse(origin.URL + "/file")
+			require.NoError(t, err)
+			dl := New(s, DownloadRequest{URL: u})
+			require.NotNil(t, dl)
+			defer dl.Cancel()
+			for range 2 {
+				other := New(s, DownloadRequest{})
+				require.NotNil(t, other)
+				defer other.Cancel()
+			}
+			require.Nil(t, New(s, DownloadRequest{}))
+			done := make(chan error, 1)
+			go func() { done <- dl.Execute() }()
+			<-started
+			if outcome == "cancel" {
+				dl.Cancel()
+			} else {
+				close(release)
+			}
+			err = <-done
+			if outcome == "complete" {
+				require.NoError(t, err)
+				require.FileExists(t, filepath.Join(s.Filesystem().Path(), "file"))
+			} else {
+				require.Error(t, err)
+			}
+			require.Nil(t, ByID(dl.Identifier))
+			replacement := New(s, DownloadRequest{})
+			require.NotNil(t, replacement)
+			defer replacement.Cancel()
+			require.Len(t, ByServer(s.ID()), 3)
+			require.Nil(t, New(s, DownloadRequest{}))
+		})
+	}
+}
+
+func TestCanceledDownloadDoesNotExecute(t *testing.T) {
+	s := newPullTestServer(t)
+	t.Cleanup(s.CleanupForDestroy)
+	dl := New(s, DownloadRequest{})
+	require.NotNil(t, dl)
+	dl.Cancel()
+	require.ErrorIs(t, dl.Execute(), context.Canceled)
+	require.Empty(t, ByServer(s.ID()))
 }
