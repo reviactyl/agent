@@ -410,17 +410,16 @@ func (e *Environment) Destroy() error {
 		Force:         true,
 	})
 
-	e.SetState(environment.ProcessOfflineState)
-
 	// Don't trigger a destroy failure if we try to delete a container that does not
 	// exist on the system. We're just a step ahead of ourselves in that case.
 	//
 	// @see https://github.com/pterodactyl/panel/issues/2001
-	if err != nil && cerrdefs.IsNotFound(err) {
-		return nil
+	if err != nil && !cerrdefs.IsNotFound(err) {
+		return err
 	}
 
-	return err
+	e.SetState(environment.ProcessOfflineState)
+	return nil
 }
 
 // SendCommand sends the specified command to the stdin of the running container
