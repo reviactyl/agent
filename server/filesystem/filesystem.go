@@ -270,6 +270,9 @@ func (fs *Filesystem) write(p string, r io.Reader, newSize int64, mode ufs.FileM
 		// Do not use CopyBuffer here, it is wasteful as the file implements
 		// io.ReaderFrom, which causes it to not use the buffer anyways.
 		n, err = io.Copy(lockedFilesystemWriter{fs: fs, file: file}, io.LimitReader(r, newSize))
+		if err == nil && n != newSize {
+			err = io.ErrUnexpectedEOF
+		}
 	}
 
 	// Adjust the disk usage to account for the old size and the new size of the file.
