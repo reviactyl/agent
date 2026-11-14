@@ -348,3 +348,32 @@ func TestStopContextCancelsQueuedAndBlockedCommands(t *testing.T) {
 		})
 	}
 }
+
+func TestWaitForStopDeadlineBoundsCommandDelivery(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(map[bool]string{false: "writing", true: "queued"}[queued], func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+			conn := &signaledCommandConn{Conn: e.stream.Conn, started: make(chan struct{}, 2)}
+			e.SetStream(&types.HijackedResponse{Conn: conn})
+			if queued {
+				first := make(chan error, 1)
+				go func() { first <- e.SendCommand("say hello") }()
+				<-conn.started
+				defer func() { _ = input.Close(); <-first }()
+			}
+			done := make(chan error, 1)
+			go func() { done <- e.WaitForStop(context.Background(), 20*time.Millisecond, false) }()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			case <-time.After(time.Second):
+				_ = input.Close()
+				<-done
+				t.Fatal("stop deadline did not bound command delivery")
+			}
+			require.Equal(t, environment.ProcessRunningState, e.State())
+		})
+	}
+}

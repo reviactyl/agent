@@ -492,6 +492,8 @@ func (e *Environment) sendCommand(ctx context.Context, c string) error {
 	}
 	if err != nil && ctx.Err() != nil {
 		err = ctx.Err()
+	} else if err != nil && !time.Now().Before(deadline) {
+		err = context.DeadlineExceeded
 	}
 	if err != nil && generation != 0 && n < stopEnd {
 		e.mu.Lock()
