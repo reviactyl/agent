@@ -17,9 +17,11 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/system"
 )
 
@@ -215,12 +217,8 @@ func (e *Environment) setRecoveryState(generation uint64, state string) bool {
 		e.mu.Unlock()
 		return false
 	}
-	previous := e.st.Load()
-	e.st.Store(state)
+	e.setStateLocked(state)
 	e.mu.Unlock()
-	if previous != state {
-		e.Events().Publish(environment.StateChangeEvent, state)
-	}
 	return true
 }
 
@@ -429,11 +427,30 @@ func (e *Environment) Destroy() error {
 // instance. There is no confirmation that this data is sent successfully, only
 // that it gets pushed into the stdin.
 func (e *Environment) SendCommand(c string) error {
-	// Commands may contain tabs and line breaks, but no other control characters.
+	return e.sendCommand(context.Background(), c)
+}
+
+func (e *Environment) sendCommand(ctx context.Context, c string) error {
 	if strings.ContainsFunc(c, func(r rune) bool {
 		return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0x7f
 	}) {
 		return errors.New("environment/docker: command contains control characters")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, commandWriteTimeout)
+	defer cancel()
+	e.mu.Lock()
+	if e.commandMu == nil {
+		e.commandMu = semaphore.NewWeighted(1)
+	}
+	commandMu := e.commandMu
+	e.mu.Unlock()
+	if err := commandMu.Acquire(ctx, 1); err != nil {
+		return errors.Wrap(err, "environment/docker: cannot acquire command stream")
+	}
+	defer commandMu.Release(1)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	e.mu.RLock()
@@ -444,24 +461,88 @@ func (e *Environment) SendCommand(c string) error {
 		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
 	}
 
-	// If the command being processed is the same as the process stop command then we
-	// want to mark the server as entering the stopping state otherwise the process will
-	// stop and Agent will think it has crashed and attempt to restart it.
-	if stop.Type == "command" {
-		for _, command := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
-			if command == stop.Value {
-				e.SetState(environment.ProcessStoppingState)
+	payload := c + "\n"
+	var stopEnd int
+	if stop.Type == remote.ProcessStopCommand {
+		stopEnd = stopCommandEnd(payload, stop.Value)
+	}
+	var previousState string
+	var generation uint64
+	if stopEnd != 0 {
+		e.mu.Lock()
+		previousState = e.State()
+		e.setStateLocked(environment.ProcessStoppingState)
+		generation = e.stateGeneration
+		e.mu.Unlock()
+	}
+
+	deadline, _ := ctx.Deadline()
+	_ = stream.Conn.SetWriteDeadline(deadline)
+	canceled := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = stream.Conn.SetWriteDeadline(time.Now())
+		close(canceled)
+	})
+	n, err := stream.Conn.Write([]byte(payload))
+	if !stopCancellation() {
+		<-canceled
+	}
+	if err == nil && n != len(payload) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && ctx.Err() != nil {
+		err = ctx.Err()
+	} else if err != nil && !time.Now().Before(deadline) {
+		err = context.DeadlineExceeded
+	}
+	if err != nil && generation != 0 && n < stopEnd {
+		e.mu.Lock()
+		if e.stateGeneration == generation {
+			e.setStateLocked(previousState)
+		}
+		e.mu.Unlock()
+	}
+
+	return errors.Wrap(err, "environment/docker: could not write to container stream")
+}
+
+func stopCommandEnd(payload, stop string) int {
+	stop = strings.ReplaceAll(stop, "\r\n", "\n")
+	stop = strings.TrimRight(strings.ReplaceAll(stop, "\r", "\n"), "\n")
+	if stop == "" {
+		return 0
+	}
+	target := strings.Split(stop, "\n")
+	type commandLine struct {
+		value string
+		end   int
+	}
+	var lines []commandLine
+	start := 0
+	for i := 0; i < len(payload); i++ {
+		if payload[i] != '\r' && payload[i] != '\n' {
+			continue
+		}
+		value := payload[start:i]
+		if payload[i] == '\r' && i+1 < len(payload) && payload[i+1] == '\n' {
+			i++
+		}
+		lines = append(lines, commandLine{value: value, end: i + 1})
+		start = i + 1
+	}
+	for i := 0; i+len(target) <= len(lines); i++ {
+		matched := true
+		for j, value := range target {
+			if lines[i+j].value != value {
+				matched = false
 				break
 			}
 		}
+		if matched {
+			return lines[i+len(target)-1].end
+		}
 	}
-
-	// The process may never read its input, so don't wait forever for there to be
-	// room for the command.
-	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
-	_, err := stream.Conn.Write([]byte(c + "\n"))
-
-	return errors.Wrap(err, "environment/docker: could not write to container stream")
+	return 0
 }
 
 // Readlog reads the log file for the server. This does not care if the server

@@ -1,0 +1,117 @@
+package router
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/router/downloader"
+	"github.com/reviactyl/agent/server"
+)
+
+func TestRemoteDownloadRuntimeConfiguration(t *testing.T) {
+	t.Setenv("AGENT_TOKEN_ID", "")
+	t.Setenv("AGENT_TOKEN", "")
+	previous := config.Get()
+	t.Cleanup(func() { config.Set(previous) })
+
+	for _, initiallyDisabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("initially_disabled_%t", initiallyDisabled), func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yml")
+			cfg, err := config.NewAtPath(configPath)
+			require.NoError(t, err)
+			cfg.AuthenticationTokenId = "test-id"
+			cfg.AuthenticationToken = "test-token"
+			cfg.System.Data = t.TempDir()
+			cfg.Api.DisableRemoteDownload = initiallyDisabled
+			require.NoError(t, cfg.ResolveToken(false))
+			config.Set(cfg)
+			manager := server.NewEmptyManager(backupTestRemoteClient{})
+			const id = "14114114-1141-4141-8141-141141141141"
+			s, err := manager.InitServer(id, remote.ServerConfigurationResponse{Settings: []byte(`{"uuid":"` + id + `"}`)})
+			require.NoError(t, err)
+			t.Cleanup(s.CleanupForDestroy)
+			manager.Add(s)
+			engine := Configure(manager, manager.Client())
+			request := func(method, path, token, body string) *httptest.ResponseRecorder {
+				t.Helper()
+				req := httptest.NewRequest(method, path, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				if token != "" {
+					req.Header.Set("Authorization", "Bearer "+token)
+				}
+				rec := httptest.NewRecorder()
+				engine.ServeHTTP(rec, req)
+				return rec
+			}
+			for _, disabled := range []bool{initiallyDisabled, !initiallyDisabled, initiallyDisabled} {
+				body := fmt.Sprintf(`{"api":{"disable_remote_download":%t}}`, disabled)
+				require.Equal(t, http.StatusUnauthorized, request(http.MethodPost, "/api/update", "", body).Code)
+				require.Equal(t, http.StatusForbidden, request(http.MethodPost, "/api/update", "wrong-token", body).Code)
+				update := request(http.MethodPost, "/api/update", "test-token", body)
+				require.Equal(t, http.StatusOK, update.Code, update.Body.String())
+				require.JSONEq(t, `{"applied":true}`, update.Body.String())
+				require.Equal(t, disabled, config.Get().Api.DisableRemoteDownload)
+				persisted, err := os.ReadFile(configPath)
+				require.NoError(t, err)
+				require.Contains(t, string(persisted), fmt.Sprintf("disable_remote_download: %t", disabled))
+				require.Equal(t, http.StatusOK, request(http.MethodPost, "/api/update", "test-token", `{}`).Code)
+				require.Equal(t, disabled, config.Get().Api.DisableRemoteDownload, "omitted setting must be preserved")
+
+				for _, route := range []struct {
+					method string
+					suffix string
+					status int
+				}{
+					{http.MethodGet, "", http.StatusOK},
+					{http.MethodPost, "", http.StatusBadRequest},
+					{http.MethodDelete, "/14114114-1141-4141-8141-141141141141", http.StatusNoContent},
+				} {
+					path := "/api/servers/" + id + "/files/pull" + route.suffix
+					var dl *downloader.Download
+					if route.method == http.MethodDelete {
+						dl = downloader.New(s, downloader.DownloadRequest{})
+						require.NotNil(t, dl)
+						t.Cleanup(dl.Cancel)
+						path = "/api/servers/" + id + "/files/pull/" + dl.Identifier
+					}
+					require.Equal(t, http.StatusUnauthorized, request(route.method, path, "", `{}`).Code)
+					require.Equal(t, http.StatusForbidden, request(route.method, path, "wrong-token", `{}`).Code)
+					rec := request(route.method, path, "test-token", `{}`)
+					if disabled && route.method != http.MethodDelete {
+						require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+						require.JSONEq(t, `{"error":"This functionality is not currently enabled on this instance."}`, rec.Body.String())
+					} else {
+						require.Equal(t, route.status, rec.Code, rec.Body.String())
+						require.NotContains(t, rec.Body.String(), "This functionality is not currently enabled")
+					}
+					if dl != nil {
+						require.Nil(t, downloader.ByID(dl.Identifier), "cancellation frees the download slot even when disabled")
+						require.ErrorIs(t, dl.Execute(), context.Canceled)
+					}
+				}
+			}
+			var updates sync.WaitGroup
+			updates.Go(func() {
+				for i := range 1000 {
+					config.Update(func(c *config.Configuration) { c.Api.DisableRemoteDownload = i%2 == 0 })
+				}
+			})
+			defer updates.Wait()
+			for range 100 {
+				rec := request(http.MethodGet, "/api/servers/"+id+"/files/pull", "test-token", "")
+				require.Contains(t, []int{http.StatusOK, http.StatusBadRequest}, rec.Code)
+			}
+		})
+	}
+}

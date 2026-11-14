@@ -2,8 +2,11 @@ package router
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -220,6 +223,67 @@ func TestPostSystemUpdateRejectsConcurrentAttempts(t *testing.T) {
 	}
 }
 
+func TestPostSystemUpdateKeepsLockDuringActiveOperation(t *testing.T) {
+	originalType := system.InstallationType
+	originalInstall := installSystemUpdate
+	originalRestart := restartAfterSystemUpdate
+	t.Cleanup(func() {
+		system.InstallationType = originalType
+		installSystemUpdate = originalInstall
+		restartAfterSystemUpdate = originalRestart
+		systemUpdateInProgress.Store(false)
+	})
+	system.InstallationType = "native"
+
+	for _, phase := range []string{"install", "restart"} {
+		t.Run(phase, func(t *testing.T) {
+			systemUpdateInProgress.Store(false)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			finished := make(chan struct{})
+			defer func() {
+				close(release)
+				<-finished
+			}()
+			installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
+				if phase == "install" {
+					close(entered)
+					<-release
+					return nil, errors.New("install failed")
+				}
+				return nil, nil
+			}
+			restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+				close(entered)
+				<-release
+				return true, errors.New("restart failed")
+			}
+			engine := gin.New()
+			engine.Use(middleware.CaptureErrors())
+			engine.POST("/api/system/update", postSystemUpdate)
+			requestUpdate := func() *httptest.ResponseRecorder {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+				request.Header.Set("Content-Type", "application/json")
+				engine.ServeHTTP(recorder, request)
+				return recorder
+			}
+			go func() {
+				defer close(finished)
+				requestUpdate()
+			}()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("update did not enter blocked operation")
+			}
+			if response := requestUpdate(); response.Code != http.StatusConflict {
+				t.Fatalf("concurrent update during %s returned %d, expected conflict", phase, response.Code)
+			}
+		})
+	}
+}
+
 func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	originalType := system.InstallationType
 	originalInstall := installSystemUpdate
@@ -278,15 +342,30 @@ func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T)
 	originalType := system.InstallationType
 	originalInstall := installSystemUpdate
 	originalRestart := restartAfterSystemUpdate
+	originalSchedule := scheduleSystemUpdateLockRelease
 	t.Cleanup(func() {
 		system.InstallationType = originalType
 		installSystemUpdate = originalInstall
 		restartAfterSystemUpdate = originalRestart
+		scheduleSystemUpdateLockRelease = originalSchedule
 		systemUpdateInProgress.Store(false)
+		failedSystemUpdate.Store(nil)
 	})
 	systemUpdateInProgress.Store(false)
 	system.InstallationType = "native"
+	var releaseLock func()
+	scheduleSystemUpdateLockRelease = func(delay time.Duration, callback func()) *time.Timer {
+		if delay != systemUpdateLockRelease {
+			t.Fatalf("unexpected lock release delay: %s", delay)
+		}
+		releaseLock = callback
+		return nil
+	}
 	directory := t.TempDir()
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(directory, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	executable := filepath.Join(directory, "agent")
 	backup := executable + ".update-backup"
 	if err := os.WriteFile(executable, []byte("new agent"), 0o755); err != nil {
@@ -295,7 +374,9 @@ func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T)
 	if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	installCalls := 0
 	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
+		installCalls++
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
 	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
@@ -325,6 +406,30 @@ func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T)
 	if !systemUpdateInProgress.Load() {
 		t.Fatal("update lock was released while the supervisor state remained unknown")
 	}
+	requestUpdate := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+		request.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	if response := requestUpdate(); response.Code != http.StatusConflict || installCalls != 1 {
+		t.Fatalf("update was not excluded during restart grace period: status %d, installs %d", response.Code, installCalls)
+	}
+	if releaseLock == nil {
+		t.Fatal("unsafe restart failure did not schedule update lock expiry")
+	}
+	releaseLock()
+	if systemUpdateInProgress.Load() {
+		t.Fatal("update lock remained set after restart grace period")
+	}
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+		return true, nil
+	}
+	if response := requestUpdate(); response.Code != http.StatusAccepted || installCalls != 2 {
+		t.Fatalf("later update was not accepted: status %d, installs %d", response.Code, installCalls)
+	}
+	t.Log("unsafe failure: 500, grace-period retry: 409, expiry releases guard, later retry: 202; installed binary and backup preserved")
 }
 
 func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
@@ -707,4 +812,90 @@ func TestPostUpdateConfigurationUpdatesCORS(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.JSONEq(t, `{"applied":false}`, rec.Body.String())
 	checkOrigins(t, []string{"https://new.test"})
+}
+
+func TestUnsafeUpdateRetryRecoversBackupBeforeRealInstall(t *testing.T) {
+	originalType, originalInstall, originalRestart, originalSchedule := system.InstallationType, installSystemUpdate, restartAfterSystemUpdate, scheduleSystemUpdateLockRelease
+	t.Cleanup(func() {
+		system.InstallationType, installSystemUpdate, restartAfterSystemUpdate, scheduleSystemUpdateLockRelease = originalType, originalInstall, originalRestart, originalSchedule
+		systemUpdateInProgress.Store(false)
+		failedSystemUpdate.Store(nil)
+	})
+	system.InstallationType = "native"
+	systemUpdateInProgress.Store(false)
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "agent")
+	backup := executable + ".update-backup"
+	if err := os.WriteFile(executable, []byte("old agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := "#!/bin/sh\nprintf 'agent v26.09.1\\n'\n"
+	digest := sha256.Sum256([]byte(binary))
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/metadata/") {
+			fmt.Fprintf(w, `{"tag_name":"v26.09.1","assets":[{"name":"agent_linux_amd64","digest":"sha256:%s"}]}`, hex.EncodeToString(digest[:]))
+		} else {
+			fmt.Fprint(w, binary)
+		}
+	}))
+	defer releases.Close()
+	updater := system.NewUpdater()
+	updater.ReleaseBaseURL, updater.ReleaseMetadataURL = releases.URL, releases.URL+"/metadata"
+	updater.ExecutablePath = func() (string, error) { return executable, nil }
+	updater.GOOS, updater.GOARCH = "linux", "amd64"
+	installSystemUpdate = updater.Install
+	allowStop := filepath.Join(directory, "allow-stop")
+	t.Setenv("REV137_STOP_ALLOWED", allowStop)
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	script := "#!/bin/sh\nif [ \"$1\" = show ]; then echo loaded; exit 0; fi\n[ -f \"$REV137_STOP_ALLOWED\" ]\n"
+	if err := os.WriteFile(filepath.Join(directory, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var release func()
+	scheduleSystemUpdateLockRelease = func(_ time.Duration, callback func()) *time.Timer { release = callback; return nil }
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+		return false, errors.New("supervisor uncertain")
+	}
+	engine := gin.New()
+	engine.Use(middleware.CaptureErrors())
+	engine.POST("/api/system/update", postSystemUpdate)
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, r)
+		return w
+	}
+	checkFiles := func() {
+		t.Helper()
+		for path, want := range map[string]string{executable: binary, backup: "old agent"} {
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != want {
+				t.Fatalf("changed recovery files at %s: %q, %v", path, got, err)
+			}
+		}
+	}
+	if r := request(); r.Code != http.StatusInternalServerError {
+		t.Fatalf("initial update: %d %s", r.Code, r.Body.String())
+	}
+	checkFiles()
+	if r := request(); r.Code != http.StatusConflict {
+		t.Fatalf("active supervisor not excluded: %d", r.Code)
+	}
+	if release == nil {
+		t.Fatal("missing expiry")
+	}
+	release()
+	if r := request(); r.Code != http.StatusInternalServerError {
+		t.Fatalf("uncertain supervisor retry: %d", r.Code)
+	}
+	checkFiles()
+	if err := os.WriteFile(allowStop, []byte("yes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) { return true, nil }
+	if r := request(); r.Code != http.StatusAccepted {
+		t.Fatalf("real updater retry failed: %d %s", r.Code, r.Body.String())
+	}
+	checkFiles()
 }
