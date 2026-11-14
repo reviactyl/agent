@@ -461,7 +461,7 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 		return err
 	}
 
-	i := make(map[string]interface{})
+	var i interface{}
 	if err := yaml.Unmarshal(b, &i); err != nil {
 		return err
 	}
