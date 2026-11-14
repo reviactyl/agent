@@ -221,3 +221,25 @@ func TestCpuBurstWritersWaitForResourceUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestCpuBurstLockCancellation(t *testing.T) {
+	unlock, err := lockCpuBurst(context.Background(), "blocked")
+	require.NoError(t, err)
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	waiting, err := lockCpuBurst(ctx, "blocked")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Nil(t, waiting)
+	other, err := lockCpuBurst(context.Background(), "other")
+	require.NoError(t, err)
+	other()
+}
+
+func TestResourceUpdateLockDeadline(t *testing.T) {
+	unlock, err := lockCpuBurst(context.Background(), "blocked-update")
+	require.NoError(t, err)
+	defer unlock()
+	e := &Environment{Id: "blocked-update"}
+	require.ErrorIs(t, e.InSituUpdate(), context.DeadlineExceeded)
+}

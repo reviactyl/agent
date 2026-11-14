@@ -229,10 +229,13 @@ func (e *Environment) setRecoveryState(generation uint64, state string) bool {
 // container. This allows memory, cpu, and IO limitations to be adjusted on the
 // fly for individual instances.
 func (e *Environment) InSituUpdate() error {
-	unlock := lockCpuBurst(e.Id)
-	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	unlock, err := lockCpuBurst(ctx, e.Id)
+	if err != nil {
+		return errors.Wrap(err, "environment/docker: could not acquire resource update lock")
+	}
+	defer unlock()
 
 	c, err := e.ContainerInspect(ctx)
 	if err != nil {

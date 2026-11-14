@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -29,28 +30,33 @@ var cpuBurstLocks = struct {
 }{entries: make(map[string]*cpuBurstLock)}
 
 type cpuBurstLock struct {
-	sync.Mutex
+	token chan struct{}
 	users int
 }
 
-func lockCpuBurst(containerID string) func() {
+func lockCpuBurst(ctx context.Context, containerID string) (func(), error) {
 	cpuBurstLocks.Lock()
 	entry := cpuBurstLocks.entries[containerID]
 	if entry == nil {
-		entry = &cpuBurstLock{}
+		entry = &cpuBurstLock{token: make(chan struct{}, 1)}
 		cpuBurstLocks.entries[containerID] = entry
 	}
 	entry.users++
 	cpuBurstLocks.Unlock()
-	entry.Lock()
-	return func() {
-		entry.Unlock()
+	release := func() {
 		cpuBurstLocks.Lock()
 		entry.users--
 		if entry.users == 0 {
 			delete(cpuBurstLocks.entries, containerID)
 		}
 		cpuBurstLocks.Unlock()
+	}
+	select {
+	case entry.token <- struct{}{}:
+		return func() { <-entry.token; release() }, nil
+	case <-ctx.Done():
+		release()
+		return nil, ctx.Err()
 	}
 }
 
@@ -139,7 +145,12 @@ func logBurstFailure(l *log.Entry, burst int64) {
 // the CFS quota in microseconds it was created with. This is a no-op when
 // bursting is disabled or the container has no CPU limit.
 func SetCpuBurst(ctx context.Context, cli *client.Client, containerID string, quota int64) {
-	unlock := lockCpuBurst(containerID)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	unlock, err := lockCpuBurst(ctx, containerID)
+	if err != nil {
+		return
+	}
 	defer unlock()
 	setCpuBurst(ctx, cli, containerID, quota)
 }
