@@ -9,12 +9,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	dockerclient "github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/router/middleware"
 	"github.com/reviactyl/agent/server"
@@ -577,4 +582,189 @@ func TestPostUpdateConfigurationOnlyAppliesPanelValues(t *testing.T) {
 	if string(onDisk) != string(want) {
 		t.Fatalf("unexpected configuration written to disk:\n%s", onDisk)
 	}
+}
+
+type createServerTestClient struct {
+	remote.Client
+	configuration func() remote.ServerConfigurationResponse
+	status        func(context.Context, remote.InstallStatusRequest) error
+}
+
+func (c createServerTestClient) GetServerConfiguration(context.Context, string) (remote.ServerConfigurationResponse, error) {
+	return c.configuration(), nil
+}
+
+func (c createServerTestClient) GetInstallationScript(context.Context, string) (remote.InstallationScript, error) {
+	return remote.InstallationScript{}, errors.New("installation script unavailable")
+}
+
+func (c createServerTestClient) SetInstallationStatus(ctx context.Context, _ string, status remote.InstallStatusRequest) error {
+	return c.status(ctx, status)
+}
+
+func TestPostCreateServerBackgroundInstallation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		failure     string
+		statusError bool
+		replacement bool
+	}{
+		{name: "environment failure", failure: "environment"},
+		{name: "installation failure", failure: "install"},
+		{name: "environment failure with notification failure", failure: "environment", statusError: true},
+		{name: "installation failure with notification failure", failure: "install", statusError: true},
+		{name: "environment failure preserves replacement", failure: "environment", replacement: true},
+		{name: "installation failure preserves replacement", failure: "install", replacement: true},
+		{name: "successful installation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const uuid = "ab012345-6789-4abc-8def-0123456789ab"
+			cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+			require.NoError(t, err)
+			cfg.AuthenticationToken = "test-token"
+			cfg.System.Data = t.TempDir()
+			cfg.System.MachineID.Enable = false
+			config.Set(cfg)
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce, inspectOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			var retry atomic.Bool
+			dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/_ping") {
+					w.Header().Set("API-Version", "1.45")
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/containers/"+uuid+"/json") {
+					http.Error(w, "unexpected Docker request: "+r.URL.Path, http.StatusBadRequest)
+					return
+				}
+				inspectOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+				if test.failure == "environment" && !retry.Load() {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"message":"environment creation unavailable"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"Id":"` + uuid + `","State":{"Running":false}}`))
+			}))
+			t.Cleanup(dockerAPI.Close)
+			t.Cleanup(unblock)
+			cli, err := environment.Docker()
+			require.NoError(t, err)
+			originalHTTPClient := cli.HTTPClient()
+			require.NoError(t, dockerclient.WithHTTPClient(&http.Client{Transport: createServerTestTransport(func(r *http.Request) (*http.Response, error) {
+				r = r.Clone(r.Context())
+				r.URL.Scheme = "http"
+				r.URL.Host = dockerAPI.Listener.Addr().String()
+				return dockerAPI.Client().Do(r)
+			})})(cli))
+			t.Cleanup(func() { require.NoError(t, dockerclient.WithHTTPClient(originalHTTPClient)(cli)) })
+
+			statuses := make(chan remote.InstallStatusRequest, 2)
+			client := createServerTestClient{
+				configuration: func() remote.ServerConfigurationResponse {
+					settings, _ := json.Marshal(map[string]any{"uuid": uuid, "skip_egg_scripts": test.failure != "install" || retry.Load()})
+					return remote.ServerConfigurationResponse{Settings: settings, ProcessConfiguration: &remote.ProcessConfiguration{}}
+				},
+				status: func(ctx context.Context, status remote.InstallStatusRequest) error {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					statuses <- status
+					if test.statusError {
+						return errors.New("panel notification unavailable")
+					}
+					return nil
+				},
+			}
+			manager := server.NewEmptyManager(client)
+			create := func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Set("manager", manager)
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/servers", strings.NewReader(`{"uuid":"`+uuid+`"}`))
+				c.Request.Header.Set("Content-Type", "application/json")
+				postCreateServer(c)
+				c.Writer.WriteHeaderNow()
+				return w
+			}
+			require.Equal(t, http.StatusAccepted, create().Code)
+			s, ok := manager.Get(uuid)
+			require.True(t, ok)
+			t.Cleanup(s.CleanupForDestroy)
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("background environment creation did not start")
+			}
+			sftpContext := s.Sftp().Context("test")
+			websocketContext, websocketCancel := context.WithCancel(context.Background())
+			s.Websockets().Push([16]byte{1}, &websocketCancel)
+			logPath := filepath.Join(s.Filesystem().Path(), "install-diagnostic.log")
+			require.NoError(t, os.WriteFile(logPath, []byte("recoverable installation data"), 0o600))
+
+			var replacement *server.Server
+			if test.replacement {
+				replacement, err = server.New(client)
+				require.NoError(t, err)
+				require.NoError(t, replacement.SyncWithConfiguration(client.configuration()))
+				t.Cleanup(replacement.CleanupForDestroy)
+				manager.Remove(func(match *server.Server) bool { return match == s })
+				require.True(t, manager.AddIfMissing(replacement))
+			}
+			unblock()
+			select {
+			case status := <-statuses:
+				require.Equal(t, test.failure == "", status.Successful)
+				require.False(t, status.Reinstall)
+			case <-time.After(time.Second):
+				t.Fatal("background installation did not report its outcome to the Panel")
+			}
+
+			if test.failure == "" {
+				require.Same(t, s, manager.Find(func(match *server.Server) bool { return match.ID() == uuid }))
+				require.NoError(t, s.Context().Err())
+				require.NoError(t, sftpContext.Err())
+				require.Equal(t, http.StatusConflict, create().Code)
+				return
+			}
+			require.Eventually(t, func() bool {
+				current, exists := manager.Get(uuid)
+				return s.Context().Err() != nil && websocketContext.Err() != nil && sftpContext.Err() != nil && ((!exists && replacement == nil) || (current == replacement && replacement != nil))
+			}, time.Second, time.Millisecond, "failed original instance must be canceled and unregistered without removing a replacement")
+			data, err := os.ReadFile(logPath)
+			require.NoError(t, err)
+			require.Equal(t, "recoverable installation data", string(data))
+			if replacement != nil {
+				require.NoError(t, replacement.Context().Err())
+				return
+			}
+
+			retry.Store(true)
+			require.Equal(t, http.StatusAccepted, create().Code, "retry must not conflict with the failed instance")
+			retried, ok := manager.Get(uuid)
+			require.True(t, ok)
+			require.NotSame(t, s, retried)
+			t.Cleanup(retried.CleanupForDestroy)
+			select {
+			case status := <-statuses:
+				require.True(t, status.Successful)
+			case <-time.After(time.Second):
+				t.Fatal("retry did not complete successfully")
+			}
+			require.Same(t, retried, manager.Find(func(match *server.Server) bool { return match.ID() == uuid }))
+			require.NoError(t, retried.Context().Err())
+		})
+	}
+}
+
+type createServerTestTransport func(*http.Request) (*http.Response, error)
+
+func (f createServerTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
