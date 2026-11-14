@@ -229,6 +229,11 @@ func (e *Environment) setRecoveryState(generation uint64, state string) bool {
 func (e *Environment) InSituUpdate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	unlock, err := lockCpuBurst(ctx, e.Id)
+	if err != nil {
+		return errors.Wrap(err, "environment/docker: could not acquire resource update lock")
+	}
+	defer unlock()
 
 	c, err := e.ContainerInspect(ctx)
 	if err != nil {
@@ -246,21 +251,24 @@ func (e *Environment) InSituUpdate() error {
 
 	// The kernel rejects a CFS quota lower than the current burst, so remove the
 	// burst before updating the limits and re-apply it afterwards.
+	restoreBurst := func() {}
 	if c.State != nil {
-		e.clearCpuBurst(c.State.Pid)
+		restoreBurst = e.clearCpuBurst(c.State.Pid)
 	}
 
 	// CPU pinning cannot be removed once it is applied to a container. The same is true
 	// for removing memory limits, a container must be re-created.
 	//
 	// @see https://github.com/moby/moby/issues/41946
+	resources := e.Configuration.Limits().AsContainerResources()
 	if _, err := e.client.ContainerUpdate(ctx, e.Id, container.UpdateConfig{
-		Resources: e.Configuration.Limits().AsContainerResources(),
+		Resources: resources,
 	}); err != nil {
+		restoreBurst()
 		return errors.Wrap(err, "environment/docker: could not update container")
 	}
 
-	e.applyCpuBurst(ctx)
+	setCpuBurst(ctx, e.client, e.Id, resources.CPUQuota)
 	return nil
 }
 
