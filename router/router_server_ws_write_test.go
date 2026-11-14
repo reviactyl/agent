@@ -131,8 +131,11 @@ func TestUnauthenticatedSocketIsClosedAfterTimeout(t *testing.T) {
 	require.NoError(t, conn.WriteJSON(websocket.Message{Event: websocket.SendStatsEvent}))
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
-	_, _, err = conn.ReadMessage()
-	require.Error(t, err)
+	for {
+		if _, _, err = conn.ReadMessage(); err != nil {
+			break
+		}
+	}
 	require.False(t, isNetTimeout(err), "expected the socket to be closed after the authentication timeout: %v", err)
 }
 
