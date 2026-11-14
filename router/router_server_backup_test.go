@@ -1,6 +1,9 @@
 package router
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"net"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/environment"
@@ -29,8 +33,9 @@ func init() {
 }
 
 type backupTestRemoteClient struct {
-	restoreStatus chan string
-	credentials   chan [2]string
+	restoreStatus     chan string
+	restoreSuccessful chan bool
+	credentials       chan [2]string
 }
 
 func (c backupTestRemoteClient) GetBackupRemoteUploadURLs(context.Context, string, int64) (remote.BackupRemoteUploadResponse, error) {
@@ -61,10 +66,16 @@ func (c backupTestRemoteClient) SetBackupStatus(context.Context, string, remote.
 	return nil
 }
 
-func (c backupTestRemoteClient) SendRestorationStatus(_ context.Context, backup string, _ bool) error {
+func (c backupTestRemoteClient) SendRestorationStatus(_ context.Context, backup string, successful bool) error {
 	if c.restoreStatus != nil {
 		select {
 		case c.restoreStatus <- backup:
+		default:
+		}
+	}
+	if c.restoreSuccessful != nil {
+		select {
+		case c.restoreSuccessful <- successful:
 		default:
 		}
 	}
@@ -248,6 +259,116 @@ func TestPostServerRestoreBackupRejectsBadDownloadStatus(t *testing.T) {
 	if c.Writer.Status() != http.StatusBadRequest {
 		t.Fatalf("expected restore request to be rejected, got status %d body %s", c.Writer.Status(), w.Body.String())
 	}
+}
+
+func TestPostServerRestoreBackupCompletionStatus(t *testing.T) {
+	for _, adapter := range []string{"agent", "s3"} {
+		for _, outcome := range []string{"success", "callback failure", "write failure", "extraction failure"} {
+			t.Run(adapter+"/"+outcome, func(t *testing.T) {
+				previous := config.Get()
+				cfg := &config.Configuration{
+					AuthenticationToken: "test-token",
+					System: config.SystemConfiguration{
+						Data:            t.TempDir(),
+						BackupDirectory: t.TempDir(),
+					},
+				}
+				cfg.System.User.Uid = os.Getuid()
+				cfg.System.User.Gid = os.Getgid()
+				cfg.System.Backups.RestoreHostAllowlist = []string{"127.0.0.1"}
+				config.Set(cfg)
+				t.Cleanup(func() { config.Set(previous) })
+
+				const backupID = "11111111-1111-1111-1111-111111111111"
+				archive := restoreCompletionArchive(t, outcome)
+				client := backupTestRemoteClient{restoreSuccessful: make(chan bool, 1)}
+				body := `{"adapter":"agent"}`
+				if adapter == "s3" {
+					remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/gzip")
+						_, _ = w.Write(archive)
+					}))
+					defer remoteServer.Close()
+					body = fmt.Sprintf(`{"adapter":"s3","download_url":%q}`, remoteServer.URL)
+				} else {
+					require.NoError(t, os.WriteFile(filepath.Join(cfg.System.BackupDirectory, backupID+".tar.gz"), archive, 0o600))
+				}
+
+				c, _, unused := newBackupRestoreContext(t, client, backupID, body)
+				unused.CtxCancel()
+				const serverID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+				s, err := wserver.NewEmptyManager(client).InitServer(serverID, remote.ServerConfigurationResponse{
+					Settings:             []byte(`{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}`),
+					ProcessConfiguration: &remote.ProcessConfiguration{},
+				})
+				require.NoError(t, err)
+				defer s.CtxCancel()
+				defer s.Filesystem().UnixFS().Close()
+				s.Environment = backupTestEnvironment{}
+				c.Set("server", s)
+				if outcome == "write failure" {
+					require.NoError(t, os.Mkdir(filepath.Join(s.Filesystem().Path(), "restored.txt"), 0o755))
+				}
+				eventsCh := make(chan []byte, 32)
+				s.Events().On(eventsCh)
+
+				postServerRestoreBackup(c)
+				require.Equal(t, http.StatusAccepted, c.Writer.Status())
+				wantSuccess := outcome == "success"
+				select {
+				case successful := <-client.restoreSuccessful:
+					require.Equal(t, wantSuccess, successful, "Panel restoration status")
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for Panel restoration status")
+				}
+				require.Eventually(t, func() bool { return !s.IsRestoring() }, 5*time.Second, time.Millisecond)
+
+				var completedEvent, completedMessage bool
+				for len(eventsCh) > 0 {
+					event := events.MustDecode(<-eventsCh)
+					if event.Topic == wserver.BackupRestoreCompletedEvent {
+						completedEvent = true
+					}
+					if event.Topic == wserver.DaemonMessageEvent {
+						message, _ := event.Data.(string)
+						completedMessage = completedMessage || strings.HasPrefix(message, "Completed server restoration")
+					}
+				}
+				require.Equal(t, wantSuccess, completedEvent, "completion event")
+				require.Equal(t, wantSuccess, completedMessage, "daemon completion message")
+				if wantSuccess {
+					content, err := os.ReadFile(filepath.Join(s.Filesystem().Path(), "restored.txt"))
+					require.NoError(t, err)
+					require.Equal(t, "hello", string(content))
+				}
+			})
+		}
+	}
+}
+
+func restoreCompletionArchive(t *testing.T, outcome string) []byte {
+	t.Helper()
+	if outcome == "extraction failure" {
+		return []byte("not an archive")
+	}
+
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	if outcome == "callback failure" {
+		require.NoError(t, tw.WriteHeader(&tar.Header{
+			Name:     "broken-link",
+			Typeflag: tar.TypeSymlink,
+			Linkname: strings.Repeat("x", 4097),
+		}))
+	} else {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "restored.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 5}))
+		_, err := tw.Write([]byte("hello"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	return archive.Bytes()
 }
 
 func TestBackupRestoreContentTypeValidation(t *testing.T) {

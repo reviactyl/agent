@@ -163,6 +163,8 @@ func postServerRestoreBackup(c *gin.Context) {
 			logger.Info("starting restoration process for server backup using local driver")
 			if err := s.RestoreBackup(b, nil, data.TruncateDirectory); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
+				s.SetRestoring(false)
+				return
 			}
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
 			s.Events().Publish(server.BackupRestoreCompletedEvent, "")
@@ -217,6 +219,8 @@ func postServerRestoreBackup(c *gin.Context) {
 		logger.Info("starting restoration process for server backup using S3 driver")
 		if err := s.RestoreBackup(backup.NewS3(client, uuid, "", data.Format), res.Body, data.TruncateDirectory); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
+			s.SetRestoring(false)
+			return
 		}
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
 		s.Events().Publish(server.BackupRestoreCompletedEvent, "")
