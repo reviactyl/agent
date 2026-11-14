@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/remote"
+	"github.com/reviactyl/agent/router/downloader"
 	"github.com/reviactyl/agent/server"
 )
 
@@ -76,15 +78,26 @@ func TestRemoteDownloadRuntimeConfiguration(t *testing.T) {
 					{http.MethodDelete, "/14114114-1141-4141-8141-141141141141", http.StatusNoContent},
 				} {
 					path := "/api/servers/" + id + "/files/pull" + route.suffix
+					var dl *downloader.Download
+					if route.method == http.MethodDelete {
+						dl = downloader.New(s, downloader.DownloadRequest{})
+						require.NotNil(t, dl)
+						t.Cleanup(dl.Cancel)
+						path = "/api/servers/" + id + "/files/pull/" + dl.Identifier
+					}
 					require.Equal(t, http.StatusUnauthorized, request(route.method, path, "", `{}`).Code)
 					require.Equal(t, http.StatusForbidden, request(route.method, path, "wrong-token", `{}`).Code)
 					rec := request(route.method, path, "test-token", `{}`)
-					if disabled {
+					if disabled && route.method != http.MethodDelete {
 						require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
 						require.JSONEq(t, `{"error":"This functionality is not currently enabled on this instance."}`, rec.Body.String())
 					} else {
 						require.Equal(t, route.status, rec.Code, rec.Body.String())
 						require.NotContains(t, rec.Body.String(), "This functionality is not currently enabled")
+					}
+					if dl != nil {
+						require.Nil(t, downloader.ByID(dl.Identifier), "cancellation frees the download slot even when disabled")
+						require.ErrorIs(t, dl.Execute(), context.Canceled)
 					}
 				}
 			}
