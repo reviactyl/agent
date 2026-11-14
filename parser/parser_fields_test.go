@@ -60,6 +60,61 @@ func TestInvalidReplacementEscapeIsRejectedBeforeDecoding(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestConfigurationFileRejectsMalformedReplacements(t *testing.T) {
+	for name, replacements := range map[string]string{
+		"object":             `{}`,
+		"string":             `"invalid"`,
+		"number":             `1`,
+		"boolean":            `false`,
+		"null entry":         `[null]`,
+		"scalar entry":       `[1]`,
+		"missing match":      `[{"replace_with":"new"}]`,
+		"missing value":      `[{"match":"key"}]`,
+		"invalid match":      `[{"match":{},"replace_with":"new"}]`,
+		"invalid condition":  `[{"match":"key","if_value":[],"replace_with":"new"}]`,
+		"valid then invalid": `[{"match":"key","replace_with":"new"},{"match":"other"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var f ConfigurationFile
+			err := json.Unmarshal([]byte(`{"file":"server.properties","parser":"properties","replace":`+replacements+`}`), &f)
+			require.ErrorContains(t, err, "replacement")
+			require.ErrorContains(t, err, "server.properties")
+		})
+	}
+}
+
+func TestConfigurationFileDecodesValidReplacements(t *testing.T) {
+	for name, tc := range map[string]struct {
+		replacements string
+		match        string
+		condition    string
+		value        string
+	}{
+		"empty":         {replacements: `[]`},
+		"string":        {`[{"match":"key","replace_with":"new"}]`, "key", "", "new"},
+		"legacy value":  {`[{"match":"key","value":"legacy"}]`, "key", "", "legacy"},
+		"numeric key":   {`[{"match":25565,"if_value":1,"replace_with":25566}]`, "25565", "1", "25566"},
+		"boolean key":   {`[{"match":true,"if_value":false,"replace_with":false}]`, "true", "false", "false"},
+		"null scalars":  {`[{"match":null,"if_value":null,"replace_with":null}]`, "", "", "<nil>"},
+		"escaped value": {`[{"match":"key","replace_with":"\u00a7new"}]`, "key", "", "§new"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var f ConfigurationFile
+			err := json.Unmarshal([]byte(`{"file":"server.properties","parser":"properties","replace":`+tc.replacements+`}`), &f)
+			require.NoError(t, err)
+			if tc.replacements == `[]` {
+				require.NotNil(t, f.Replace)
+				require.Empty(t, f.Replace)
+				return
+			}
+			require.Len(t, f.Replace, 1)
+			require.Equal(t, tc.match, f.Replace[0].Match)
+			require.Equal(t, tc.condition, f.Replace[0].IfValue)
+			require.Equal(t, tc.value, f.Replace[0].ReplaceWith.String())
+		})
+	}
+}
+
 func TestConfigurationFilePreservesReplacementScalarTypes(t *testing.T) {
 	cases := []struct {
 		name string
