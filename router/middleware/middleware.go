@@ -150,6 +150,15 @@ func ServerExists() gin.HandlerFunc {
 				return c.Param("server") == s.ID()
 			})
 		}
+		if s == nil && ((c.Request.Method == http.MethodPost && c.FullPath() == "/api/servers/:server/reinstall") ||
+			(c.Request.Method == http.MethodDelete && c.FullPath() == "/api/servers/:server")) {
+			var err error
+			s, err = ExtractManager(c).RecoverFailedInstallation(c.Param("server"))
+			if err != nil {
+				CaptureAndAbort(c, err)
+				return
+			}
+		}
 		if s == nil {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "The requested resource does not exist on this instance."})
 			return

@@ -608,6 +608,7 @@ func TestPostCreateServerBackgroundInstallation(t *testing.T) {
 		failure     string
 		statusError bool
 		replacement bool
+		recovery    string
 	}{
 		{name: "environment failure", failure: "environment"},
 		{name: "installation failure", failure: "install"},
@@ -615,6 +616,10 @@ func TestPostCreateServerBackgroundInstallation(t *testing.T) {
 		{name: "installation failure with notification failure", failure: "install", statusError: true},
 		{name: "environment failure preserves replacement", failure: "environment", replacement: true},
 		{name: "installation failure preserves replacement", failure: "install", replacement: true},
+		{name: "environment failure allows reinstall", failure: "environment", recovery: "reinstall"},
+		{name: "installation failure allows reinstall", failure: "install", recovery: "reinstall"},
+		{name: "environment failure allows deletion", failure: "environment", recovery: "delete"},
+		{name: "installation failure allows deletion", failure: "install", recovery: "delete"},
 		{name: "successful installation"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -622,6 +627,7 @@ func TestPostCreateServerBackgroundInstallation(t *testing.T) {
 			cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
 			require.NoError(t, err)
 			cfg.AuthenticationToken = "test-token"
+			require.NoError(t, cfg.ResolveToken(false))
 			cfg.System.Data = t.TempDir()
 			cfg.System.MachineID.Enable = false
 			config.Set(cfg)
@@ -635,6 +641,10 @@ func TestPostCreateServerBackgroundInstallation(t *testing.T) {
 				if strings.HasSuffix(r.URL.Path, "/_ping") {
 					w.Header().Set("API-Version", "1.45")
 					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if r.Method == http.MethodDelete && test.recovery == "delete" {
+					w.WriteHeader(http.StatusNoContent)
 					return
 				}
 				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/containers/"+uuid+"/json") {
@@ -746,6 +756,52 @@ func TestPostCreateServerBackgroundInstallation(t *testing.T) {
 			}
 
 			retry.Store(true)
+			if test.recovery != "" {
+				engine := Configure(manager, client)
+				path := "/api/servers/" + uuid
+				method := http.MethodDelete
+				if test.recovery == "reinstall" {
+					method = http.MethodPost
+					path += "/reinstall"
+				}
+				request := func(method, path, token string) *httptest.ResponseRecorder {
+					req := httptest.NewRequest(method, path, nil)
+					if token != "" {
+						req.Header.Set("Authorization", "Bearer "+token)
+					}
+					w := httptest.NewRecorder()
+					engine.ServeHTTP(w, req)
+					return w
+				}
+				require.Equal(t, http.StatusUnauthorized, request(method, path, "").Code)
+				require.Equal(t, http.StatusForbidden, request(method, path, "wrong-token").Code)
+				require.Equal(t, http.StatusNotFound, request(http.MethodGet, "/api/servers/"+uuid, "test-token").Code)
+				_, exists := manager.Get(uuid)
+				require.False(t, exists, "normal and unauthorized requests must not recover failed registrations")
+				response := request(method, path, "test-token")
+				if test.recovery == "delete" {
+					require.Equal(t, http.StatusNoContent, response.Code, response.Body.String())
+					_, exists = manager.Get(uuid)
+					require.False(t, exists)
+					require.Eventually(t, func() bool { _, err := os.Stat(filepath.Dir(logPath)); return os.IsNotExist(err) }, time.Second, time.Millisecond)
+					return
+				}
+				require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+				recovered, exists := manager.Get(uuid)
+				require.True(t, exists)
+				t.Cleanup(recovered.CleanupForDestroy)
+				require.NotSame(t, s, recovered)
+				require.NoError(t, recovered.Context().Err())
+				select {
+				case status := <-statuses:
+					require.True(t, status.Successful)
+					require.True(t, status.Reinstall)
+				case <-time.After(time.Second):
+					t.Fatal("failed installation could not be reinstalled")
+				}
+				require.Equal(t, http.StatusConflict, create().Code)
+				return
+			}
 			require.Equal(t, http.StatusAccepted, create().Code, "retry must not conflict with the failed instance")
 			retried, ok := manager.Get(uuid)
 			require.True(t, ok)
