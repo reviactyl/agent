@@ -12,7 +12,6 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/Jeffail/gabs/v2"
-	"github.com/apex/log"
 	"github.com/beevik/etree"
 	"github.com/buger/jsonparser"
 	"github.com/icza/dyno"
@@ -149,10 +148,7 @@ type ConfigurationFile struct {
 	configuration []byte
 }
 
-// UnmarshalJSON is a custom unmarshaler for configuration files. If there is an
-// error while parsing out the replacements, don't fail the entire operation,
-// just log a global warning so someone can find the issue, and return an empty
-// array of replacements.
+// UnmarshalJSON validates configuration files and their replacements.
 func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	var m map[string]*json.RawMessage
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -173,9 +169,7 @@ func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	}
 
 	if err := json.Unmarshal(*m["replace"], &f.Replace); err != nil {
-		log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
-
-		f.Replace = []ConfigurationFileReplacement{}
+		return errors.Wrapf(err, "parser: failed to unmarshal replacements for configuration file %q", f.FileName)
 	}
 
 	return nil
