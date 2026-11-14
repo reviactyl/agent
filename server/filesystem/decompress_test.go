@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"io"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/mholt/archives"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -148,4 +150,48 @@ func TestDecompressZipSymlinkEntry(t *testing.T) {
 	target, err := os.Readlink(filepath.Join(rfs.root, "server", "link"))
 	require.NoError(t, err)
 	assert.Equal(t, "target.txt", target)
+}
+
+type cancelingArchiveReader struct {
+	io.Reader
+	cancel context.CancelFunc
+	read   int
+}
+
+func (r *cancelingArchiveReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.read += n
+	if r.read > 512 {
+		r.cancel()
+	}
+	return n, err
+}
+
+func TestDecompressStopsWritingDuringCanceledEntry(t *testing.T) {
+	fs, rfs := NewFs()
+	t.Cleanup(func() { _ = fs.UnixFS().Close(); _ = os.RemoveAll(rfs.root) })
+
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	payload := bytes.Repeat([]byte("x"), 1<<20)
+	for _, name := range []string{"large.txt", "later.txt"} {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(payload))}))
+		_, err := tw.Write(payload)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := &cancelingArchiveReader{Reader: bytes.NewReader(archive.Bytes()), cancel: cancel}
+	err := fs.extractStream(ctx, extractStreamOptions{
+		Directory: "/",
+		Format:    archives.Tar{},
+		Reader:    source,
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	info, err := os.Stat(filepath.Join(rfs.root, "server", "large.txt"))
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "canceled extraction wrote archive contents")
+	_, err = os.Stat(filepath.Join(rfs.root, "server", "later.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
