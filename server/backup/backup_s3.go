@@ -194,7 +194,7 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 	if !ok {
 		return nil, errors.New("backup: S3 upload source is not seekable")
 	}
-	uploader := newS3FileUploader(reader)
+	uploader := newS3FileUploader(reader, s.Format)
 	for i, part := range urls.Parts {
 		// Get the size for the current part.
 		var partSize int64
@@ -226,19 +226,32 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 type s3FileUploader struct {
 	reader        io.ReadSeeker
 	client        *http.Client
+	contentType   string
 	uploadedParts []remote.BackupPart
 }
 
 // newS3FileUploader returns a new file uploader instance.
-func newS3FileUploader(file io.ReadSeeker) *s3FileUploader {
+func newS3FileUploader(file io.ReadSeeker, archiveFormat ...string) *s3FileUploader {
+	format := "tar.gz"
+	if len(archiveFormat) > 0 {
+		format = archiveFormat[0]
+	}
 	return &s3FileUploader{
-		reader: file,
+		reader:      file,
+		contentType: contentTypeForFormat(format),
 		// We purposefully use a super high timeout on this request since we need to upload
 		// a 5GB file. This assumes at worst a 10Mbps connection for uploading. While technically
 		// you could go slower we're targeting mostly hosted servers that should have 100Mbps
 		// connections anyways.
 		client: &http.Client{Timeout: time.Hour * 2},
 	}
+}
+
+func contentTypeForFormat(format string) string {
+	if format == "zip" {
+		return "application/zip"
+	}
+	return "application/x-gzip"
 }
 
 // backoff returns a new expoential backoff implementation using a context that
@@ -274,7 +287,7 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 		}
 		r.ContentLength = size
 		r.Header.Add("Content-Length", strconv.FormatInt(size, 10))
-		r.Header.Add("Content-Type", "application/x-gzip")
+		r.Header.Add("Content-Type", fu.contentType)
 
 		res, err := fu.client.Do(r)
 		if err != nil {
