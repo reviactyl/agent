@@ -126,10 +126,19 @@ func postServerCommands(c *gin.Context) {
 		return
 	}
 
+	failed := false
 	for _, command := range data.Commands {
 		if err := s.Environment.SendCommand(command); err != nil {
+			failed = true
 			s.Log().WithFields(log.Fields{"command": command, "error": err}).Warn("failed to send command to server instance")
 		}
+	}
+
+	if failed {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"error": "One or more commands could not be sent to the server instance. Other commands may have been delivered.",
+		})
+		return
 	}
 
 	c.Status(http.StatusNoContent)
