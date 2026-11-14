@@ -113,13 +113,11 @@ func postSystemUpdate(c *gin.Context) {
 	restartContext, restartCancel := context.WithTimeout(operationContext, systemUpdateRestartTimeout)
 	defer restartCancel()
 	rollbackSafe, err := restartAfterSystemUpdate(restartContext, installed)
-	if err != nil {
-		if rollbackSafe {
-			if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
-				err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
-			}
-			systemUpdateInProgress.Store(false)
+	if err != nil && rollbackSafe {
+		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
+			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
 		}
+		systemUpdateInProgress.Store(false)
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -130,6 +128,11 @@ func postSystemUpdate(c *gin.Context) {
 	scheduleSystemUpdateLockRelease(systemUpdateLockRelease, func() {
 		systemUpdateInProgress.Store(false)
 	})
+
+	if err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
 
 	c.JSON(http.StatusAccepted, postSystemUpdateResponse{
 		Version: request.Version,
