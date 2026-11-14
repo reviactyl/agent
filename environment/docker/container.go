@@ -215,12 +215,8 @@ func (e *Environment) setRecoveryState(generation uint64, state string) bool {
 		e.mu.Unlock()
 		return false
 	}
-	previous := e.st.Load()
-	e.st.Store(state)
+	e.setStateLocked(state)
 	e.mu.Unlock()
-	if previous != state {
-		e.Events().Publish(environment.StateChangeEvent, state)
-	}
 	return true
 }
 
@@ -436,6 +432,9 @@ func (e *Environment) SendCommand(c string) error {
 		return errors.New("environment/docker: command contains control characters")
 	}
 
+	e.commandMu.Lock()
+	defer e.commandMu.Unlock()
+
 	e.mu.RLock()
 	stream := e.stream
 	stop := e.meta.Stop
@@ -447,10 +446,16 @@ func (e *Environment) SendCommand(c string) error {
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Agent will think it has crashed and attempt to restart it.
+	var previousState string
+	var generation uint64
 	if stop.Type == "command" {
 		for _, command := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
 			if command == stop.Value {
-				e.SetState(environment.ProcessStoppingState)
+				e.mu.Lock()
+				previousState = e.State()
+				e.setStateLocked(environment.ProcessStoppingState)
+				generation = e.stateGeneration
+				e.mu.Unlock()
 				break
 			}
 		}
@@ -460,6 +465,13 @@ func (e *Environment) SendCommand(c string) error {
 	// room for the command.
 	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
 	_, err := stream.Conn.Write([]byte(c + "\n"))
+	if err != nil && generation != 0 {
+		e.mu.Lock()
+		if e.stateGeneration == generation {
+			e.setStateLocked(previousState)
+		}
+		e.mu.Unlock()
+	}
 
 	return errors.Wrap(err, "environment/docker: could not write to container stream")
 }

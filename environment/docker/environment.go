@@ -28,7 +28,8 @@ type Metadata struct {
 var _ environment.ProcessEnvironment = (*Environment)(nil)
 
 type Environment struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	commandMu sync.Mutex
 
 	// The public identifier for this environment. In this case it is the Docker container
 	// name that will be used for all instances created under it.
@@ -53,7 +54,8 @@ type Environment struct {
 	logCallback   func([]byte)
 
 	// Tracks the environment state.
-	st *system.AtomicString
+	st              *system.AtomicString
+	stateGeneration uint64
 
 	// Tracks how often the attached stream has ended while the container kept
 	// running, guarded by mu.
@@ -208,7 +210,14 @@ func (e *Environment) SetState(state string) {
 		panic(errors.New(fmt.Sprintf("invalid server state received: %s", state)))
 	}
 
-	// Emit the event to any listeners that are currently registered.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setStateLocked(state)
+}
+
+// setStateLocked requires mu and invalidates rollback even for repeated states.
+func (e *Environment) setStateLocked(state string) {
+	e.stateGeneration++
 	if e.State() != state {
 		// If the state changed make sure we update the internal tracking to note that.
 		e.st.Store(state)

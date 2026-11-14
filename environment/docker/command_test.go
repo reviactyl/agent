@@ -1,11 +1,16 @@
 package docker
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reviactyl/agent/environment"
 	"github.com/reviactyl/agent/events"
@@ -95,4 +100,150 @@ func TestMultilineStopCommandSetsStoppingState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStopCommandWriteFailureRestoresState(t *testing.T) {
+	for _, method := range []string{"command", "stop"} {
+		for _, state := range []string{environment.ProcessRunningState, environment.ProcessStartingState, environment.ProcessStoppingState} {
+			t.Run(method+"/"+state, func(t *testing.T) {
+				e, input := attachedEnvironment(t)
+				e.emitter = events.NewBus()
+				e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+				e.SetState(state)
+				require.NoError(t, input.Close())
+				var err error
+				if method == "stop" {
+					err = e.Stop(context.Background())
+				} else {
+					err = e.SendCommand("say goodbye\r\nstop\r\n")
+				}
+				require.ErrorIs(t, err, io.ErrClosedPipe)
+				require.Contains(t, err.Error(), "could not write to container stream")
+				require.Equal(t, state, e.State())
+			})
+		}
+	}
+}
+
+func TestStopCommandWriteTimeoutRestoresState(t *testing.T) {
+	previous := commandWriteTimeout
+	commandWriteTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { commandWriteTimeout = previous })
+	e, _ := attachedEnvironment(t)
+	e.emitter = events.NewBus()
+	e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+	err := e.SendCommand("stop")
+	var netErr net.Error
+	require.True(t, errors.As(err, &netErr))
+	require.True(t, netErr.Timeout())
+	require.Equal(t, environment.ProcessRunningState, e.State())
+}
+
+func TestStopCommandWriteSuccess(t *testing.T) {
+	for _, method := range []string{"command", "stop"} {
+		t.Run(method, func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+			done := make(chan error, 1)
+			go func() {
+				if method == "stop" {
+					done <- e.Stop(context.Background())
+				} else {
+					done <- e.SendCommand("stop")
+				}
+			}()
+			require.NoError(t, input.SetReadDeadline(time.Now().Add(2*time.Second)))
+			b := make([]byte, len("stop\n"))
+			_, err := io.ReadFull(input, b)
+			require.NoError(t, err)
+			require.Equal(t, "stop\n", string(b))
+			require.Equal(t, environment.ProcessStoppingState, e.State(), "must mark stopping before the process can exit")
+			require.NoError(t, <-done)
+			require.Equal(t, environment.ProcessStoppingState, e.State())
+		})
+	}
+}
+
+func TestFailedStopCommandPreservesLaterState(t *testing.T) {
+	for _, states := range [][]string{
+		{environment.ProcessOfflineState},
+		{environment.ProcessStartingState},
+		{environment.ProcessRunningState},
+		{environment.ProcessStoppingState},
+		{environment.ProcessOfflineState, environment.ProcessStoppingState},
+	} {
+		t.Run(strings.Join(states, "/"), func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+			changes := make(chan []byte, 8)
+			e.Events().On(changes)
+			defer e.Events().Off(changes)
+			done := make(chan error, 1)
+			go func() { done <- e.SendCommand("stop") }()
+			select {
+			case v := <-changes:
+				require.Equal(t, environment.ProcessStoppingState, events.MustDecode(v).Data)
+			case <-time.After(2 * time.Second):
+				t.Fatal("stop command did not start writing")
+			}
+			for _, state := range states {
+				e.SetState(state)
+			}
+			require.NoError(t, input.Close())
+			require.ErrorIs(t, <-done, io.ErrClosedPipe)
+			require.Equal(t, states[len(states)-1], e.State())
+		})
+	}
+}
+
+func TestFailedStopCommandPublishesRestoredState(t *testing.T) {
+	e, input := attachedEnvironment(t)
+	e.emitter = events.NewBus()
+	e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+	changes := make(chan []byte, 8)
+	e.Events().On(changes)
+	defer e.Events().Off(changes)
+	require.NoError(t, input.Close())
+	require.ErrorIs(t, e.SendCommand("stop"), io.ErrClosedPipe)
+	for _, state := range []string{environment.ProcessStoppingState, environment.ProcessRunningState} {
+		select {
+		case v := <-changes:
+			event := events.MustDecode(v)
+			require.Equal(t, environment.StateChangeEvent, event.Topic)
+			require.Equal(t, state, event.Data)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("missing state change to %s", state)
+		}
+	}
+}
+
+type blockedCommandConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockedCommandConn) Write([]byte) (int, error) {
+	c.started <- struct{}{}
+	<-c.release
+	return 0, io.ErrClosedPipe
+}
+
+func TestConcurrentFailedStopCommandsRestoreState(t *testing.T) {
+	e, _ := attachedEnvironment(t)
+	e.emitter = events.NewBus()
+	e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+	conn := &blockedCommandConn{Conn: e.stream.Conn, started: make(chan struct{}, 2), release: make(chan struct{})}
+	e.SetStream(&types.HijackedResponse{Conn: conn})
+	done := make(chan error, 2)
+	go func() { done <- e.SendCommand("stop") }()
+	<-conn.started
+	go func() { done <- e.SendCommand("stop") }()
+	close(conn.release)
+	for range 2 {
+		require.ErrorIs(t, <-done, io.ErrClosedPipe)
+	}
+	require.Equal(t, environment.ProcessRunningState, e.State())
 }
