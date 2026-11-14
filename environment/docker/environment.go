@@ -11,6 +11,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/reviactyl/agent/environment"
 	"github.com/reviactyl/agent/events"
@@ -29,7 +30,7 @@ var _ environment.ProcessEnvironment = (*Environment)(nil)
 
 type Environment struct {
 	mu        sync.RWMutex
-	commandMu sync.Mutex
+	commandMu *semaphore.Weighted
 
 	// The public identifier for this environment. In this case it is the Docker container
 	// name that will be used for all instances created under it.

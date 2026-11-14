@@ -155,7 +155,7 @@ func (e *Environment) Stop(ctx context.Context) error {
 	e.mu.RUnlock()
 
 	if e.IsAttached() && s.Type == remote.ProcessStopCommand {
-		return e.SendCommand(s.Value)
+		return e.sendCommand(ctx, s.Value)
 	}
 
 	// If the process is already offline don't switch it back to stopping. Just leave it how

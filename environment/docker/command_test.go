@@ -247,3 +247,104 @@ func TestConcurrentFailedStopCommandsRestoreState(t *testing.T) {
 	}
 	require.Equal(t, environment.ProcessRunningState, e.State())
 }
+
+func TestConfiguredMultilineStopCommands(t *testing.T) {
+	for _, command := range []string{"stop\n", "say goodbye\nstop", "say goodbye\r\nstop\r\n"} {
+		t.Run(command, func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: command}
+			read := make(chan struct{})
+			go func() {
+				defer close(read)
+				_, _ = io.CopyN(io.Discard, input, int64(len(command)+1))
+			}()
+			require.NoError(t, e.Stop(context.Background()))
+			<-read
+			require.Equal(t, environment.ProcessStoppingState, e.State())
+		})
+	}
+}
+
+type partialCommandConn struct {
+	net.Conn
+	limit int
+}
+
+func (c *partialCommandConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b[:c.limit])
+	if err != nil {
+		return n, err
+	}
+	return n, io.ErrClosedPipe
+}
+
+func TestPartialStopCommandDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		command, stop string
+		written       int
+		state         string
+	}{
+		{"stop\ntrailing", "stop", len("stop\n"), environment.ProcessStoppingState},
+		{"stop\ntrailing", "stop", len("stop"), environment.ProcessRunningState},
+		{"say goodbye\nstop\ntrailing", "say goodbye\nstop", len("say goodbye\nstop\n"), environment.ProcessStoppingState},
+		{"say goodbye\nstop\ntrailing", "say goodbye\nstop", len("say goodbye\n"), environment.ProcessRunningState},
+	} {
+		t.Run(tc.command+"/"+tc.state, func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: tc.stop}
+			e.SetStream(&types.HijackedResponse{Conn: &partialCommandConn{Conn: e.stream.Conn, limit: tc.written}})
+			read := make(chan struct{})
+			go func() { defer close(read); _, _ = io.CopyN(io.Discard, input, int64(tc.written)) }()
+			require.ErrorIs(t, e.SendCommand(tc.command), io.ErrClosedPipe)
+			<-read
+			require.Equal(t, tc.state, e.State())
+		})
+	}
+}
+
+type signaledCommandConn struct {
+	net.Conn
+	started chan struct{}
+}
+
+func (c *signaledCommandConn) Write(b []byte) (int, error) {
+	c.started <- struct{}{}
+	return c.Conn.Write(b)
+}
+
+func TestStopContextCancelsQueuedAndBlockedCommands(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(map[bool]string{false: "writing", true: "queued"}[queued], func(t *testing.T) {
+			e, input := attachedEnvironment(t)
+			e.emitter = events.NewBus()
+			e.meta.Stop = remote.ProcessStopConfiguration{Type: "command", Value: "stop"}
+			conn := &signaledCommandConn{Conn: e.stream.Conn, started: make(chan struct{}, 2)}
+			e.SetStream(&types.HijackedResponse{Conn: conn})
+			if queued {
+				first := make(chan error, 1)
+				go func() { first <- e.SendCommand("say hello") }()
+				<-conn.started
+				defer func() { _ = input.Close(); <-first }()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- e.Stop(ctx) }()
+			if !queued {
+				<-conn.started
+			}
+			cancel()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				_ = input.Close()
+				<-done
+				t.Fatal("stop ignored cancellation")
+			}
+			require.Equal(t, environment.ProcessRunningState, e.State())
+		})
+	}
+}
