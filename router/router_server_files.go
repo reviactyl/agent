@@ -563,12 +563,6 @@ func postServerChmodFile(c *gin.Context) {
 				}
 
 				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), os.FileMode(mode)); err != nil {
-					// Return nil if the error is an is not exists.
-					// NOTE: os.IsNotExist() does not work if the error is wrapped.
-					if errors.Is(err, os.ErrNotExist) {
-						return nil
-					}
-
 					return err
 				}
 
@@ -581,6 +575,12 @@ func postServerChmodFile(c *gin.Context) {
 		if errors.Is(err, errInvalidFileMode) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Invalid file mode.",
+			})
+			return
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+				"error": "The requested file was not found on the system.",
 			})
 			return
 		}
