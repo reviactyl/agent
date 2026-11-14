@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/reviactyl/agent/config"
 	wnet "github.com/reviactyl/agent/internal/network"
 	"github.com/reviactyl/agent/server"
+	"github.com/reviactyl/agent/server/filesystem"
 )
 
 var client *http.Client
@@ -136,10 +138,11 @@ func (c *Counter) Write(p []byte) (int, error) {
 }
 
 type DownloadRequest struct {
-	Directory string
-	URL       *url.URL
-	FileName  string
-	UseHeader bool
+	Directory     string
+	URL           *url.URL
+	FileName      string
+	UseHeader     bool
+	RetainFailure bool
 }
 
 type Download struct {
@@ -151,6 +154,7 @@ type Download struct {
 	progress   float64
 	cancelFunc context.CancelFunc
 	canceled   bool
+	failure    string
 }
 
 // New starts a new tracked download which allows for cancellation later on by calling
@@ -179,6 +183,11 @@ func ByServer(sid string) []*Download {
 			}
 		}
 	}
+	for _, failure := range instance.failures {
+		if failure.download.server.ID() == sid {
+			downloads = append(downloads, failure.download)
+		}
+	}
 	return downloads
 }
 
@@ -189,18 +198,23 @@ func ByID(dlid string) *Download {
 }
 
 func (dl *Download) MarshalJSON() ([]byte, error) {
+	dl.mu.RLock()
+	defer dl.mu.RUnlock()
+	status := "downloading"
+	if dl.failure != "" {
+		status = "failed"
+	}
 	return json.Marshal(struct {
 		Identifier string
 		Progress   float64
-	}{
-		Identifier: dl.Identifier,
-		Progress:   dl.Progress(),
-	})
+		Status     string
+		Error      string `json:",omitempty"`
+	}{dl.Identifier, dl.progress, status, dl.failure})
 }
 
 // Execute executes a given download for the server and begins writing the file to the disk. Once
-// completed the download will be removed from the cache.
-func (dl *Download) Execute() error {
+// successful the download is removed; requested failure history is retained temporarily.
+func (dl *Download) Execute() (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*12)
 	dl.mu.Lock()
 	if dl.canceled {
@@ -210,7 +224,10 @@ func (dl *Download) Execute() error {
 	}
 	dl.cancelFunc = cancel
 	dl.mu.Unlock()
-	defer dl.Cancel()
+	defer func() {
+		cancel()
+		instance.complete(dl, err)
+	}()
 
 	// At this point we have verified the destination is not within the local network, so we can
 	// now make a request to that URL and pull down the file, saving it to the server's data
@@ -230,7 +247,7 @@ func (dl *Download) Execute() error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
+		return &responseStatusError{code: res.StatusCode}
 	}
 
 	if dl.req.UseHeader {
@@ -327,6 +344,7 @@ type Downloader struct {
 	mu            sync.RWMutex
 	downloadCache map[string]*Download
 	serverCache   map[string][]string
+	failures      map[string]*failedDownload
 }
 
 // track tracks a download in the internal cache for this instance.
@@ -354,6 +372,9 @@ func (d *Downloader) find(dlid string) *Download {
 	if entry, ok := d.downloadCache[dlid]; ok {
 		return entry
 	}
+	if entry, ok := d.failures[dlid]; ok {
+		return entry.download
+	}
 	return nil
 }
 
@@ -362,6 +383,14 @@ func (d *Downloader) find(dlid string) *Download {
 func (d *Downloader) remove(dlID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.removeLocked(dlID)
+}
+
+func (d *Downloader) removeLocked(dlID string) {
+	if failure, ok := d.failures[dlID]; ok {
+		failure.timer.Stop()
+		delete(d.failures, dlID)
+	}
 	if _, ok := d.downloadCache[dlID]; !ok {
 		return
 	}
@@ -374,10 +403,84 @@ func (d *Downloader) remove(dlID string) {
 				out = append(out, k)
 			}
 		}
-		d.serverCache[sID] = out
+		if len(out) == 0 {
+			delete(d.serverCache, sID)
+		} else {
+			d.serverCache[sID] = out
+		}
 	}
 }
 
 func IsDownloadError(err error) bool {
 	return errors.Is(err, ErrDownloadFailed) || errors.Is(err, ErrInvalidIPAddress) || errors.Is(err, ErrInternalResolution)
+}
+
+const failureRetention = 15 * time.Minute
+const maxRetainedFailures = 100
+
+type failedDownload struct {
+	download *Download
+	finished time.Time
+	timer    *time.Timer
+}
+
+func (d *Downloader) complete(dl *Download, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+	d.removeLocked(dl.Identifier)
+	dl.cancelFunc = nil
+	canceled := dl.canceled
+	dl.canceled = true
+	if err == nil || canceled || !dl.req.RetainFailure {
+		return
+	}
+	dl.failure = failureMessage(err)
+	if d.failures == nil {
+		d.failures = make(map[string]*failedDownload)
+	}
+	if len(d.failures) >= maxRetainedFailures {
+		var oldestID string
+		var oldest time.Time
+		for id, failure := range d.failures {
+			if oldestID == "" || failure.finished.Before(oldest) {
+				oldestID, oldest = id, failure.finished
+			}
+		}
+		d.removeLocked(oldestID)
+	}
+	failure := &failedDownload{download: dl, finished: time.Now()}
+	failure.timer = time.AfterFunc(failureRetention, func() { d.remove(dl.Identifier) })
+	d.failures[dl.Identifier] = failure
+}
+
+type responseStatusError struct{ code int }
+
+func (e *responseStatusError) Error() string {
+	return fmt.Sprintf("downloader: got bad response status from endpoint: %d %s", e.code, http.StatusText(e.code))
+}
+
+func failureMessage(err error) string {
+	var status *responseStatusError
+	switch {
+	case errors.As(err, &status):
+		return fmt.Sprintf("The remote server returned HTTP %d %s.", status.code, http.StatusText(status.code))
+	case errors.Is(err, context.DeadlineExceeded):
+		return "The remote download timed out. Please try again."
+	case IsDownloadError(err):
+		return "The remote file could not be downloaded. Check that the URL is reachable and allowed."
+	case filesystem.IsErrorCode(err, filesystem.ErrCodeDiskSpace), errors.Is(err, syscall.ENOSPC):
+		return "There is not enough disk space to download this file."
+	case filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory), errors.Is(err, syscall.EISDIR):
+		return "The download destination is an existing directory. Choose a different filename."
+	case filesystem.IsErrorCode(err, filesystem.ErrCodeDenylistFile), filesystem.IsErrorCode(err, filesystem.ErrCodePathResolution):
+		return "Writing to the download destination is prohibited."
+	case errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.ErrShortWrite):
+		return "The remote file was incomplete and could not be saved."
+	case errors.Is(err, os.ErrPermission):
+		return "The download destination is not writable. Check its file permissions."
+	default:
+		return "The remote file could not be saved to the server directory. Check the destination and available disk space."
+	}
 }
