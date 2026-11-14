@@ -280,10 +280,7 @@ func writeServerFile(c *gin.Context, createOnly bool) {
 	c.Status(http.StatusNoContent)
 }
 
-// Returns all of the currently in-progress file downloads and their current download
-// progress. The progress is also pushed out via a websocket event allowing you to just
-// call this once to get current downloads, and then listen to targeted websocket events
-// with the current progress for everything.
+// Returns active downloads and recent background failures for this server.
 func getServerPullingFiles(c *gin.Context) {
 	s := ExtractServer(c)
 	c.JSON(http.StatusOK, gin.H{
@@ -330,10 +327,11 @@ func postServerPullRemoteFile(c *gin.Context) {
 	}
 
 	dl := downloader.New(s, downloader.DownloadRequest{
-		Directory: data.RootPath,
-		URL:       u,
-		FileName:  data.FileName,
-		UseHeader: data.UseHeader,
+		Directory:     data.RootPath,
+		URL:           u,
+		FileName:      data.FileName,
+		UseHeader:     data.UseHeader,
+		RetainFailure: !data.Foreground,
 	})
 	// Do not allow more than three simultaneous remote file downloads at one time.
 	if dl == nil {
