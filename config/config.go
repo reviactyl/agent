@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -415,12 +416,14 @@ type PanelConfiguration struct {
 			Port int `json:"bind_port"`
 		} `json:"sftp"`
 	} `json:"system"`
+	AllowedOrigins []string `json:"allowed_origins"`
 }
 
 // PanelConfiguration returns the values in the configuration that the Panel is
 // allowed to set.
 func (c *Configuration) PanelConfiguration() PanelConfiguration {
 	var p PanelConfiguration
+	p.AllowedOrigins = slices.Clone(c.AllowedOrigins)
 	p.Debug = c.Debug
 	p.Uuid = c.Uuid
 	p.TokenId = c.AuthenticationTokenId
@@ -438,6 +441,7 @@ func (c *Configuration) PanelConfiguration() PanelConfiguration {
 // ApplyPanelConfiguration sets the values in the configuration that the Panel is
 // allowed to set.
 func (c *Configuration) ApplyPanelConfiguration(p PanelConfiguration) {
+	c.AllowedOrigins = p.AllowedOrigins
 	c.Debug = p.Debug
 	c.Uuid = p.Uuid
 	c.AuthenticationTokenId = p.TokenId

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/remote"
@@ -546,6 +547,7 @@ func TestPostUpdateConfigurationOnlyAppliesPanelValues(t *testing.T) {
 	expected.Api.Ssl.Enabled = true
 	expected.Api.UploadLimit = 250
 	expected.System.Sftp.Port = 2023
+	expected.AllowedOrigins = []string{"https://other.invalid"}
 	want, err := yaml.Marshal(expected)
 	if err != nil {
 		t.Fatal(err)
@@ -577,4 +579,132 @@ func TestPostUpdateConfigurationOnlyAppliesPanelValues(t *testing.T) {
 	if string(onDisk) != string(want) {
 		t.Fatalf("unexpected configuration written to disk:\n%s", onDisk)
 	}
+}
+
+func TestPostUpdateConfigurationUpdatesCORS(t *testing.T) {
+	t.Setenv("AGENT_TOKEN_ID", "")
+	t.Setenv("AGENT_TOKEN", "")
+	path := filepath.Join(t.TempDir(), "config.yml")
+	cfg, err := config.NewAtPath(path)
+	require.NoError(t, err)
+	cfg.AuthenticationTokenId = "test-id"
+	cfg.AuthenticationToken = "test-token"
+	cfg.PanelLocation = "https://panel.test"
+	cfg.AllowedOrigins = []string{"https://old.test"}
+	require.NoError(t, cfg.ResolveToken(false))
+	config.Set(cfg)
+	require.NoError(t, config.WriteToDisk(cfg))
+	client := backupTestRemoteClient{}
+	engine := Configure(server.NewEmptyManager(client), client)
+
+	request := func(method, uri, body, token, origin string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, uri, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		return rec
+	}
+	checkOrigins := func(t *testing.T, allowed []string) {
+		t.Helper()
+		require.Equal(t, allowed, config.Get().AllowedOrigins)
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		var persisted config.Configuration
+		require.NoError(t, yaml.Unmarshal(data, &persisted))
+		require.ElementsMatch(t, allowed, persisted.AllowedOrigins)
+		for _, origin := range []string{cfg.PanelLocation, "https://old.test", "https://new.test", "https://untrusted.test"} {
+			want := cfg.PanelLocation
+			for _, permitted := range allowed {
+				if origin != cfg.PanelLocation && (origin == permitted || permitted == "*") {
+					want = permitted
+					break
+				}
+			}
+			for _, method := range []string{http.MethodGet, http.MethodOptions} {
+				rec := request(method, "/api/servers", "", "test-token", origin)
+				status := http.StatusOK
+				if method == http.MethodOptions {
+					status = http.StatusNoContent
+				}
+				require.Equal(t, status, rec.Code, rec.Body.String())
+				require.Equal(t, want, rec.Header().Get("Access-Control-Allow-Origin"), "%s %s", method, origin)
+				require.Equal(t, "true", rec.Header().Get("Access-Control-Allow-Credentials"))
+			}
+		}
+	}
+	checkOrigins(t, []string{"https://old.test"})
+	for _, token := range []string{"", "invalid-token"} {
+		rec := request(http.MethodPost, "/api/update", `{"allowed_origins":["https://new.test"]}`, token, cfg.PanelLocation)
+		require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, rec.Code)
+		checkOrigins(t, []string{"https://old.test"})
+	}
+
+	for _, step := range []struct {
+		name    string
+		body    string
+		status  int
+		origins []string
+	}{
+		{"replace", `{"allowed_origins":["https://new.test"]}`, http.StatusOK, []string{"https://new.test"}},
+		{"omitted", `{"debug":true}`, http.StatusOK, []string{"https://new.test"}},
+		{"invalid credentials", `{"allowed_origins":["https://rejected.test"],"token":"file:///invalid"}`, http.StatusInternalServerError, []string{"https://new.test"}},
+		{"malformed origins", `{"allowed_origins":["https://rejected.test",42]}`, http.StatusBadRequest, []string{"https://new.test"}},
+		{"remove", `{"allowed_origins":[]}`, http.StatusOK, []string{}},
+		{"wildcard", `{"allowed_origins":["*"]}`, http.StatusOK, []string{"*"}},
+		{"null clears", `{"allowed_origins":null}`, http.StatusOK, nil},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			rec := request(http.MethodPost, "/api/update", step.body, "test-token", cfg.PanelLocation)
+			require.Equal(t, step.status, rec.Code, rec.Body.String())
+			if step.status == http.StatusOK {
+				require.JSONEq(t, `{"applied":true}`, rec.Body.String())
+			}
+			checkOrigins(t, step.origins)
+		})
+	}
+
+	t.Run("concurrent preflight", func(t *testing.T) {
+		done := make(chan struct{})
+		result := make(chan string, 1)
+		go func() {
+			for {
+				select {
+				case <-done:
+					result <- ""
+					return
+				default:
+					rec := request(http.MethodOptions, "/api/servers", "", "", "https://new.test")
+					origin := rec.Header().Get("Access-Control-Allow-Origin")
+					if rec.Code != http.StatusNoContent || (origin != cfg.PanelLocation && origin != "https://new.test") {
+						result <- "unexpected preflight response: " + origin
+						return
+					}
+				}
+			}
+		}()
+		defer func() {
+			close(done)
+			require.Empty(t, <-result)
+		}()
+		for i := 0; i < 20; i++ {
+			origin := "https://new.test"
+			if i%2 == 0 {
+				origin = "https://old.test"
+			}
+			rec := request(http.MethodPost, "/api/update", `{"allowed_origins":["`+origin+`"]}`, "test-token", cfg.PanelLocation)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		}
+	})
+	checkOrigins(t, []string{"https://new.test"})
+
+	config.Update(func(c *config.Configuration) { c.IgnorePanelConfigUpdates = true })
+	rec := request(http.MethodPost, "/api/update", `{"allowed_origins":["https://old.test"]}`, "test-token", cfg.PanelLocation)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.JSONEq(t, `{"applied":false}`, rec.Body.String())
+	checkOrigins(t, []string{"https://new.test"})
 }

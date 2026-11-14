@@ -43,3 +43,28 @@ func TestPrivateNetworkPreflightGrantUsesResponseHeader(t *testing.T) {
 
 	require.Equal(t, "true", rec.Header().Get("Access-Control-Allow-Private-Network"))
 }
+
+func TestCORSUsesCurrentConfiguration(t *testing.T) {
+	engine := newCORSTestEngine(t, func(cfg *config.Configuration) {
+		cfg.AllowedOrigins = []string{"https://old.test"}
+		cfg.AllowCORSPrivateNetwork = true
+	})
+	config.Update(func(cfg *config.Configuration) {
+		cfg.PanelLocation = "https://new-panel.test"
+		cfg.AllowedOrigins = []string{"https://new.test"}
+		cfg.AllowCORSPrivateNetwork = false
+	})
+	for _, origin := range []string{"https://new-panel.test", "https://new.test", "https://old.test", "http://panel.test"} {
+		req := httptest.NewRequest(http.MethodOptions, "/resource", nil)
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		want := "https://new-panel.test"
+		if origin == "https://new.test" {
+			want = origin
+		}
+		require.Equal(t, http.StatusNoContent, rec.Code)
+		require.Equal(t, want, rec.Header().Get("Access-Control-Allow-Origin"))
+		require.Empty(t, rec.Header().Get("Access-Control-Allow-Private-Network"))
+	}
+}
