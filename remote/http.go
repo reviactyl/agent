@@ -172,8 +172,8 @@ func (c *client) request(ctx context.Context, method, path string, body *bytes.B
 		}
 		res = r
 		if r.HasError() {
-			// Close the request body after returning the error to free up resources.
-			defer r.Body.Close()
+			// Close the replay body after returning the error to free up resources.
+			defer func() { _ = r.Body.Close() }()
 			// Don't keep attempting to access this endpoint if the response is a 4XX
 			// level error which indicates a client mistake. Only retry when the error
 			// is due to a server issue (5XX error).
@@ -245,17 +245,24 @@ func (r *Response) HasError() bool {
 }
 
 // Reads the body from the response and returns it, then replaces it on the response
-// so that it can be read again later. This does not close the response body, so any
-// functions calling this should be sure to manually defer a Body.Close() call.
+// so that it can be read again later. The consumed response body is closed before
+// it is replaced with the replay body.
 func (r *Response) Read() ([]byte, error) {
-	var b []byte
 	if r.Response == nil {
 		return nil, errors.New("remote: attempting to read missing response")
 	}
+
+	var b []byte
+	var err error
 	if r.Response.Body != nil {
-		b, _ = io.ReadAll(r.Response.Body)
+		body := r.Response.Body
+		b, err = io.ReadAll(body)
+		_ = body.Close()
 	}
 	r.Response.Body = io.NopCloser(bytes.NewBuffer(b))
+	if err != nil {
+		return b, errors.Wrap(err, "remote: could not read response")
+	}
 	return b, nil
 }
 
