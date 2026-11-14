@@ -15,9 +15,12 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	. "github.com/franela/goblin"
+	"golang.org/x/sys/unix"
 
 	"github.com/reviactyl/agent/internal/ufs"
 
@@ -689,18 +692,29 @@ func TestFilesystem_Copy(t *testing.T) {
 
 func TestCopyFailureRemovesPartialDestination(t *testing.T) {
 	if os.Getenv("REV148_COPY_HELPER") != "1" {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestCopyFailureRemovesPartialDestination$", "-test.v")
-		cmd.Env = append(os.Environ(), "REV148_COPY_HELPER=1")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("copy subprocess: %v\n%s", err, output)
+		for _, fallback := range []string{"0", "1"} {
+			t.Run("fallback="+fallback, func(t *testing.T) {
+				cmd := exec.Command(os.Args[0], "-test.run=^TestCopyFailureRemovesPartialDestination$", "-test.v")
+				cmd.Env = append(os.Environ(), "REV148_COPY_HELPER=1", "REV148_COPY_FALLBACK="+fallback)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("copy subprocess: %v\n%s", err, output)
+				}
+				t.Log(string(output))
+			})
 		}
-		t.Log(string(output))
 		return
 	}
-
+	if os.Getenv("REV148_COPY_FALLBACK") == "1" {
+		rejectUnnamedCopyFiles(t)
+	}
 	fs, rfs := NewFs()
 	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+	checkCopyFailure(t, fs, rfs)
+}
+
+func checkCopyFailure(t *testing.T, fs *Filesystem, rfs *rootFs) {
+	t.Helper()
 	contents := bytes.Repeat([]byte("copy data"), 16384)
 	if err := fs.Write("source.txt", bytes.NewReader(contents), int64(len(contents)), 0o640); err != nil {
 		t.Fatal(err)
@@ -733,9 +747,14 @@ func TestCopyFailureRemovesPartialDestination(t *testing.T) {
 	if err != nil || len(entries) != 2 {
 		t.Fatalf("file list after failure: %v, %v", entries, err)
 	}
-	if fs.CachedUsage() != usage || fs.reserved != 0 {
+	if fs.CachedUsage() != usage || fs.reserved != 0 || len(fs.copyStaging) != 0 {
 		t.Fatalf("failed copy usage = %d, reserved = %d, want %d and 0", fs.CachedUsage(), fs.reserved, usage)
 	}
+	fs.SetDiskLimit(usage + int64(len(contents)) - 1)
+	if err := fs.Copy("source.txt"); !IsErrorCode(err, ErrCodeDiskSpace) {
+		t.Fatalf("copy exceeding quota: %v", err)
+	}
+	fs.SetDiskLimit(usage + int64(len(contents)))
 	if err := fs.Copy("source.txt"); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
@@ -752,10 +771,122 @@ func TestCopyFailureRemovesPartialDestination(t *testing.T) {
 	if fs.CachedUsage() != usage+int64(len(contents)) {
 		t.Fatalf("successful copy usage = %d", fs.CachedUsage())
 	}
+	if len(fs.copyStaging) != 0 {
+		t.Fatal("copy left an active staging reservation")
+	}
 	t.Logf("EFBIG after 49152 bytes; no partial destination; source and existing copy preserved; retry copied %d bytes", len(contents))
 }
 
+func rejectUnnamedCopyFiles(t *testing.T) {
+	t.Helper()
+	filter := []unix.SockFilter{
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: unix.SYS_OPENAT, Jf: 4},
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 32},
+		{Code: unix.BPF_ALU | unix.BPF_AND | unix.BPF_K, K: unix.O_TMPFILE},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: unix.O_TMPFILE, Jf: 1},
+		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EOPNOTSUPP)},
+		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+	}
+	program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if result, _, err := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC, uintptr(unsafe.Pointer(&program))); err != 0 || result != 0 {
+		t.Fatalf("seccomp synchronization: result=%d, error=%v", result, err)
+	}
+	fd, err := unix.Open(t.TempDir(), unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err == nil {
+		_ = unix.Close(fd)
+	}
+	if !errors.Is(err, unix.EOPNOTSUPP) {
+		t.Fatalf("O_TMPFILE rejection was not installed: %v", err)
+	}
+}
+
+func TestCopyOnSeparateMountWithoutTmpfile(t *testing.T) {
+	if os.Getenv("REV148_MOUNT_HELPER") != "1" {
+		cmd := exec.Command("unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", os.Args[0], "-test.run=^TestCopyOnSeparateMountWithoutTmpfile$", "-test.v")
+		cmd.Env = append(os.Environ(), "REV148_MOUNT_HELPER=1")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			if bytes.HasPrefix(output, []byte("unshare:")) && bytes.Contains(output, []byte("Operation not permitted")) {
+				t.Skip("mount namespace unavailable: " + string(output))
+			}
+			t.Fatalf("mount subprocess: %v\n%s", err, output)
+		}
+		t.Log(string(output))
+		return
+	}
+
+	fs, rfs := NewFs()
+	if err := unix.Mount("tmpfs", fs.Path(), "tmpfs", 0, "size=8m"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Unmount(fs.Path(), 0); err != nil {
+			t.Error(err)
+		}
+		_ = os.RemoveAll(rfs.root)
+	})
+	var mounted, parent unix.Stat_t
+	if err := unix.Stat(fs.Path(), &mounted); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Stat(rfs.root, &parent); err != nil {
+		t.Fatal(err)
+	}
+	if mounted.Dev == parent.Dev {
+		t.Fatal("server root did not mount on a separate filesystem")
+	}
+	t.Logf("server mount device=%d, parent device=%d", mounted.Dev, parent.Dev)
+	rejectUnnamedCopyFiles(t)
+	if err := fs.Write("source.txt", bytes.NewBufferString("complete"), 8, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Write("source copy.txt", bytes.NewBufferString("existing"), 8, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Copy("source.txt"); err != nil {
+		t.Fatalf("copy on separate mount without O_TMPFILE: %v", err)
+	}
+	for name, want := range map[string]string{"source.txt": "complete", "source copy.txt": "existing", "source copy 1.txt": "complete"} {
+		data, err := os.ReadFile(filepath.Join(fs.Path(), name))
+		if err != nil || string(data) != want {
+			t.Fatalf("%s changed: %q, %v", name, data, err)
+		}
+	}
+	if size := fs.CachedUsage(); size != 24 || fs.reserved != 0 {
+		t.Fatalf("usage=%d, reserved=%d, want 24/0", size, fs.reserved)
+	}
+	entries, err := fs.ReadDir("/")
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("staging remains in file list: %v, %v", entries, err)
+	}
+	t.Log("forced EOPNOTSUPP: separate tmpfs mount copy, collision, source, quota and cleanup verified")
+	if err := fs.TruncateRootDirectory(); err != nil {
+		t.Fatal(err)
+	}
+	checkCopyFailure(t, fs, rfs)
+}
+
 func TestCopyStagingCannotRemoveReplacement(t *testing.T) {
+	if os.Getenv("REV148_STAGING_HELPER") != "1" {
+		for _, fallback := range []string{"0", "1"} {
+			t.Run("fallback="+fallback, func(t *testing.T) {
+				cmd := exec.Command(os.Args[0], "-test.run=^TestCopyStagingCannotRemoveReplacement$", "-test.v")
+				cmd.Env = append(os.Environ(), "REV148_STAGING_HELPER=1", "REV148_COPY_FALLBACK="+fallback)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("staging subprocess: %v\n%s", err, output)
+				}
+			})
+		}
+		return
+	}
+	if os.Getenv("REV148_COPY_FALLBACK") == "1" {
+		rejectUnnamedCopyFiles(t)
+	}
 	fs, rfs := NewFs()
 	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
 	dirfd, name, closeFd, err := fs.unixFS.SafePath("source copy.txt")
@@ -767,13 +898,24 @@ func TestCopyStagingCannotRemoveReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanup()
+	defer file.Close()
+	defer func() {
+		if _, err := cleanup(); err != nil {
+			t.Error(err)
+		}
+	}()
 	if _, err := file.WriteString("incomplete data"); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := fs.ReadDir("/")
-	if err != nil || len(entries) != 0 {
+	if err != nil {
 		t.Fatalf("incomplete copy is exposed: %v, %v", entries, err)
+	}
+	for _, entry := range entries {
+		info, err := rfs.StatServerFile(entry.Name())
+		if err != nil || !entry.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Fatalf("staging is not private: %v, %v", info, err)
+		}
 	}
 	if err := rfs.CreateServerFileFromString(name, "replacement"); err != nil {
 		t.Fatal(err)
@@ -781,11 +923,128 @@ func TestCopyStagingCannotRemoveReplacement(t *testing.T) {
 	if err := linkCopyFile(dirfd, name, file); !errors.Is(err, syscall.EEXIST) {
 		t.Fatalf("publishing overwrote a replacement: %v", err)
 	}
-	cleanup()
+	if _, err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
 	data, err := os.ReadFile(filepath.Join(rfs.root, "server", name))
 	if err != nil || string(data) != "replacement" {
 		t.Fatalf("failed copy cleanup changed replacement: %q, %v", data, err)
 	}
+}
+
+func TestCopyFallbackStagingReplacementAndAccounting(t *testing.T) {
+	if os.Getenv("REV148_FALLBACK_HELPER") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestCopyFallbackStagingReplacementAndAccounting$", "-test.v")
+		cmd.Env = append(os.Environ(), "REV148_FALLBACK_HELPER=1")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("fallback subprocess: %v\n%s", err, output)
+		}
+		t.Log(string(output))
+		return
+	}
+	rejectUnnamedCopyFiles(t)
+	t.Run("replaced staging directory", func(t *testing.T) {
+		fs, rfs := NewFs()
+		t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+		dirfd, _, closeFd, err := fs.unixFS.SafePath("output.txt")
+		defer closeFd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, replacement := range []string{"directory", "symlink", "file"} {
+			t.Run(replacement, func(t *testing.T) {
+				file, cleanup, err := fs.newCopyFile(dirfd)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				if _, err := file.WriteString("partial"); err != nil {
+					t.Fatal(err)
+				}
+				entries, err := os.ReadDir(fs.Path())
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("staging entries: %v, %v", entries, err)
+				}
+				staged := filepath.Join(fs.Path(), entries[0].Name())
+				moved := staged + "-moved"
+				if err := os.Rename(staged, moved); err != nil {
+					t.Fatal(err)
+				}
+				sentinel := filepath.Join(fs.Path(), "sentinel")
+				if err := os.Mkdir(sentinel, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(sentinel, "copy"), []byte("preserve"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				switch replacement {
+				case "directory":
+					err = os.Rename(sentinel, staged)
+				case "symlink":
+					err = os.Symlink(sentinel, staged)
+				case "file":
+					err = os.WriteFile(staged, []byte("preserve"), 0o600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := cleanup(); err == nil {
+					t.Fatal("cleanup did not report a replaced staging directory")
+				}
+				check := staged
+				if replacement != "file" {
+					check = filepath.Join(staged, "copy")
+				}
+				if data, err := os.ReadFile(check); err != nil || string(data) != "preserve" {
+					t.Fatalf("replacement changed: %q, %v", data, err)
+				}
+				if entries, err := os.ReadDir(moved); err != nil || len(entries) != 0 {
+					t.Fatalf("original partial remains: %v, %v", entries, err)
+				}
+				if err := fs.TruncateRootDirectory(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	})
+	t.Run("disk walks during copy", func(t *testing.T) {
+		fs, rfs := NewFs()
+		t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+		contents := bytes.Repeat([]byte("a"), 8<<20)
+		if err := fs.Write("source.bin", bytes.NewReader(contents), int64(len(contents)), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if err := fs.Write(".agent-copy-user-data", bytes.NewBufferString("x"), 1, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		limit := 2*int64(len(contents)) + 1
+		fs.SetDiskLimit(limit)
+		result := make(chan error, 1)
+		go func() { result <- fs.Copy("source.bin") }()
+		for {
+			if _, err := fs.updateCachedDiskUsage(); err != nil {
+				t.Fatal(err)
+			}
+			if fs.CachedUsage() > limit {
+				t.Fatalf("private copy was counted twice: usage=%d, limit=%d", fs.CachedUsage(), limit)
+			}
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fs.CachedUsage() != limit || fs.reserved != 0 {
+					t.Fatalf("copy accounting: usage=%d, reserved=%d", fs.CachedUsage(), fs.reserved)
+				}
+				if err := fs.Copy("source.bin"); !IsErrorCode(err, ErrCodeDiskSpace) {
+					t.Fatalf("copy beyond quota: %v", err)
+				}
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	})
 }
 
 func TestFilesystem_Delete(t *testing.T) {
