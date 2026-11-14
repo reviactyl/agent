@@ -120,3 +120,35 @@ func TestSyncWithConfigurationRejectsChangedUuid(t *testing.T) {
 		t.Fatalf("expected server uuid to be unchanged, got %q", s.ID())
 	}
 }
+
+func TestManagerAllSnapshotSurvivesFailedInstallation(t *testing.T) {
+	setTestConfig(t)
+	manager := NewEmptyManager(nil)
+	for _, uuid := range []string{
+		"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+	} {
+		s, err := New(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SyncWithConfiguration(serverConfigurationResponse(t, uuid)); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.CleanupForDestroy)
+		manager.Add(s)
+	}
+	snapshot := manager.All()
+	first, second, third := snapshot[0], snapshot[1], snapshot[2]
+	if err := manager.FailInstallation(first); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot[0] != first || snapshot[1] != second || snapshot[2] != third {
+		t.Fatal("a failed installation changed a previously returned server list")
+	}
+	current := manager.All()
+	if len(current) != 2 || current[0] != second || current[1] != third {
+		t.Fatal("the manager must remove only the failed instance")
+	}
+}

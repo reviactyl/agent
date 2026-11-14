@@ -213,11 +213,11 @@ func postCreateServer(c *gin.Context) {
 		installed := false
 		defer func() {
 			if !installed {
-				i.Server().CleanupForDestroy()
 				if err := manager.FailInstallation(i.Server()); err != nil {
 					i.Server().Log().WithError(err).Error("failed to retain installation recovery configuration")
 					manager.Remove(func(match *server.Server) bool { return match == i.Server() })
 				}
+				i.Server().CleanupForDestroy()
 				_ = i.Server().Filesystem().UnixFS().Close()
 			}
 		}()

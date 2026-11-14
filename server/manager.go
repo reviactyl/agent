@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -83,7 +84,7 @@ func (m *Manager) Put(s []*Server) {
 func (m *Manager) All() []*Server {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.servers
+	return slices.Clone(m.servers)
 }
 
 // Add adds an item to the collection store.
@@ -119,6 +120,9 @@ func (m *Manager) FailInstallation(s *Server) error {
 	data := &remote.ServerConfigurationResponse{Settings: settings, ProcessConfiguration: s.ProcessConfiguration()}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s.Context().Err() != nil {
+		return nil
+	}
 	for i, current := range m.servers {
 		if current != s {
 			continue
@@ -131,6 +135,13 @@ func (m *Manager) FailInstallation(s *Server) error {
 		break
 	}
 	return nil
+}
+
+func (m *Manager) PrepareForDeletion(s *Server) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s.CtxCancel()
+	delete(m.failedInstalls, s.ID())
 }
 
 func (m *Manager) RecoverFailedInstallation(uuid string) (*Server, error) {
@@ -209,6 +220,13 @@ func (m *Manager) Remove(filter func(match *Server) bool) {
 		}
 	}
 	m.servers = r
+}
+
+func (m *Manager) RemoveByID(uuid string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.servers = slices.DeleteFunc(m.servers, func(s *Server) bool { return s.ID() == uuid })
+	delete(m.failedInstalls, uuid)
 }
 
 // PersistStates writes the current environment states to the disk for each

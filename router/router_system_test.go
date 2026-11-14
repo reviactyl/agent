@@ -1144,3 +1144,112 @@ func TestUnsafeUpdateRetryRecoversBackupBeforeRealInstall(t *testing.T) {
 	}
 	checkFiles()
 }
+
+type deletingInstallTestEnvironment struct {
+	environment.ProcessEnvironment
+	destroy func() error
+}
+
+func (e deletingInstallTestEnvironment) Destroy() error { return e.destroy() }
+
+func TestDeleteDuringInitialInstallationCannotRecover(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		failBeforeDelete bool
+		destroyError     bool
+		replacementFails bool
+	}{
+		{name: "installation canceled during deletion"},
+		{name: "installation failed before deletion", failBeforeDelete: true},
+		{name: "container removal failed", destroyError: true},
+		{name: "replacement fails while deleting", replacementFails: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const uuid = "ab012345-6789-4abc-8def-0123456789ab"
+			cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+			require.NoError(t, err)
+			cfg.AuthenticationToken = "test-token"
+			cfg.System.Data = t.TempDir()
+			config.Set(cfg)
+			manager := server.NewEmptyManager(nil)
+			settings, err := json.Marshal(map[string]string{"uuid": uuid})
+			require.NoError(t, err)
+			s, err := manager.InitServer(uuid, remote.ServerConfigurationResponse{
+				Settings: settings, ProcessConfiguration: &remote.ProcessConfiguration{},
+			})
+			require.NoError(t, err)
+			t.Cleanup(s.CleanupForDestroy)
+			manager.Add(s)
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			s.Environment = deletingInstallTestEnvironment{destroy: func() error {
+				close(entered)
+				<-release
+				if test.destroyError {
+					return errors.New("container removal failed")
+				}
+				return nil
+			}}
+			if test.failBeforeDelete {
+				require.NoError(t, manager.FailInstallation(s))
+			}
+			recorder := httptest.NewRecorder()
+			engine := gin.New()
+			engine.Use(middleware.CaptureErrors())
+			engine.DELETE("/api/servers/:server", func(c *gin.Context) {
+				c.Set("manager", manager)
+				c.Set("server", s)
+			}, deleteServer)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/api/servers/"+uuid, nil))
+			}()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("deletion did not reach container removal")
+			}
+			require.ErrorIs(t, s.Context().Err(), context.Canceled)
+			if !test.failBeforeDelete {
+				failed := s
+				if test.replacementFails {
+					failed, err = server.New(nil)
+					require.NoError(t, err)
+					require.NoError(t, failed.SyncWithConfiguration(remote.ServerConfigurationResponse{
+						Settings: settings, ProcessConfiguration: &remote.ProcessConfiguration{},
+					}))
+					t.Cleanup(failed.CleanupForDestroy)
+					manager.Remove(func(current *server.Server) bool { return current == s })
+					require.True(t, manager.AddIfMissing(failed))
+				}
+				require.NoError(t, manager.FailInstallation(failed))
+			}
+			unblock()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("deletion did not finish")
+			}
+			if test.destroyError {
+				require.Equal(t, http.StatusInternalServerError, recorder.Code, recorder.Body.String())
+				current, exists := manager.Get(uuid)
+				require.True(t, exists, "a failed deletion must remain available for retry")
+				require.Same(t, s, current)
+				_ = s.Filesystem().UnixFS().Close()
+			} else {
+				require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+				require.Zero(t, manager.Len())
+			}
+			recovered, err := manager.RecoverFailedInstallation(uuid)
+			if recovered != nil {
+				t.Cleanup(recovered.CleanupForDestroy)
+				_ = recovered.Filesystem().UnixFS().Close()
+			}
+			require.NoError(t, err)
+			require.Nil(t, recovered, "a deleted installation must not be recoverable")
+		})
+	}
+}
