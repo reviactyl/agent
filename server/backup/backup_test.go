@@ -97,7 +97,11 @@ func TestS3BackupGenerateRemoteRequestPreservesSuccessfulUpload(t *testing.T) {
 		return remote.BackupRemoteUploadResponse{Parts: []string{server.URL}, PartSize: int64(len(data))}, nil
 	}}
 	backup := NewS3(client, uuid, "")
-	parts, err := backup.generateRemoteRequest(context.Background(), io.NopCloser(strings.NewReader(string(data))))
+	file, err := os.Open(backup.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, err := backup.generateRemoteRequest(context.Background(), file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,29 +123,38 @@ func TestS3BackupGenerateRemoteRequestUploadsPartsAndStopsAfterCancellation(t *t
 	}
 	var requests atomic.Int32
 	firstPartReceived := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		part := requests.Add(1)
-		if part == 1 {
-			close(firstPartReceived)
-		}
 		if got, err := io.ReadAll(r.Body); err != nil {
 			t.Errorf("read part %d: %v", part, err)
 		} else if want := string(data[(part-1)*4 : part*4]); string(got) != want {
 			t.Errorf("part %d body = %q, want %q", part, got, want)
 		}
+		if part == 1 {
+			close(firstPartReceived)
+			<-ctx.Done()
+		}
 		w.Header().Set("ETag", "etag")
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer server.Close()
+	defer func() {
+		cancel()
+		server.Close()
+	}()
 
 	client := backupRemoteClient{getURLs: func(context.Context, string, int64) (remote.BackupRemoteUploadResponse, error) {
 		return remote.BackupRemoteUploadResponse{Parts: []string{server.URL + "/1", server.URL + "/2"}, PartSize: 4}, nil
 	}}
 	backup := NewS3(client, uuid, "")
-	ctx, cancel := context.WithCancel(context.Background())
+	file, err := os.Open(backup.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
 	result := make(chan error, 1)
 	go func() {
-		_, err := backup.generateRemoteRequest(ctx, io.NopCloser(strings.NewReader(string(data))))
+		_, err := backup.generateRemoteRequest(ctx, file)
 		result <- err
 	}()
 	select {
