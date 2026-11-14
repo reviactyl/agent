@@ -69,6 +69,8 @@ var restartAfterSystemUpdate = system.RestartAfterUpdate
 
 var systemUpdateInProgress atomic.Bool
 
+var failedSystemUpdate atomic.Pointer[system.InstalledUpdate]
+
 var systemUpdateTimeout = 2 * time.Minute
 
 var systemUpdateRestartTimeout = 20 * time.Second
@@ -99,6 +101,14 @@ func postSystemUpdate(c *gin.Context) {
 	operationContext := context.Background()
 	ctx, cancel := context.WithTimeout(operationContext, systemUpdateTimeout)
 	defer cancel()
+	if previous := failedSystemUpdate.Load(); previous != nil {
+		if err := system.RecoverInterruptedUpdate(ctx, previous); err != nil {
+			systemUpdateInProgress.Store(false)
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		failedSystemUpdate.Store(nil)
+	}
 	installed, err := installSystemUpdate(ctx, request.Version, request.Channel)
 	if err != nil {
 		systemUpdateInProgress.Store(false)
@@ -120,6 +130,10 @@ func postSystemUpdate(c *gin.Context) {
 		systemUpdateInProgress.Store(false)
 		middleware.CaptureAndAbort(c, err)
 		return
+	}
+
+	if err != nil {
+		failedSystemUpdate.Store(installed)
 	}
 
 	// The transient supervisor should replace this process almost immediately.

@@ -346,3 +346,50 @@ func TestRestartAfterUpdatePreventsRollbackWhenSupervisorCleanupFails(t *testing
 		t.Fatalf("missing supervisor cleanup failure: %v", err)
 	}
 }
+
+func TestRecoverInterruptedUpdateRequiresStoppedSupervisor(t *testing.T) {
+	for _, state := range []string{"stopped", "not-found", "uncertain", "consumed"} {
+		t.Run(state, func(t *testing.T) {
+			directory := t.TempDir()
+			executable := filepath.Join(directory, "agent")
+			backup := executable + ".update-backup"
+			if err := os.WriteFile(executable, []byte("new agent"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if state != "consumed" {
+				if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("REV137_UNIT_STATE", state)
+			script := "#!/bin/sh\ncase \"$1\" in\nstop) [ \"$REV137_UNIT_STATE\" = stopped ] || [ \"$REV137_UNIT_STATE\" = consumed ] ;;\nshow) if [ \"$REV137_UNIT_STATE\" = not-found ]; then echo not-found; exit 4; else echo loaded; fi ;;\nesac\n"
+			if err := os.WriteFile(filepath.Join(directory, "systemctl"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := RecoverInterruptedUpdate(context.Background(), &InstalledUpdate{ExecutablePath: executable, BackupPath: backup})
+			if (err != nil) != (state == "uncertain") {
+				t.Fatalf("unexpected recovery outcome: %v", err)
+			}
+			current, err := os.ReadFile(executable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state == "uncertain" || state == "consumed" {
+				if string(current) != "new agent" {
+					t.Fatalf("recovery changed executable: %q", current)
+				}
+			} else if string(current) != "old agent" {
+				t.Fatalf("recovery did not restore backup: %q", current)
+			}
+			if state == "uncertain" {
+				previous, err := os.ReadFile(backup)
+				if err != nil || string(previous) != "old agent" {
+					t.Fatalf("unsafe recovery changed backup: %q, %v", previous, err)
+				}
+			} else if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("backup remained after safe recovery: %v", err)
+			}
+		})
+	}
+}
