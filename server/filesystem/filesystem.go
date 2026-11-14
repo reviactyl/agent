@@ -517,86 +517,88 @@ func (fs *Filesystem) Copy(p string) error {
 		baseName = strings.TrimSuffix(baseName, ".tar")
 	}
 
-	// Never write into an existing file, such as a copy made by another request
-	// at the same time.
-	var (
-		newName string
-		dst     ufs.File
-	)
-	for i := 0; ; i++ {
-		newName, err = fs.findCopySuffix(dirfd, baseName, extension)
-		if err == nil {
-			dst, err = fs.unixFS.OpenFileat(dirfd, newName, ufs.O_WRONLY|ufs.O_CREATE|ufs.O_EXCL, info.Mode())
+	dst, cleanup, err := fs.newCopyFile(dirfd)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	n, err := io.Copy(dst, io.LimitReader(source, currentSize))
+	if err != nil {
+		return err
+	}
+	if n != currentSize {
+		return io.ErrUnexpectedEOF
+	}
+	if !fs.isTest {
+		if err := dst.Chown(config.Get().System.User.Uid, config.Get().System.User.Gid); err != nil {
+			return err
 		}
+	}
+	if err := dst.Chmod(info.Mode().Perm()); err != nil {
+		return err
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for i := 0; ; i++ {
+		newName, err := fs.findCopySuffix(dirfd, baseName, extension)
+		if err != nil {
+			return err
+		}
+		err = linkCopyFile(dirfd, newName, dst)
 		if err == nil {
-			break
+			used = n
+			fs.recordWalkFileSizeLocked(dst)
+			return nil
 		}
 		if !errors.Is(err, ufs.ErrExist) || i >= 10 {
 			return err
 		}
 	}
-	defer dst.Close()
-
-	// Do not use CopyBuffer here, it is wasteful as the file implements
-	// io.ReaderFrom, which causes it to not use the buffer anyways.
-	n, err := io.Copy(lockedFilesystemWriter{fs: fs, file: dst}, io.LimitReader(source, currentSize))
-	used = n
-	if err != nil {
-		freed, cleanupErr := fs.removeFailedCopy(dirfd, newName, dst)
-		if freed {
-			used = 0
-		}
-		return errors.Combine(err, errors.WrapIf(cleanupErr, "failed to remove incomplete copy"))
-	}
-
-	if !fs.isTest {
-		if err := fs.unixFS.Lchownat(dirfd, newName, config.Get().System.User.Uid, config.Get().System.User.Gid); err != nil {
-			return err
-		}
-	}
-	// Return the error from io.Copy.
-	return err
 }
 
-func (fs *Filesystem) removeFailedCopy(dirfd int, name string, file ufs.File) (freed bool, err error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	var opened unix.Stat_t
-	if err := unix.Fstat(int(file.Fd()), &opened); err != nil {
-		return false, err
+func (fs *Filesystem) newCopyFile(dirfd int) (*os.File, func(), error) {
+	fd, err := unix.Openat(dirfd, ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err == nil {
+		file := os.NewFile(uintptr(fd), "incomplete copy")
+		return file, func() { _ = file.Close() }, nil
 	}
-	defer func() {
-		if err != nil {
-			return
-		}
-		if err = unix.Fstat(int(file.Fd()), &opened); err != nil {
-			return
-		}
-		freed = opened.Nlink == 0
-		if freed && fs.walking {
-			if size, seen := fs.walkObserved[opened.Ino]; seen {
-				fs.walkCompletedDelta -= size
-				delete(fs.walkObserved, opened.Ino)
-			}
-			delete(fs.walkUnobserved, opened.Ino)
-		}
-	}()
-	info, err := fs.unixFS.Lstatat(dirfd, name)
-	if errors.Is(err, ufs.ErrNotExist) {
-		return false, nil
+	if !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.EINVAL) {
+		return nil, nil, err
 	}
+	// Filesystems without unnamed temporary files stage outside the server root.
+	dir, err := os.MkdirTemp(filepath.Dir(fs.Path()), ".agent-copy-")
 	if err != nil {
-		return false, err
+		return nil, nil, err
 	}
-	current := info.Sys().(*unix.Stat_t)
-	if current.Dev != opened.Dev || current.Ino != opened.Ino {
-		return false, nil
+	file, err := os.CreateTemp(dir, "copy-")
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, err
 	}
-	if err := unix.Unlinkat(dirfd, name, 0); err != nil {
-		return false, err
+	cleanup := func() {
+		_ = file.Close()
+		_ = os.RemoveAll(dir)
 	}
-	return false, nil
+	var destination, staging unix.Stat_t
+	if err := unix.Fstat(dirfd, &destination); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if err := unix.Fstat(int(file.Fd()), &staging); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if destination.Dev != staging.Dev {
+		cleanup()
+		return nil, nil, errors.New("server/filesystem: safe copy staging requires the same filesystem")
+	}
+	return file, cleanup, nil
+}
+
+func linkCopyFile(dirfd int, name string, file *os.File) error {
+	return unix.Linkat(unix.AT_FDCWD, "/proc/self/fd/"+strconv.Itoa(int(file.Fd())), dirfd, name, unix.AT_SYMLINK_FOLLOW)
 }
 
 // TruncateRootDirectory removes _all_ files and directories from a server's

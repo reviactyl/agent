@@ -755,147 +755,36 @@ func TestCopyFailureRemovesPartialDestination(t *testing.T) {
 	t.Logf("EFBIG after 49152 bytes; no partial destination; source and existing copy preserved; retry copied %d bytes", len(contents))
 }
 
-func TestRemoveFailedCopyPreservesOtherEntries(t *testing.T) {
-	for _, replacement := range []string{"file", "symlink", "directory", "missing", "renamed", "hardlink"} {
-		t.Run(replacement, func(t *testing.T) {
-			fs, rfs := NewFs()
-			t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
-			if err := rfs.CreateServerFileFromString("partial.txt", "partial"); err != nil {
-				t.Fatal(err)
-			}
-			dirfd, name, closeFd, err := fs.unixFS.SafePath("partial.txt")
-			defer closeFd()
-			if err != nil {
-				t.Fatal(err)
-			}
-			file, err := fs.unixFS.OpenFileat(dirfd, name, ufs.O_WRONLY, 0)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer file.Close()
-			path := filepath.Join(rfs.root, "server", name)
-			other := filepath.Join(rfs.root, "server", "other.txt")
-			switch replacement {
-			case "renamed":
-				err = os.Rename(path, other)
-			case "hardlink":
-				err = os.Link(path, other)
-			default:
-				err = os.Remove(path)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			switch replacement {
-			case "file":
-				err = os.WriteFile(path, []byte("replacement"), 0o600)
-			case "symlink":
-				err = os.WriteFile(other, []byte("replacement"), 0o600)
-				if err == nil {
-					err = os.Symlink("other.txt", path)
-				}
-			case "directory":
-				err = os.Mkdir(path, 0o700)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			freed, err := fs.removeFailedCopy(dirfd, name, file)
-			if err != nil || freed != (replacement != "renamed" && replacement != "hardlink") {
-				t.Fatalf("cleanup freed=%t, error=%v", freed, err)
-			}
-			if replacement == "file" || replacement == "symlink" {
-				data, err := os.ReadFile(path)
-				if err != nil || string(data) != "replacement" {
-					t.Fatalf("replacement changed: %q, %v", data, err)
-				}
-			} else if replacement == "directory" {
-				if info, err := os.Stat(path); err != nil || !info.IsDir() {
-					t.Fatalf("replacement directory changed: %v, %v", info, err)
-				}
-			} else if _, err := os.Lstat(path); !os.IsNotExist(err) {
-				t.Fatalf("partial entry remains: %v", err)
-			}
-			if replacement == "renamed" || replacement == "hardlink" {
-				data, err := os.ReadFile(other)
-				if err != nil || string(data) != "partial" {
-					t.Fatalf("retained link changed: %q, %v", data, err)
-				}
-			}
-		})
-	}
-}
-
-func TestRemoveFailedCopyReportsCleanupError(t *testing.T) {
+func TestCopyStagingCannotRemoveReplacement(t *testing.T) {
 	fs, rfs := NewFs()
 	t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
-	file, err := fs.unixFS.OpenFile("partial.txt", ufs.O_CREATE|ufs.O_WRONLY|ufs.O_EXCL, 0o600)
+	dirfd, name, closeFd, err := fs.unixFS.SafePath("source copy.txt")
+	defer closeFd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
-	freed, err := fs.removeFailedCopy(-1, "partial.txt", file)
-	if freed || !errors.Is(err, syscall.EBADF) {
-		t.Fatalf("cleanup freed=%t, error=%v, want EBADF", freed, err)
+	file, cleanup, err := fs.newCopyFile(dirfd)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := fs.unixFS.Lstat("partial.txt"); err != nil {
-		t.Fatalf("failed cleanup removed the file: %v", err)
+	defer cleanup()
+	if _, err := file.WriteString("incomplete data"); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestRemoveFailedCopyReconcilesDiskWalk(t *testing.T) {
-	for _, observed := range []bool{false, true} {
-		for _, unlinked := range []bool{false, true} {
-			t.Run(fmt.Sprintf("observed=%t/unlinked=%t", observed, unlinked), func(t *testing.T) {
-				fs, rfs := NewFs()
-				t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
-				if err := rfs.CreateServerFileFromString("partial.txt", "partial"); err != nil {
-					t.Fatal(err)
-				}
-				file, err := fs.unixFS.Open("partial.txt")
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer file.Close()
-				info, err := file.Stat()
-				if err != nil {
-					t.Fatal(err)
-				}
-				ino, ok := fileInode(info)
-				if !ok {
-					t.Fatal("file has no inode")
-				}
-				fs.walking = true
-				fs.walkObserved = make(map[uint64]int64)
-				fs.walkUnobserved = make(map[uint64]int64)
-				if observed {
-					fs.walkObserved[ino] = info.Size()
-				} else {
-					fs.walkUnobserved[ino] = info.Size()
-				}
-				if unlinked {
-					if err := fs.unixFS.Remove("partial.txt"); err != nil {
-						t.Fatal(err)
-					}
-				}
-				dirfd, name, closeFd, err := fs.unixFS.SafePath("partial.txt")
-				defer closeFd()
-				if err != nil {
-					t.Fatal(err)
-				}
-				freed, err := fs.removeFailedCopy(dirfd, name, file)
-				if err != nil || !freed || len(fs.walkObserved) != 0 || len(fs.walkUnobserved) != 0 {
-					t.Fatalf("cleanup freed=%t, error=%v, walk=%v/%v", freed, err, fs.walkObserved, fs.walkUnobserved)
-				}
-				var wantDelta int64
-				if observed {
-					wantDelta = -info.Size()
-				}
-				if fs.walkCompletedDelta != wantDelta {
-					t.Fatalf("walk delta=%d, want %d", fs.walkCompletedDelta, wantDelta)
-				}
-			})
-		}
+	entries, err := fs.ReadDir("/")
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("incomplete copy is exposed: %v, %v", entries, err)
+	}
+	if err := rfs.CreateServerFileFromString(name, "replacement"); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkCopyFile(dirfd, name, file); !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("publishing overwrote a replacement: %v", err)
+	}
+	cleanup()
+	data, err := os.ReadFile(filepath.Join(rfs.root, "server", name))
+	if err != nil || string(data) != "replacement" {
+		t.Fatalf("failed copy cleanup changed replacement: %q, %v", data, err)
 	}
 }
 
