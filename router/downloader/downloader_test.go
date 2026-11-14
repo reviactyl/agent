@@ -1,14 +1,20 @@
 package downloader
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/stretchr/testify/require"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/remote"
@@ -93,4 +99,102 @@ func TestCounterUnknownLength(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestRetainedFailuresReleaseSlotsAndExpire(t *testing.T) {
+	s := newPullTestServer(t)
+	t.Cleanup(func() {
+		for _, dl := range ByServer(s.ID()) {
+			dl.Cancel()
+		}
+	})
+	d := instance
+	var first, last *Download
+	for i := 0; i <= maxRetainedFailures; i++ {
+		dl := New(s, DownloadRequest{RetainFailure: true})
+		require.NotNil(t, dl)
+		if i == 0 {
+			first = dl
+		}
+		d.complete(dl, &responseStatusError{code: http.StatusNotFound})
+		last = dl
+	}
+	require.Nil(t, ByID(first.Identifier), "oldest failure must be evicted")
+	require.Len(t, ByServer(s.ID()), maxRetainedFailures)
+	for range 3 {
+		require.NotNil(t, New(s, DownloadRequest{}), "failure history must not consume slots")
+	}
+	require.Nil(t, New(s, DownloadRequest{}), "active admission limit must remain three")
+	d.mu.Lock()
+	d.failures[last.Identifier].timer.Reset(time.Millisecond)
+	d.mu.Unlock()
+	require.Eventually(t, func() bool { return ByID(last.Identifier) == nil }, time.Second, time.Millisecond)
+	// Explicit dismissal removes retained history and its timer too.
+	for _, dl := range ByServer(s.ID()) {
+		dl.Cancel()
+	}
+	require.Empty(t, ByServer(s.ID()))
+	d.mu.RLock()
+	require.Empty(t, d.serverCache[s.ID()])
+	d.mu.RUnlock()
+}
+
+func TestCancelDoesNotRestoreFailureHistory(t *testing.T) {
+	s := newPullTestServer(t)
+	for range 50 {
+		dl := New(s, DownloadRequest{RetainFailure: true})
+		require.NotNil(t, dl)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); dl.Cancel() }()
+		go func() {
+			defer wg.Done()
+			instance.complete(dl, io.ErrUnexpectedEOF)
+			_, _ = json.Marshal(dl)
+		}()
+		wg.Wait()
+		require.Nil(t, ByID(dl.Identifier))
+	}
+}
+
+func TestFailureMessagesDoNotExposeURLCredentials(t *testing.T) {
+	err := fmt.Errorf("%w: %w", ErrDownloadFailed, &url.Error{Op: "Get", URL: "http://user:secret@example.com/?token=private", Err: io.EOF})
+	message := failureMessage(err)
+	require.Contains(t, message, "reachable")
+	require.NotContains(t, message, "secret")
+	require.NotContains(t, message, "private")
+}
+
+func TestCancelRunningBackgroundDownload(t *testing.T) {
+	s := newPullTestServer(t)
+	started := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(origin.Close)
+	u, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	dl := New(s, DownloadRequest{URL: u, RetainFailure: true})
+	t.Cleanup(dl.Cancel)
+	result := make(chan error, 1)
+	go func() { result <- dl.Execute() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("download did not start")
+	}
+	dl.Cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled download did not finish")
+	}
+	require.Nil(t, ByID(dl.Identifier), "cancellation must not produce failure history")
+}
+
+func TestFailureMessageForDirectoryWriteRejection(t *testing.T) {
+	err := fmt.Errorf("write: %w", &os.LinkError{Op: "rename", Old: "/private/staging", New: "/private/destination", Err: syscall.EISDIR})
+	require.Equal(t, "The download destination is an existing directory. Choose a different filename.", failureMessage(err))
 }
