@@ -251,6 +251,19 @@ func (fs *Filesystem) directorySize(root string, trackWrites bool) (int64, error
 		}
 
 		var sysFileInfo = info.Sys().(*unix.Stat_t)
+		if !trackWrites {
+			fs.mu.RLock()
+		}
+		_, staging := fs.copyStaging[copyFileID{sysFileInfo.Dev, sysFileInfo.Ino}]
+		if !trackWrites {
+			fs.mu.RUnlock()
+		}
+		if staging {
+			if trackWrites {
+				fs.mu.Unlock()
+			}
+			return nil
+		}
 		if sysFileInfo.Nlink > 1 {
 			// Hard links have the same inode number
 			if slices.Contains(hardLinks, sysFileInfo.Ino) {
@@ -318,13 +331,20 @@ func (fs *Filesystem) recordWalkFileSizeLocked(file ufs.File) {
 		}
 		ino = st.Ino
 	}
-	previousSize, seen := fs.walkObserved[ino]
-	if !seen {
-		fs.walkUnobserved[ino] = info.Size()
+	fs.recordWalkInodeSizeLocked(ino, info.Size())
+}
+
+func (fs *Filesystem) recordWalkInodeSizeLocked(ino uint64, size int64) {
+	if !fs.walking || fs.walkObserved == nil {
 		return
 	}
-	fs.walkCompletedDelta += info.Size() - previousSize
-	fs.walkObserved[ino] = info.Size()
+	previousSize, seen := fs.walkObserved[ino]
+	if !seen {
+		fs.walkUnobserved[ino] = size
+		return
+	}
+	fs.walkCompletedDelta += size - previousSize
+	fs.walkObserved[ino] = size
 }
 
 func (fs *Filesystem) forgetWalkFileLocked(info ufs.FileInfo) {
