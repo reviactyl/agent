@@ -183,7 +183,7 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 	s.log().WithField("size", size).Debug("got size of backup")
 
 	s.log().Debug("attempting to get S3 upload urls from Panel...")
-	urls, err := s.client.GetBackupRemoteUploadURLs(context.Background(), s.Backup.Uuid, size)
+	urls, err := s.client.GetBackupRemoteUploadURLs(ctx, s.Backup.Uuid, size)
 	if err != nil {
 		return nil, err
 	}

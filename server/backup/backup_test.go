@@ -6,16 +6,176 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/server/filesystem"
 )
+
+type backupRemoteClient struct {
+	remote.Client
+	getURLs func(context.Context, string, int64) (remote.BackupRemoteUploadResponse, error)
+}
+
+func (c backupRemoteClient) GetBackupRemoteUploadURLs(ctx context.Context, backup string, size int64) (remote.BackupRemoteUploadResponse, error) {
+	return c.getURLs(ctx, backup, size)
+}
+
+func TestS3BackupGenerateRemoteRequestCancelsBlockedURLAcquisition(t *testing.T) {
+	backupDir := t.TempDir()
+	config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: backupDir}})
+	const uuid = "00000000-0000-0000-0000-000000000001"
+	if err := os.WriteFile(filepath.Join(backupDir, uuid+".tar.gz"), []byte("backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	urlRequestStarted := make(chan struct{})
+	client := backupRemoteClient{getURLs: func(ctx context.Context, _ string, _ int64) (remote.BackupRemoteUploadResponse, error) {
+		close(urlRequestStarted)
+		<-ctx.Done()
+		return remote.BackupRemoteUploadResponse{}, ctx.Err()
+	}}
+	backup := NewS3(client, uuid, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := backup.generateRemoteRequest(ctx, io.NopCloser(strings.NewReader("backup")))
+		result <- err
+	}()
+
+	select {
+	case <-urlRequestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for presigned URL request")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("presigned URL request did not stop after cancellation")
+	}
+}
+
+func TestS3BackupGenerateRemoteRequestPreservesSuccessfulUpload(t *testing.T) {
+	backupDir := t.TempDir()
+	config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: backupDir}})
+	const uuid = "00000000-0000-0000-0000-000000000001"
+	data := []byte("backup")
+	if err := os.WriteFile(filepath.Join(backupDir, uuid+".tar.gz"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("read upload: %v", err)
+		} else if string(got) != string(data) {
+			t.Errorf("upload body = %q, want %q", got, data)
+		}
+		w.Header().Set("ETag", "etag")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := backupRemoteClient{getURLs: func(context.Context, string, int64) (remote.BackupRemoteUploadResponse, error) {
+		return remote.BackupRemoteUploadResponse{Parts: []string{server.URL}, PartSize: int64(len(data))}, nil
+	}}
+	backup := NewS3(client, uuid, "")
+	file, err := os.Open(backup.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, err := backup.generateRemoteRequest(context.Background(), file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0].ETag != "etag" || parts[0].PartNumber != 1 {
+		t.Fatalf("uploaded parts = %#v", parts)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("started %d upload parts, want 1", got)
+	}
+}
+
+func TestS3BackupGenerateRemoteRequestUploadsPartsAndStopsAfterCancellation(t *testing.T) {
+	backupDir := t.TempDir()
+	config.Set(&config.Configuration{AuthenticationToken: "test", System: config.SystemConfiguration{BackupDirectory: backupDir}})
+	const uuid = "00000000-0000-0000-0000-000000000001"
+	data := []byte("abcdefgh")
+	if err := os.WriteFile(filepath.Join(backupDir, uuid+".tar.gz"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	firstPartReceived := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		part := requests.Add(1)
+		if got, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("read part %d: %v", part, err)
+		} else if want := string(data[(part-1)*4 : part*4]); string(got) != want {
+			t.Errorf("part %d body = %q, want %q", part, got, want)
+		}
+		if part == 1 {
+			close(firstPartReceived)
+			<-ctx.Done()
+		}
+		w.Header().Set("ETag", "etag")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer func() {
+		cancel()
+		server.Close()
+	}()
+
+	client := backupRemoteClient{getURLs: func(context.Context, string, int64) (remote.BackupRemoteUploadResponse, error) {
+		return remote.BackupRemoteUploadResponse{Parts: []string{server.URL + "/1", server.URL + "/2"}, PartSize: 4}, nil
+	}}
+	backup := NewS3(client, uuid, "")
+	file, err := os.Open(backup.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := backup.generateRemoteRequest(ctx, file)
+		result <- err
+	}()
+	select {
+	case <-firstPartReceived:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first upload part")
+	}
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upload did not stop after cancellation")
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("started %d upload parts after cancellation, want 1", got)
+	}
+}
 
 func TestTarBackupRestorePreservesSymlinkTarget(t *testing.T) {
 	config.Set(&config.Configuration{AuthenticationToken: "test"})
