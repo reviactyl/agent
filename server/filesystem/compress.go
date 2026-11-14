@@ -266,6 +266,23 @@ type extractStreamOptions struct {
 	KeepDenylist bool
 }
 
+// Archive extractors check cancellation between entries; also check during file reads.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	if ctxErr := r.ctx.Err(); ctxErr != nil {
+		return 0, ctxErr
+	}
+	return n, err
+}
+
 func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptions) error {
 	// See if it's a compressed archive, such as TAR or a ZIP
 	ex, ok := opts.Format.(archives.Extractor)
@@ -291,7 +308,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		}
 		defer reader.Close()
 
-		if _, err := fs.WriteFrom(p, reader); err != nil {
+		if _, err := fs.WriteFrom(p, contextReader{ctx: ctx, r: reader}); err != nil {
 			return wrapError(err, opts.FileName)
 		}
 		return nil
@@ -300,6 +317,9 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 	// Decompress and extract archive
 	extracted := make(map[string]struct{})
 	return ex.Extract(ctx, opts.Reader, func(ctx context.Context, f archives.FileInfo) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		p := filepath.Join(opts.Directory, f.NameInArchive)
 		delete(extracted, path.Clean(f.NameInArchive))
 		// If it is ignored, just don't do anything with the entry and skip over it.
@@ -416,15 +436,16 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return err
 		}
 		defer r.Close()
+		reader := contextReader{ctx: ctx, r: r}
 		var writeErr error
 		if existing, err := fs.unixFS.Lstat(p); err == nil && existing.Mode().IsRegular() {
 			if st, ok := existing.Sys().(*unix.Stat_t); ok && st.Nlink > 1 {
-				_, writeErr = fs.writeStream(p, r, f.Mode(), true)
+				_, writeErr = fs.writeStream(p, reader, f.Mode(), true)
 			} else {
-				writeErr = fs.Write(p, r, f.Size(), f.Mode())
+				writeErr = fs.Write(p, reader, f.Size(), f.Mode())
 			}
 		} else {
-			writeErr = fs.Write(p, r, f.Size(), f.Mode())
+			writeErr = fs.Write(p, reader, f.Size(), f.Mode())
 		}
 		if writeErr != nil {
 			return wrapError(writeErr, opts.FileName)
