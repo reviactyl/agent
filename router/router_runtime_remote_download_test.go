@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,7 +25,8 @@ func TestRemoteDownloadRuntimeConfiguration(t *testing.T) {
 
 	for _, initiallyDisabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("initially_disabled_%t", initiallyDisabled), func(t *testing.T) {
-			cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+			configPath := filepath.Join(t.TempDir(), "config.yml")
+			cfg, err := config.NewAtPath(configPath)
 			require.NoError(t, err)
 			cfg.AuthenticationTokenId = "test-id"
 			cfg.AuthenticationToken = "test-token"
@@ -51,12 +53,18 @@ func TestRemoteDownloadRuntimeConfiguration(t *testing.T) {
 				return rec
 			}
 			for _, disabled := range []bool{initiallyDisabled, !initiallyDisabled, initiallyDisabled} {
-				config.Update(func(c *config.Configuration) { c.Api.DisableRemoteDownload = disabled })
-				// Panel updates replace the configuration but retain this operator-owned flag.
-				update := request(http.MethodPost, "/api/update", "test-token", `{}`)
+				body := fmt.Sprintf(`{"api":{"disable_remote_download":%t}}`, disabled)
+				require.Equal(t, http.StatusUnauthorized, request(http.MethodPost, "/api/update", "", body).Code)
+				require.Equal(t, http.StatusForbidden, request(http.MethodPost, "/api/update", "wrong-token", body).Code)
+				update := request(http.MethodPost, "/api/update", "test-token", body)
 				require.Equal(t, http.StatusOK, update.Code, update.Body.String())
 				require.JSONEq(t, `{"applied":true}`, update.Body.String())
 				require.Equal(t, disabled, config.Get().Api.DisableRemoteDownload)
+				persisted, err := os.ReadFile(configPath)
+				require.NoError(t, err)
+				require.Contains(t, string(persisted), fmt.Sprintf("disable_remote_download: %t", disabled))
+				require.Equal(t, http.StatusOK, request(http.MethodPost, "/api/update", "test-token", `{}`).Code)
+				require.Equal(t, disabled, config.Get().Api.DisableRemoteDownload, "omitted setting must be preserved")
 
 				for _, route := range []struct {
 					method string
