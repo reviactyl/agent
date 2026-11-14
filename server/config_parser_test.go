@@ -72,3 +72,22 @@ func TestConfigurationFilesAreUpdated(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "motd=hi\nport=25565\n", string(b))
 }
+
+func TestConfigurationFilesExpandEverySupportedPlaceholder(t *testing.T) {
+	raw := `{"file":"config.json","parser":"json","replace":[{"match":"bind","replace_with":"prefix {{config.missing}} [{{ config.docker.interface }}:{{config.docker.network.interface}}:{{config.docker.interface}}] {{config.authentication_token}} suffix"}]}`
+	s, root := newConfigParserServer(t, 0, raw)
+	path := filepath.Join(root, "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"bind":"original","keep":"untouched"}`), 0o600))
+
+	s.UpdateConfigurationFiles()
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var got map[string]string
+	require.NoError(t, json.Unmarshal(content, &got))
+	address := config.Get().Docker.Network.Interface
+	require.NotEmpty(t, address)
+	require.Equal(t, "prefix {{config.missing}} ["+address+":"+address+":"+address+"] {{config.authentication_token}} suffix", got["bind"])
+	require.Equal(t, "untouched", got["keep"])
+	require.NotContains(t, string(content), "test-token")
+}

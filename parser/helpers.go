@@ -262,44 +262,41 @@ func valueAtPath(c *gabs.Container, path string) string {
 
 // Looks up a configuration value on the Daemon given a dot-notated syntax.
 func (f *ConfigurationFile) LookupConfigurationValue(cfr ConfigurationFileReplacement) (string, error) {
-	// If this is not something that we can do a regex lookup on then just continue
-	// on our merry way. If the value isn't a string, we're not going to be doing anything
-	// with it anyways.
-	if cfr.ReplaceWith.Type() != jsonparser.String || !configMatchRegex.Match(cfr.ReplaceWith.Value()) {
-		return cfr.ReplaceWith.String(), nil
+	value := cfr.ReplaceWith.String()
+	if cfr.ReplaceWith.Type() != jsonparser.String {
+		return value, nil
 	}
 
-	// If there is a match, lookup the value in the configuration for the Daemon. If no key
-	// is found, just return the string representation, otherwise use the value from the
-	// daemon configuration here.
-	huntPath := configMatchRegex.ReplaceAllString(
-		configMatchRegex.FindString(cfr.ReplaceWith.String()), "$1",
-	)
-
-	var path []string
-	for _, value := range strings.Split(huntPath, ".") {
-		path = append(path, strcase.ToSnake(value))
+	matches := configMatchRegex.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return value, nil
 	}
 
-	// Look for the key in the configuration file, and if found return that value to the
-	// calling function.
-	match, dataType, _, err := jsonparser.Get(f.configuration, path...)
-	if err != nil {
-		if err != jsonparser.KeyPathNotFoundError {
-			return string(match), err
+	var result strings.Builder
+	last := 0
+	for _, indices := range matches {
+		result.WriteString(value[last:indices[0]])
+		placeholder := value[indices[0]:indices[1]]
+		path := strings.Split(value[indices[2]:indices[3]], ".")
+		for i := range path {
+			path[i] = strcase.ToSnake(path[i])
 		}
 
-		log.WithFields(log.Fields{"path": path, "filename": f.FileName}).Debug("attempted to load a configuration value that does not exist")
+		match, dataType, _, err := jsonparser.Get(f.configuration, path...)
+		if err != nil && err != jsonparser.KeyPathNotFoundError {
+			return string(match), err
+		}
+		if err == jsonparser.KeyPathNotFoundError {
+			log.WithFields(log.Fields{"path": path, "filename": f.FileName}).Debug("attempted to load a configuration value that does not exist")
+		}
 
-		// If there is no key, keep the original value intact, that way it is obvious there
-		// is a replace issue at play.
-		return cfr.ReplaceWith.String(), nil
+		if err != nil || dataType == jsonparser.Object || dataType == jsonparser.Array {
+			result.WriteString(placeholder)
+		} else {
+			result.Write(match)
+		}
+		last = indices[1]
 	}
-
-	// Only substitute scalar values, not whole objects or arrays.
-	if dataType == jsonparser.Object || dataType == jsonparser.Array {
-		return cfr.ReplaceWith.String(), nil
-	}
-
-	return configMatchRegex.ReplaceAllString(cfr.ReplaceWith.String(), string(match)), nil
+	result.WriteString(value[last:])
+	return result.String(), nil
 }
