@@ -190,7 +190,7 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 	s.log().Debug("got S3 upload urls from the Panel")
 	s.log().WithField("parts", len(urls.Parts)).Info("attempting to upload backup to s3 endpoint...")
 
-	uploader := newS3FileUploader(rc)
+	uploader := newS3FileUploader(rc, s.Format)
 	for i, part := range urls.Parts {
 		// Get the size for the current part.
 		var partSize int64
@@ -222,19 +222,32 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 type s3FileUploader struct {
 	io.ReadCloser
 	client        *http.Client
+	contentType   string
 	uploadedParts []remote.BackupPart
 }
 
 // newS3FileUploader returns a new file uploader instance.
-func newS3FileUploader(file io.ReadCloser) *s3FileUploader {
+func newS3FileUploader(file io.ReadCloser, archiveFormat ...string) *s3FileUploader {
+	format := "tar.gz"
+	if len(archiveFormat) > 0 {
+		format = archiveFormat[0]
+	}
 	return &s3FileUploader{
-		ReadCloser: file,
+		ReadCloser:  file,
+		contentType: contentTypeForFormat(format),
 		// We purposefully use a super high timeout on this request since we need to upload
 		// a 5GB file. This assumes at worst a 10Mbps connection for uploading. While technically
 		// you could go slower we're targeting mostly hosted servers that should have 100Mbps
 		// connections anyways.
 		client: &http.Client{Timeout: time.Hour * 2},
 	}
+}
+
+func contentTypeForFormat(format string) string {
+	if format == "zip" {
+		return "application/zip"
+	}
+	return "application/x-gzip"
 }
 
 // backoff returns a new expoential backoff implementation using a context that
@@ -260,7 +273,7 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 
 	r.ContentLength = size
 	r.Header.Add("Content-Length", strconv.Itoa(int(size)))
-	r.Header.Add("Content-Type", "application/x-gzip")
+	r.Header.Add("Content-Type", fu.contentType)
 
 	// Limit the reader to the size of the part.
 	r.Body = Reader{Reader: io.LimitReader(fu.ReadCloser, size)}
