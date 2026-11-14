@@ -17,6 +17,8 @@ func TestTextFileMatchBoundaries(t *testing.T) {
 		{"equals prefix", "server-port=", "server-port=25565\nserver-port-extra=25566\n", "updated\nserver-port-extra=25566\n"},
 		{"colon prefix", "server-port:", "server-port:25565\nserver-port-extra:25566\n", "updated\nserver-port-extra:25566\n"},
 		{"space prefix", "set port ", "set port 25565\nset ports 25566\n", "updated\nset ports 25566\n"},
+		{"double quoted prefix", `hostname "`, "hostname \"Old server\"\nhostname-extra \"unchanged\"\n", "updated\nhostname-extra \"unchanged\"\n"},
+		{"single quoted prefix", "hostname '", "hostname 'Old server'\nhostname-extra 'unchanged'\n", "updated\nhostname-extra 'unchanged'\n"},
 		{"tab prefix", "set port\t", "set port\t25565\n", "updated\n"},
 		{"literal metacharacters", "server.port[0]", "server.port[0]=1\nserverXport0=2\nserver.port[0]-extra=3\n", "updated\nserverXport0=2\nserver.port[0]-extra=3\n"},
 		{"literal regex prefix", "regex:^server-port", "server-port=1\nregex:^server-port=2\n", "server-port=1\nupdated\n"},

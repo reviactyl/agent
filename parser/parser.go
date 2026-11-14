@@ -528,7 +528,7 @@ func matchesTextLine(line []byte, match string) bool {
 		return true
 	}
 	const separators = "=: \t\r\v\f"
-	return strings.ContainsRune(separators, rune(match[len(match)-1])) ||
+	return strings.ContainsRune(separators+`"'`, rune(match[len(match)-1])) ||
 		strings.ContainsRune(separators, rune(line[len(match)]))
 }
 
