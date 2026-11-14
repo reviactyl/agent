@@ -317,7 +317,7 @@ func (e *Environment) Create() error {
 		Tty:          true,
 		ExposedPorts: a.Exposed(),
 		Image:        strings.TrimPrefix(e.meta.Image, "~"),
-		Env:          e.Configuration.EnvironmentVariables(),
+		Env:          evs,
 		Labels:       labels,
 	}
 
