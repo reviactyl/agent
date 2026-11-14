@@ -23,6 +23,37 @@ var cgroupV2 = sync.OnceValue(func() bool {
 
 var burstWarning sync.Once
 
+var cpuBurstLocks = struct {
+	sync.Mutex
+	entries map[string]*cpuBurstLock
+}{entries: make(map[string]*cpuBurstLock)}
+
+type cpuBurstLock struct {
+	sync.Mutex
+	users int
+}
+
+func lockCpuBurst(containerID string) func() {
+	cpuBurstLocks.Lock()
+	entry := cpuBurstLocks.entries[containerID]
+	if entry == nil {
+		entry = &cpuBurstLock{}
+		cpuBurstLocks.entries[containerID] = entry
+	}
+	entry.users++
+	cpuBurstLocks.Unlock()
+	entry.Lock()
+	return func() {
+		entry.Unlock()
+		cpuBurstLocks.Lock()
+		entry.users--
+		if entry.users == 0 {
+			delete(cpuBurstLocks.entries, containerID)
+		}
+		cpuBurstLocks.Unlock()
+	}
+}
+
 // cpuBurstMicroseconds returns the burst allowance in microseconds for the given
 // CFS quota and configured percentage. The kernel rejects a burst larger than the
 // quota, so the value is clamped to it.
@@ -108,6 +139,12 @@ func logBurstFailure(l *log.Entry, burst int64) {
 // the CFS quota in microseconds it was created with. This is a no-op when
 // bursting is disabled or the container has no CPU limit.
 func SetCpuBurst(ctx context.Context, cli *client.Client, containerID string, quota int64) {
+	unlock := lockCpuBurst(containerID)
+	defer unlock()
+	setCpuBurst(ctx, cli, containerID, quota)
+}
+
+func setCpuBurst(ctx context.Context, cli *client.Client, containerID string, quota int64) {
 	cfg := config.Get().Docker.CpuBurst
 	if !cfg.Enabled || quota <= 0 {
 		return

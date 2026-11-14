@@ -1,10 +1,20 @@
 package docker
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/docker/docker/client"
+	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -136,4 +146,78 @@ func TestClearCpuBurstWithoutReadableSnapshot(t *testing.T) {
 	_, err := os.Stat(f)
 	require.True(t, os.IsNotExist(err), "do not clear burst without a rollback value")
 	e.clearCpuBurst(0)()
+}
+
+func TestCpuBurstWritersWaitForResourceUpdate(t *testing.T) {
+	cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+	require.NoError(t, err)
+	cfg.AuthenticationToken = "test-token"
+	cfg.Docker.UsePerformantInspect = false
+	cfg.Docker.CpuBurst.Enabled = true
+	config.Set(cfg)
+
+	for _, writer := range []string{"resource update", "burst application"} {
+		t.Run(writer, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var unblock sync.Once
+			defer unblock.Do(func() { close(release) })
+			var inspections atomic.Int32
+			var updates atomic.Int32
+			docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					inspections.Add(1)
+					_, _ = io.WriteString(w, `{"Id":"server","State":{"Pid":0}}`)
+					return
+				}
+				if updates.Add(1) == 1 {
+					close(entered)
+					<-release
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = io.WriteString(w, `{"message":"update rejected"}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer docker.Close()
+			defer unblock.Do(func() { close(release) })
+			cli, err := client.NewClientWithOpts(client.WithHost(docker.URL), client.WithVersion("1.45"))
+			require.NoError(t, err)
+			defer cli.Close()
+			newEnvironment := func() *Environment {
+				return &Environment{Id: "server", client: cli, Configuration: environment.NewConfiguration(environment.Settings{Limits: environment.Limits{CpuLimit: 50}}, nil)}
+			}
+			first := make(chan error, 1)
+			go func() { first <- newEnvironment().InSituUpdate() }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second * 5):
+				t.Fatal("first update did not reach Docker")
+			}
+			second := make(chan error, 1)
+			started := make(chan struct{})
+			go func() {
+				close(started)
+				if writer == "resource update" {
+					second <- newEnvironment().InSituUpdate()
+				} else {
+					SetCpuBurst(context.Background(), cli, "server", 50000)
+					second <- nil
+				}
+			}()
+			<-started
+			select {
+			case result := <-second:
+				second <- result
+				t.Error("another writer finished before the pending update could restore its burst")
+			case <-time.After(100 * time.Millisecond):
+			}
+			require.EqualValues(t, 1, inspections.Load(), "other writers must wait before inspecting or changing burst")
+			unblock.Do(func() { close(release) })
+			require.ErrorContains(t, <-first, "update rejected")
+			require.NoError(t, <-second)
+			require.GreaterOrEqual(t, inspections.Load(), int32(2))
+		})
+	}
 }

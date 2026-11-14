@@ -229,6 +229,8 @@ func (e *Environment) setRecoveryState(generation uint64, state string) bool {
 // container. This allows memory, cpu, and IO limitations to be adjusted on the
 // fly for individual instances.
 func (e *Environment) InSituUpdate() error {
+	unlock := lockCpuBurst(e.Id)
+	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -257,14 +259,15 @@ func (e *Environment) InSituUpdate() error {
 	// for removing memory limits, a container must be re-created.
 	//
 	// @see https://github.com/moby/moby/issues/41946
+	resources := e.Configuration.Limits().AsContainerResources()
 	if _, err := e.client.ContainerUpdate(ctx, e.Id, container.UpdateConfig{
-		Resources: e.Configuration.Limits().AsContainerResources(),
+		Resources: resources,
 	}); err != nil {
 		restoreBurst()
 		return errors.Wrap(err, "environment/docker: could not update container")
 	}
 
-	e.applyCpuBurst(ctx)
+	setCpuBurst(ctx, e.client, e.Id, resources.CPUQuota)
 	return nil
 }
 
