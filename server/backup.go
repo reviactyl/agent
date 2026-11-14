@@ -102,6 +102,14 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	if notifyError := s.notifyPanelOfBackup(b.Identifier(), ad, true); notifyError != nil {
 		_ = b.Remove()
 
+		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
+			"uuid":          b.Identifier(),
+			"is_successful": false,
+			"checksum":      "",
+			"checksum_type": "sha1",
+			"file_size":     0,
+		})
+
 		s.Log().WithField("error", notifyError).Info("failed to notify panel of successful backup state")
 		return notifyError
 	} else {

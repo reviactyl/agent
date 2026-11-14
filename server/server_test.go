@@ -14,6 +14,7 @@ import (
 
 	"github.com/reviactyl/agent/config"
 	"github.com/reviactyl/agent/environment"
+	"github.com/reviactyl/agent/events"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/server/backup"
 	"github.com/reviactyl/agent/server/filesystem"
@@ -71,6 +72,9 @@ func TestBackupReturnsCallbackError(t *testing.T) {
 			b := callbackTestBackup{backup.NewLocal(nil, "00000000-0000-0000-0000-000000000001", "", format)}
 			client := &backupStatusClient{err: callbackError, archivePath: b.Path()}
 			srv := &Server{ctx: context.Background(), client: client, fs: fsys}
+			completion := make(chan []byte, 2)
+			srv.Events().On(completion)
+			t.Cleanup(func() { srv.Events().Off(completion) })
 			err = srv.Backup(b)
 			if !client.archiveExists || !client.request.Successful || client.request.Size == 0 || client.request.Checksum == "" {
 				t.Fatalf("callback did not follow successful generation: %+v", client.request)
@@ -80,6 +84,19 @@ func TestBackupReturnsCallbackError(t *testing.T) {
 			}
 			if !errors.Is(err, callbackError) {
 				t.Fatalf("Backup returned %v, want callback error %v", err, callbackError)
+			}
+			select {
+			case data := <-completion:
+				event := events.MustDecode(data)
+				payload, ok := event.Data.(map[string]interface{})
+				if !ok || event.Topic != BackupCompletedEvent || payload["uuid"] != b.Identifier() || payload["is_successful"] != false || payload["checksum"] != "" || payload["checksum_type"] != "sha1" || payload["file_size"] != float64(0) {
+					t.Fatalf("unexpected failed completion event: %+v", event)
+				}
+			default:
+				t.Fatal("missing failed backup completion event after status notification failure")
+			}
+			if len(completion) != 0 {
+				t.Fatal("backup emitted more than one completion event")
 			}
 		})
 	}
