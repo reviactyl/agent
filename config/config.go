@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -408,19 +409,22 @@ type PanelConfiguration struct {
 			CertificateFile string `json:"cert"`
 			KeyFile         string `json:"key"`
 		} `json:"ssl"`
-		UploadLimit int64 `json:"upload_limit"`
+		UploadLimit           int64 `json:"upload_limit"`
+		DisableRemoteDownload bool  `json:"disable_remote_download"`
 	} `json:"api"`
 	System struct {
 		Sftp struct {
 			Port int `json:"bind_port"`
 		} `json:"sftp"`
 	} `json:"system"`
+	AllowedOrigins []string `json:"allowed_origins"`
 }
 
 // PanelConfiguration returns the values in the configuration that the Panel is
 // allowed to set.
 func (c *Configuration) PanelConfiguration() PanelConfiguration {
 	var p PanelConfiguration
+	p.AllowedOrigins = slices.Clone(c.AllowedOrigins)
 	p.Debug = c.Debug
 	p.Uuid = c.Uuid
 	p.TokenId = c.AuthenticationTokenId
@@ -431,6 +435,7 @@ func (c *Configuration) PanelConfiguration() PanelConfiguration {
 	p.Api.Ssl.CertificateFile = c.Api.Ssl.CertificateFile
 	p.Api.Ssl.KeyFile = c.Api.Ssl.KeyFile
 	p.Api.UploadLimit = c.Api.UploadLimit
+	p.Api.DisableRemoteDownload = c.Api.DisableRemoteDownload
 	p.System.Sftp.Port = c.System.Sftp.Port
 	return p
 }
@@ -438,6 +443,7 @@ func (c *Configuration) PanelConfiguration() PanelConfiguration {
 // ApplyPanelConfiguration sets the values in the configuration that the Panel is
 // allowed to set.
 func (c *Configuration) ApplyPanelConfiguration(p PanelConfiguration) {
+	c.AllowedOrigins = p.AllowedOrigins
 	c.Debug = p.Debug
 	c.Uuid = p.Uuid
 	c.AuthenticationTokenId = p.TokenId
@@ -448,6 +454,7 @@ func (c *Configuration) ApplyPanelConfiguration(p PanelConfiguration) {
 	c.Api.Ssl.CertificateFile = p.Api.Ssl.CertificateFile
 	c.Api.Ssl.KeyFile = p.Api.Ssl.KeyFile
 	c.Api.UploadLimit = p.Api.UploadLimit
+	c.Api.DisableRemoteDownload = p.Api.DisableRemoteDownload
 	c.System.Sftp.Port = p.System.Sftp.Port
 }
 

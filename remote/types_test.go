@@ -1,11 +1,26 @@
 package remote
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetServerConfigurationRejectsMalformedReplacements(t *testing.T) {
+	c, server := createTestClient(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/servers/test-server", r.URL.Path)
+		_, err := w.Write([]byte(`{"process_configuration":{"configs":[{"file":"server.properties","parser":"properties","replace":[{"match":"port","replace_with":25565},{"match":"motd"}]}]}}`))
+		require.NoError(t, err)
+	})
+	defer server.Close()
+
+	_, err := c.GetServerConfiguration(context.Background(), "test-server")
+	require.ErrorContains(t, err, "replacement")
+	require.ErrorContains(t, err, "server.properties")
+}
 
 func TestOutputLineMatcher(t *testing.T) {
 	for _, tt := range []struct {

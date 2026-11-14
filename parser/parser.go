@@ -12,7 +12,6 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/Jeffail/gabs/v2"
-	"github.com/apex/log"
 	"github.com/beevik/etree"
 	"github.com/buger/jsonparser"
 	"github.com/icza/dyno"
@@ -149,10 +148,7 @@ type ConfigurationFile struct {
 	configuration []byte
 }
 
-// UnmarshalJSON is a custom unmarshaler for configuration files. If there is an
-// error while parsing out the replacements, don't fail the entire operation,
-// just log a global warning so someone can find the issue, and return an empty
-// array of replacements.
+// UnmarshalJSON validates configuration files and their replacements.
 func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	var m map[string]*json.RawMessage
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -173,9 +169,7 @@ func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	}
 
 	if err := json.Unmarshal(*m["replace"], &f.Replace); err != nil {
-		log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
-
-		f.Replace = []ConfigurationFileReplacement{}
+		return errors.Wrapf(err, "parser: failed to unmarshal replacements for configuration file %q", f.FileName)
 	}
 
 	return nil
@@ -301,6 +295,8 @@ func (f *ConfigurationFile) Parse(file ufs.File) error {
 		err = f.parseIniFile(file)
 	case Xml:
 		err = f.parseXmlFile(file)
+	default:
+		return errors.Errorf("parser: unsupported configuration parser %q", f.Parser)
 	}
 	return err
 }
@@ -459,7 +455,7 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 		return err
 	}
 
-	i := make(map[string]interface{})
+	var i interface{}
 	if err := yaml.Unmarshal(b, &i); err != nil {
 		return err
 	}
@@ -496,7 +492,7 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 		for _, replace := range f.Replace {
 			// If this line doesn't match what we expect for the replacement, move on to the next
 			// line. Otherwise, update the line to have the replacement value.
-			if !bytes.HasPrefix(line, []byte(replace.Match)) {
+			if !matchesTextLine(line, replace.Match) {
 				continue
 			}
 			b.Write(replace.ReplaceWith.Bytes())
@@ -516,6 +512,18 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 	}
 
 	return rewrite(file, b.Bytes())
+}
+
+func matchesTextLine(line []byte, match string) bool {
+	if !bytes.HasPrefix(line, []byte(match)) {
+		return false
+	}
+	if len(match) == 0 || len(line) == len(match) {
+		return true
+	}
+	const separators = "=: \t\r\v\f"
+	return strings.ContainsRune(separators+`"'`, rune(match[len(match)-1])) ||
+		strings.ContainsRune(separators, rune(line[len(match)]))
 }
 
 // decodePropertiesSurrogates handles UTF-16 pairs unsupported by the properties lexer.

@@ -32,6 +32,37 @@ func TestMissingConfigurationKeyKeepsPlaceholder(t *testing.T) {
 	assert.Equal(t, "{{config.docker.missing}}", got, "a missing key should leave the placeholder in place")
 }
 
+func TestConfigurationPlaceholderExpansion(t *testing.T) {
+	f := ConfigurationFile{configuration: []byte(`{"docker":{"interface":"eth0","network":{"interface":"172.18.0.1"}},"name":"$1-${value}-$$","nested":"{{config.docker.interface}}","enabled":true,"port":25565,"items":["first"]}`)}
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"distinct", "{{config.docker.interface}}:{{config.docker.network.interface}}", "eth0:172.18.0.1"},
+		{"repeated and distinct", "{{config.docker.interface}}/{{config.docker.network.interface}}/{{config.docker.interface}}", "eth0/172.18.0.1/eth0"},
+		{"literal text", "prefix [{{ config.docker.interface }}]:{{config.docker.network.interface}} suffix $1", "prefix [eth0]:172.18.0.1 suffix $1"},
+		{"known then unknown", "{{config.docker.interface}}:{{config.missing}}", "eth0:{{config.missing}}"},
+		{"unknown then known", "{{config.missing}}:{{config.docker.network.interface}}", "{{config.missing}}:172.18.0.1"},
+		{"non scalar then known", "{{config.docker}}:{{config.items}}:{{config.docker.interface}}", "{{config.docker}}:{{config.items}}:eth0"},
+		{"literal dollar values", "{{config.name}}:{{config.docker.interface}}", "$1-${value}-$$:eth0"},
+		{"single pass", "{{config.nested}}:{{config.docker.network.interface}}", "{{config.docker.interface}}:172.18.0.1"},
+		{"scalar values", "{{config.enabled}}:{{config.port}}", "true:25565"},
+		{"no placeholders", "literal $1 {{other.value}}", "literal $1 {{other.value}}"},
+		{"unknown only", "{{config.missing}}", "{{config.missing}}"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := json.Marshal(tc.value)
+			require.NoError(t, err)
+			cfr := replacement(t, `{"match":"value","replace_with":`+string(value)+`}`)
+			got, err := f.LookupConfigurationValue(cfr)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // A configuration file entry that is missing a field is refused when it is decoded.
 func TestConfigurationFileWithoutParserKeyReturnsError(t *testing.T) {
 	var f ConfigurationFile
@@ -58,6 +89,61 @@ func TestInvalidReplacementEscapeIsRejectedBeforeDecoding(t *testing.T) {
 		err = json.Unmarshal([]byte(`{"file":"a","parser":"file","replace":[{"match":"k","replace_with":"\z"}]}`), &f)
 	})
 	require.Error(t, err)
+}
+
+func TestConfigurationFileRejectsMalformedReplacements(t *testing.T) {
+	for name, replacements := range map[string]string{
+		"object":             `{}`,
+		"string":             `"invalid"`,
+		"number":             `1`,
+		"boolean":            `false`,
+		"null entry":         `[null]`,
+		"scalar entry":       `[1]`,
+		"missing match":      `[{"replace_with":"new"}]`,
+		"missing value":      `[{"match":"key"}]`,
+		"invalid match":      `[{"match":{},"replace_with":"new"}]`,
+		"invalid condition":  `[{"match":"key","if_value":[],"replace_with":"new"}]`,
+		"valid then invalid": `[{"match":"key","replace_with":"new"},{"match":"other"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var f ConfigurationFile
+			err := json.Unmarshal([]byte(`{"file":"server.properties","parser":"properties","replace":`+replacements+`}`), &f)
+			require.ErrorContains(t, err, "replacement")
+			require.ErrorContains(t, err, "server.properties")
+		})
+	}
+}
+
+func TestConfigurationFileDecodesValidReplacements(t *testing.T) {
+	for name, tc := range map[string]struct {
+		replacements string
+		match        string
+		condition    string
+		value        string
+	}{
+		"empty":         {replacements: `[]`},
+		"string":        {`[{"match":"key","replace_with":"new"}]`, "key", "", "new"},
+		"legacy value":  {`[{"match":"key","value":"legacy"}]`, "key", "", "legacy"},
+		"numeric key":   {`[{"match":25565,"if_value":1,"replace_with":25566}]`, "25565", "1", "25566"},
+		"boolean key":   {`[{"match":true,"if_value":false,"replace_with":false}]`, "true", "false", "false"},
+		"null scalars":  {`[{"match":null,"if_value":null,"replace_with":null}]`, "", "", "<nil>"},
+		"escaped value": {`[{"match":"key","replace_with":"\u00a7new"}]`, "key", "", "§new"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var f ConfigurationFile
+			err := json.Unmarshal([]byte(`{"file":"server.properties","parser":"properties","replace":`+tc.replacements+`}`), &f)
+			require.NoError(t, err)
+			if tc.replacements == `[]` {
+				require.NotNil(t, f.Replace)
+				require.Empty(t, f.Replace)
+				return
+			}
+			require.Len(t, f.Replace, 1)
+			require.Equal(t, tc.match, f.Replace[0].Match)
+			require.Equal(t, tc.condition, f.Replace[0].IfValue)
+			require.Equal(t, tc.value, f.Replace[0].ReplaceWith.String())
+		})
+	}
 }
 
 func TestConfigurationFilePreservesReplacementScalarTypes(t *testing.T) {

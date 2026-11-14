@@ -2,19 +2,27 @@ package router
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	dockerclient "github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reviactyl/agent/config"
+	"github.com/reviactyl/agent/environment"
 	"github.com/reviactyl/agent/remote"
 	"github.com/reviactyl/agent/router/middleware"
 	"github.com/reviactyl/agent/server"
@@ -219,6 +227,67 @@ func TestPostSystemUpdateRejectsConcurrentAttempts(t *testing.T) {
 	}
 }
 
+func TestPostSystemUpdateKeepsLockDuringActiveOperation(t *testing.T) {
+	originalType := system.InstallationType
+	originalInstall := installSystemUpdate
+	originalRestart := restartAfterSystemUpdate
+	t.Cleanup(func() {
+		system.InstallationType = originalType
+		installSystemUpdate = originalInstall
+		restartAfterSystemUpdate = originalRestart
+		systemUpdateInProgress.Store(false)
+	})
+	system.InstallationType = "native"
+
+	for _, phase := range []string{"install", "restart"} {
+		t.Run(phase, func(t *testing.T) {
+			systemUpdateInProgress.Store(false)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			finished := make(chan struct{})
+			defer func() {
+				close(release)
+				<-finished
+			}()
+			installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
+				if phase == "install" {
+					close(entered)
+					<-release
+					return nil, errors.New("install failed")
+				}
+				return nil, nil
+			}
+			restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+				close(entered)
+				<-release
+				return true, errors.New("restart failed")
+			}
+			engine := gin.New()
+			engine.Use(middleware.CaptureErrors())
+			engine.POST("/api/system/update", postSystemUpdate)
+			requestUpdate := func() *httptest.ResponseRecorder {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+				request.Header.Set("Content-Type", "application/json")
+				engine.ServeHTTP(recorder, request)
+				return recorder
+			}
+			go func() {
+				defer close(finished)
+				requestUpdate()
+			}()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("update did not enter blocked operation")
+			}
+			if response := requestUpdate(); response.Code != http.StatusConflict {
+				t.Fatalf("concurrent update during %s returned %d, expected conflict", phase, response.Code)
+			}
+		})
+	}
+}
+
 func TestPostSystemUpdateRollsBackWhenRestartCannotBeScheduled(t *testing.T) {
 	originalType := system.InstallationType
 	originalInstall := installSystemUpdate
@@ -277,15 +346,30 @@ func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T)
 	originalType := system.InstallationType
 	originalInstall := installSystemUpdate
 	originalRestart := restartAfterSystemUpdate
+	originalSchedule := scheduleSystemUpdateLockRelease
 	t.Cleanup(func() {
 		system.InstallationType = originalType
 		installSystemUpdate = originalInstall
 		restartAfterSystemUpdate = originalRestart
+		scheduleSystemUpdateLockRelease = originalSchedule
 		systemUpdateInProgress.Store(false)
+		failedSystemUpdate.Store(nil)
 	})
 	systemUpdateInProgress.Store(false)
 	system.InstallationType = "native"
+	var releaseLock func()
+	scheduleSystemUpdateLockRelease = func(delay time.Duration, callback func()) *time.Timer {
+		if delay != systemUpdateLockRelease {
+			t.Fatalf("unexpected lock release delay: %s", delay)
+		}
+		releaseLock = callback
+		return nil
+	}
 	directory := t.TempDir()
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(directory, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	executable := filepath.Join(directory, "agent")
 	backup := executable + ".update-backup"
 	if err := os.WriteFile(executable, []byte("new agent"), 0o755); err != nil {
@@ -294,7 +378,9 @@ func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T)
 	if err := os.WriteFile(backup, []byte("old agent"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	installCalls := 0
 	installSystemUpdate = func(context.Context, string, string) (*system.InstalledUpdate, error) {
+		installCalls++
 		return &system.InstalledUpdate{ExecutablePath: executable, BackupPath: backup}, nil
 	}
 	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
@@ -324,6 +410,30 @@ func TestPostSystemUpdateDoesNotRollBackWhenSupervisorCleanupFails(t *testing.T)
 	if !systemUpdateInProgress.Load() {
 		t.Fatal("update lock was released while the supervisor state remained unknown")
 	}
+	requestUpdate := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+		request.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	if response := requestUpdate(); response.Code != http.StatusConflict || installCalls != 1 {
+		t.Fatalf("update was not excluded during restart grace period: status %d, installs %d", response.Code, installCalls)
+	}
+	if releaseLock == nil {
+		t.Fatal("unsafe restart failure did not schedule update lock expiry")
+	}
+	releaseLock()
+	if systemUpdateInProgress.Load() {
+		t.Fatal("update lock remained set after restart grace period")
+	}
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+		return true, nil
+	}
+	if response := requestUpdate(); response.Code != http.StatusAccepted || installCalls != 2 {
+		t.Fatalf("later update was not accepted: status %d, installs %d", response.Code, installCalls)
+	}
+	t.Log("unsafe failure: 500, grace-period retry: 409, expiry releases guard, later retry: 202; installed binary and backup preserved")
 }
 
 func TestPostSystemUpdateTimesOutBlockedRestartAndReleasesLock(t *testing.T) {
@@ -546,6 +656,7 @@ func TestPostUpdateConfigurationOnlyAppliesPanelValues(t *testing.T) {
 	expected.Api.Ssl.Enabled = true
 	expected.Api.UploadLimit = 250
 	expected.System.Sftp.Port = 2023
+	expected.AllowedOrigins = []string{"https://other.invalid"}
 	want, err := yaml.Marshal(expected)
 	if err != nil {
 		t.Fatal(err)
@@ -576,5 +687,569 @@ func TestPostUpdateConfigurationOnlyAppliesPanelValues(t *testing.T) {
 	}
 	if string(onDisk) != string(want) {
 		t.Fatalf("unexpected configuration written to disk:\n%s", onDisk)
+	}
+}
+
+type createServerTestClient struct {
+	remote.Client
+	configuration func() remote.ServerConfigurationResponse
+	status        func(context.Context, remote.InstallStatusRequest) error
+}
+
+func (c createServerTestClient) GetServerConfiguration(context.Context, string) (remote.ServerConfigurationResponse, error) {
+	return c.configuration(), nil
+}
+
+func (c createServerTestClient) GetInstallationScript(context.Context, string) (remote.InstallationScript, error) {
+	return remote.InstallationScript{}, errors.New("installation script unavailable")
+}
+
+func (c createServerTestClient) SetInstallationStatus(ctx context.Context, _ string, status remote.InstallStatusRequest) error {
+	return c.status(ctx, status)
+}
+
+func TestPostCreateServerBackgroundInstallation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		failure     string
+		statusError bool
+		replacement bool
+		recovery    string
+	}{
+		{name: "environment failure", failure: "environment"},
+		{name: "installation failure", failure: "install"},
+		{name: "environment failure with notification failure", failure: "environment", statusError: true},
+		{name: "installation failure with notification failure", failure: "install", statusError: true},
+		{name: "environment failure preserves replacement", failure: "environment", replacement: true},
+		{name: "installation failure preserves replacement", failure: "install", replacement: true},
+		{name: "environment failure allows reinstall", failure: "environment", recovery: "reinstall"},
+		{name: "installation failure allows reinstall", failure: "install", recovery: "reinstall"},
+		{name: "environment failure allows deletion", failure: "environment", recovery: "delete"},
+		{name: "installation failure allows deletion", failure: "install", recovery: "delete"},
+		{name: "successful installation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const uuid = "ab012345-6789-4abc-8def-0123456789ab"
+			cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+			require.NoError(t, err)
+			cfg.AuthenticationToken = "test-token"
+			require.NoError(t, cfg.ResolveToken(false))
+			cfg.System.Data = t.TempDir()
+			cfg.System.MachineID.Enable = false
+			config.Set(cfg)
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce, inspectOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			var retry atomic.Bool
+			dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/_ping") {
+					w.Header().Set("API-Version", "1.45")
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if r.Method == http.MethodDelete && test.recovery == "delete" {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/containers/"+uuid+"/json") {
+					http.Error(w, "unexpected Docker request: "+r.URL.Path, http.StatusBadRequest)
+					return
+				}
+				inspectOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+				if test.failure == "environment" && !retry.Load() {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"message":"environment creation unavailable"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"Id":"` + uuid + `","State":{"Running":false}}`))
+			}))
+			t.Cleanup(dockerAPI.Close)
+			t.Cleanup(unblock)
+			cli, err := environment.Docker()
+			require.NoError(t, err)
+			originalHTTPClient := cli.HTTPClient()
+			require.NoError(t, dockerclient.WithHTTPClient(&http.Client{Transport: createServerTestTransport(func(r *http.Request) (*http.Response, error) {
+				r = r.Clone(r.Context())
+				r.URL.Scheme = "http"
+				r.URL.Host = dockerAPI.Listener.Addr().String()
+				return dockerAPI.Client().Do(r)
+			})})(cli))
+			t.Cleanup(func() { require.NoError(t, dockerclient.WithHTTPClient(originalHTTPClient)(cli)) })
+
+			statuses := make(chan remote.InstallStatusRequest, 2)
+			client := createServerTestClient{
+				configuration: func() remote.ServerConfigurationResponse {
+					settings, _ := json.Marshal(map[string]any{"uuid": uuid, "skip_egg_scripts": test.failure != "install" || retry.Load()})
+					return remote.ServerConfigurationResponse{Settings: settings, ProcessConfiguration: &remote.ProcessConfiguration{}}
+				},
+				status: func(ctx context.Context, status remote.InstallStatusRequest) error {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					statuses <- status
+					if test.statusError {
+						return errors.New("panel notification unavailable")
+					}
+					return nil
+				},
+			}
+			manager := server.NewEmptyManager(client)
+			create := func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Set("manager", manager)
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/servers", strings.NewReader(`{"uuid":"`+uuid+`"}`))
+				c.Request.Header.Set("Content-Type", "application/json")
+				postCreateServer(c)
+				c.Writer.WriteHeaderNow()
+				return w
+			}
+			require.Equal(t, http.StatusAccepted, create().Code)
+			s, ok := manager.Get(uuid)
+			require.True(t, ok)
+			t.Cleanup(s.CleanupForDestroy)
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("background environment creation did not start")
+			}
+			sftpContext := s.Sftp().Context("test")
+			websocketContext, websocketCancel := context.WithCancel(context.Background())
+			s.Websockets().Push([16]byte{1}, &websocketCancel)
+			logPath := filepath.Join(s.Filesystem().Path(), "install-diagnostic.log")
+			require.NoError(t, os.WriteFile(logPath, []byte("recoverable installation data"), 0o600))
+
+			var replacement *server.Server
+			if test.replacement {
+				replacement, err = server.New(client)
+				require.NoError(t, err)
+				require.NoError(t, replacement.SyncWithConfiguration(client.configuration()))
+				t.Cleanup(replacement.CleanupForDestroy)
+				manager.Remove(func(match *server.Server) bool { return match == s })
+				require.True(t, manager.AddIfMissing(replacement))
+			}
+			unblock()
+			select {
+			case status := <-statuses:
+				require.Equal(t, test.failure == "", status.Successful)
+				require.False(t, status.Reinstall)
+			case <-time.After(time.Second):
+				t.Fatal("background installation did not report its outcome to the Panel")
+			}
+
+			if test.failure == "" {
+				require.Same(t, s, manager.Find(func(match *server.Server) bool { return match.ID() == uuid }))
+				require.NoError(t, s.Context().Err())
+				require.NoError(t, sftpContext.Err())
+				require.Equal(t, http.StatusConflict, create().Code)
+				return
+			}
+			require.Eventually(t, func() bool {
+				current, exists := manager.Get(uuid)
+				return s.Context().Err() != nil && websocketContext.Err() != nil && sftpContext.Err() != nil && ((!exists && replacement == nil) || (current == replacement && replacement != nil))
+			}, time.Second, time.Millisecond, "failed original instance must be canceled and unregistered without removing a replacement")
+			data, err := os.ReadFile(logPath)
+			require.NoError(t, err)
+			require.Equal(t, "recoverable installation data", string(data))
+			if replacement != nil {
+				require.NoError(t, replacement.Context().Err())
+				return
+			}
+
+			retry.Store(true)
+			if test.recovery != "" {
+				engine := Configure(manager, client)
+				path := "/api/servers/" + uuid
+				method := http.MethodDelete
+				if test.recovery == "reinstall" {
+					method = http.MethodPost
+					path += "/reinstall"
+				}
+				request := func(method, path, token string) *httptest.ResponseRecorder {
+					req := httptest.NewRequest(method, path, nil)
+					if token != "" {
+						req.Header.Set("Authorization", "Bearer "+token)
+					}
+					w := httptest.NewRecorder()
+					engine.ServeHTTP(w, req)
+					return w
+				}
+				require.Equal(t, http.StatusUnauthorized, request(method, path, "").Code)
+				require.Equal(t, http.StatusForbidden, request(method, path, "wrong-token").Code)
+				require.Equal(t, http.StatusNotFound, request(http.MethodGet, "/api/servers/"+uuid, "test-token").Code)
+				_, exists := manager.Get(uuid)
+				require.False(t, exists, "normal and unauthorized requests must not recover failed registrations")
+				response := request(method, path, "test-token")
+				if test.recovery == "delete" {
+					require.Equal(t, http.StatusNoContent, response.Code, response.Body.String())
+					_, exists = manager.Get(uuid)
+					require.False(t, exists)
+					require.Eventually(t, func() bool { _, err := os.Stat(filepath.Dir(logPath)); return os.IsNotExist(err) }, time.Second, time.Millisecond)
+					return
+				}
+				require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+				recovered, exists := manager.Get(uuid)
+				require.True(t, exists)
+				t.Cleanup(recovered.CleanupForDestroy)
+				require.NotSame(t, s, recovered)
+				require.NoError(t, recovered.Context().Err())
+				select {
+				case status := <-statuses:
+					require.True(t, status.Successful)
+					require.True(t, status.Reinstall)
+				case <-time.After(time.Second):
+					t.Fatal("failed installation could not be reinstalled")
+				}
+				require.Equal(t, http.StatusConflict, create().Code)
+				return
+			}
+			require.Equal(t, http.StatusAccepted, create().Code, "retry must not conflict with the failed instance")
+			retried, ok := manager.Get(uuid)
+			require.True(t, ok)
+			require.NotSame(t, s, retried)
+			t.Cleanup(retried.CleanupForDestroy)
+			select {
+			case status := <-statuses:
+				require.True(t, status.Successful)
+			case <-time.After(time.Second):
+				t.Fatal("retry did not complete successfully")
+			}
+			require.Same(t, retried, manager.Find(func(match *server.Server) bool { return match.ID() == uuid }))
+			require.NoError(t, retried.Context().Err())
+		})
+	}
+}
+
+type createServerTestTransport func(*http.Request) (*http.Response, error)
+
+func (f createServerTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestPostUpdateConfigurationUpdatesCORS(t *testing.T) {
+	t.Setenv("AGENT_TOKEN_ID", "")
+	t.Setenv("AGENT_TOKEN", "")
+	path := filepath.Join(t.TempDir(), "config.yml")
+	cfg, err := config.NewAtPath(path)
+	require.NoError(t, err)
+	cfg.AuthenticationTokenId = "test-id"
+	cfg.AuthenticationToken = "test-token"
+	cfg.PanelLocation = "https://panel.test"
+	cfg.AllowedOrigins = []string{"https://old.test"}
+	require.NoError(t, cfg.ResolveToken(false))
+	config.Set(cfg)
+	require.NoError(t, config.WriteToDisk(cfg))
+	client := backupTestRemoteClient{}
+	engine := Configure(server.NewEmptyManager(client), client)
+
+	request := func(method, uri, body, token, origin string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, uri, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		return rec
+	}
+	checkOrigins := func(t *testing.T, allowed []string) {
+		t.Helper()
+		require.Equal(t, allowed, config.Get().AllowedOrigins)
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		var persisted config.Configuration
+		require.NoError(t, yaml.Unmarshal(data, &persisted))
+		require.ElementsMatch(t, allowed, persisted.AllowedOrigins)
+		for _, origin := range []string{cfg.PanelLocation, "https://old.test", "https://new.test", "https://untrusted.test"} {
+			want := cfg.PanelLocation
+			for _, permitted := range allowed {
+				if origin != cfg.PanelLocation && (origin == permitted || permitted == "*") {
+					want = permitted
+					break
+				}
+			}
+			for _, method := range []string{http.MethodGet, http.MethodOptions} {
+				rec := request(method, "/api/servers", "", "test-token", origin)
+				status := http.StatusOK
+				if method == http.MethodOptions {
+					status = http.StatusNoContent
+				}
+				require.Equal(t, status, rec.Code, rec.Body.String())
+				require.Equal(t, want, rec.Header().Get("Access-Control-Allow-Origin"), "%s %s", method, origin)
+				require.Equal(t, "true", rec.Header().Get("Access-Control-Allow-Credentials"))
+			}
+		}
+	}
+	checkOrigins(t, []string{"https://old.test"})
+	for _, token := range []string{"", "invalid-token"} {
+		rec := request(http.MethodPost, "/api/update", `{"allowed_origins":["https://new.test"]}`, token, cfg.PanelLocation)
+		require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, rec.Code)
+		checkOrigins(t, []string{"https://old.test"})
+	}
+
+	for _, step := range []struct {
+		name    string
+		body    string
+		status  int
+		origins []string
+	}{
+		{"replace", `{"allowed_origins":["https://new.test"]}`, http.StatusOK, []string{"https://new.test"}},
+		{"omitted", `{"debug":true}`, http.StatusOK, []string{"https://new.test"}},
+		{"invalid credentials", `{"allowed_origins":["https://rejected.test"],"token":"file:///invalid"}`, http.StatusInternalServerError, []string{"https://new.test"}},
+		{"malformed origins", `{"allowed_origins":["https://rejected.test",42]}`, http.StatusBadRequest, []string{"https://new.test"}},
+		{"remove", `{"allowed_origins":[]}`, http.StatusOK, []string{}},
+		{"wildcard", `{"allowed_origins":["*"]}`, http.StatusOK, []string{"*"}},
+		{"null clears", `{"allowed_origins":null}`, http.StatusOK, nil},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			rec := request(http.MethodPost, "/api/update", step.body, "test-token", cfg.PanelLocation)
+			require.Equal(t, step.status, rec.Code, rec.Body.String())
+			if step.status == http.StatusOK {
+				require.JSONEq(t, `{"applied":true}`, rec.Body.String())
+			}
+			checkOrigins(t, step.origins)
+		})
+	}
+
+	t.Run("concurrent preflight", func(t *testing.T) {
+		done := make(chan struct{})
+		result := make(chan string, 1)
+		go func() {
+			for {
+				select {
+				case <-done:
+					result <- ""
+					return
+				default:
+					rec := request(http.MethodOptions, "/api/servers", "", "", "https://new.test")
+					origin := rec.Header().Get("Access-Control-Allow-Origin")
+					if rec.Code != http.StatusNoContent || (origin != cfg.PanelLocation && origin != "https://new.test") {
+						result <- "unexpected preflight response: " + origin
+						return
+					}
+				}
+			}
+		}()
+		defer func() {
+			close(done)
+			require.Empty(t, <-result)
+		}()
+		for i := 0; i < 20; i++ {
+			origin := "https://new.test"
+			if i%2 == 0 {
+				origin = "https://old.test"
+			}
+			rec := request(http.MethodPost, "/api/update", `{"allowed_origins":["`+origin+`"]}`, "test-token", cfg.PanelLocation)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		}
+	})
+	checkOrigins(t, []string{"https://new.test"})
+
+	config.Update(func(c *config.Configuration) { c.IgnorePanelConfigUpdates = true })
+	rec := request(http.MethodPost, "/api/update", `{"allowed_origins":["https://old.test"]}`, "test-token", cfg.PanelLocation)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.JSONEq(t, `{"applied":false}`, rec.Body.String())
+	checkOrigins(t, []string{"https://new.test"})
+}
+
+func TestUnsafeUpdateRetryRecoversBackupBeforeRealInstall(t *testing.T) {
+	originalType, originalInstall, originalRestart, originalSchedule := system.InstallationType, installSystemUpdate, restartAfterSystemUpdate, scheduleSystemUpdateLockRelease
+	t.Cleanup(func() {
+		system.InstallationType, installSystemUpdate, restartAfterSystemUpdate, scheduleSystemUpdateLockRelease = originalType, originalInstall, originalRestart, originalSchedule
+		systemUpdateInProgress.Store(false)
+		failedSystemUpdate.Store(nil)
+	})
+	system.InstallationType = "native"
+	systemUpdateInProgress.Store(false)
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "agent")
+	backup := executable + ".update-backup"
+	if err := os.WriteFile(executable, []byte("old agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := "#!/bin/sh\nprintf 'agent v26.09.1\\n'\n"
+	digest := sha256.Sum256([]byte(binary))
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/metadata/") {
+			fmt.Fprintf(w, `{"tag_name":"v26.09.1","assets":[{"name":"agent_linux_amd64","digest":"sha256:%s"}]}`, hex.EncodeToString(digest[:]))
+		} else {
+			fmt.Fprint(w, binary)
+		}
+	}))
+	defer releases.Close()
+	updater := system.NewUpdater()
+	updater.ReleaseBaseURL, updater.ReleaseMetadataURL = releases.URL, releases.URL+"/metadata"
+	updater.ExecutablePath = func() (string, error) { return executable, nil }
+	updater.GOOS, updater.GOARCH = "linux", "amd64"
+	installSystemUpdate = updater.Install
+	allowStop := filepath.Join(directory, "allow-stop")
+	t.Setenv("REV137_STOP_ALLOWED", allowStop)
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	script := "#!/bin/sh\nif [ \"$1\" = show ]; then echo loaded; exit 0; fi\n[ -f \"$REV137_STOP_ALLOWED\" ]\n"
+	if err := os.WriteFile(filepath.Join(directory, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var release func()
+	scheduleSystemUpdateLockRelease = func(_ time.Duration, callback func()) *time.Timer { release = callback; return nil }
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) {
+		return false, errors.New("supervisor uncertain")
+	}
+	engine := gin.New()
+	engine.Use(middleware.CaptureErrors())
+	engine.POST("/api/system/update", postSystemUpdate)
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/system/update", strings.NewReader(`{"version":"26.09.1"}`))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, r)
+		return w
+	}
+	checkFiles := func() {
+		t.Helper()
+		for path, want := range map[string]string{executable: binary, backup: "old agent"} {
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != want {
+				t.Fatalf("changed recovery files at %s: %q, %v", path, got, err)
+			}
+		}
+	}
+	if r := request(); r.Code != http.StatusInternalServerError {
+		t.Fatalf("initial update: %d %s", r.Code, r.Body.String())
+	}
+	checkFiles()
+	if r := request(); r.Code != http.StatusConflict {
+		t.Fatalf("active supervisor not excluded: %d", r.Code)
+	}
+	if release == nil {
+		t.Fatal("missing expiry")
+	}
+	release()
+	if r := request(); r.Code != http.StatusInternalServerError {
+		t.Fatalf("uncertain supervisor retry: %d", r.Code)
+	}
+	checkFiles()
+	if err := os.WriteFile(allowStop, []byte("yes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restartAfterSystemUpdate = func(context.Context, *system.InstalledUpdate) (bool, error) { return true, nil }
+	if r := request(); r.Code != http.StatusAccepted {
+		t.Fatalf("real updater retry failed: %d %s", r.Code, r.Body.String())
+	}
+	checkFiles()
+}
+
+type deletingInstallTestEnvironment struct {
+	environment.ProcessEnvironment
+	destroy func() error
+}
+
+func (e deletingInstallTestEnvironment) Destroy() error { return e.destroy() }
+
+func TestDeleteDuringInitialInstallationCannotRecover(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		failBeforeDelete bool
+		destroyError     bool
+		replacementFails bool
+	}{
+		{name: "installation canceled during deletion"},
+		{name: "installation failed before deletion", failBeforeDelete: true},
+		{name: "container removal failed", destroyError: true},
+		{name: "replacement fails while deleting", replacementFails: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const uuid = "ab012345-6789-4abc-8def-0123456789ab"
+			cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+			require.NoError(t, err)
+			cfg.AuthenticationToken = "test-token"
+			cfg.System.Data = t.TempDir()
+			config.Set(cfg)
+			manager := server.NewEmptyManager(nil)
+			settings, err := json.Marshal(map[string]string{"uuid": uuid})
+			require.NoError(t, err)
+			s, err := manager.InitServer(uuid, remote.ServerConfigurationResponse{
+				Settings: settings, ProcessConfiguration: &remote.ProcessConfiguration{},
+			})
+			require.NoError(t, err)
+			t.Cleanup(s.CleanupForDestroy)
+			manager.Add(s)
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			s.Environment = deletingInstallTestEnvironment{destroy: func() error {
+				close(entered)
+				<-release
+				if test.destroyError {
+					return errors.New("container removal failed")
+				}
+				return nil
+			}}
+			if test.failBeforeDelete {
+				require.NoError(t, manager.FailInstallation(s))
+			}
+			recorder := httptest.NewRecorder()
+			engine := gin.New()
+			engine.Use(middleware.CaptureErrors())
+			engine.DELETE("/api/servers/:server", func(c *gin.Context) {
+				c.Set("manager", manager)
+				c.Set("server", s)
+			}, deleteServer)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/api/servers/"+uuid, nil))
+			}()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("deletion did not reach container removal")
+			}
+			require.ErrorIs(t, s.Context().Err(), context.Canceled)
+			if !test.failBeforeDelete {
+				failed := s
+				if test.replacementFails {
+					failed, err = server.New(nil)
+					require.NoError(t, err)
+					require.NoError(t, failed.SyncWithConfiguration(remote.ServerConfigurationResponse{
+						Settings: settings, ProcessConfiguration: &remote.ProcessConfiguration{},
+					}))
+					t.Cleanup(failed.CleanupForDestroy)
+					manager.Remove(func(current *server.Server) bool { return current == s })
+					require.True(t, manager.AddIfMissing(failed))
+				}
+				require.NoError(t, manager.FailInstallation(failed))
+			}
+			unblock()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("deletion did not finish")
+			}
+			if test.destroyError {
+				require.Equal(t, http.StatusInternalServerError, recorder.Code, recorder.Body.String())
+				current, exists := manager.Get(uuid)
+				require.True(t, exists, "a failed deletion must remain available for retry")
+				require.Same(t, s, current)
+				_ = s.Filesystem().UnixFS().Close()
+			} else {
+				require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+				require.Zero(t, manager.Len())
+			}
+			recovered, err := manager.RecoverFailedInstallation(uuid)
+			if recovered != nil {
+				t.Cleanup(recovered.CleanupForDestroy)
+				_ = recovered.Filesystem().UnixFS().Close()
+			}
+			require.NoError(t, err)
+			require.Nil(t, recovered, "a deleted installation must not be recoverable")
+		})
 	}
 }

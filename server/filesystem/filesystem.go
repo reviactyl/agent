@@ -624,6 +624,7 @@ func (fs *Filesystem) newCopyFile(dirfd int) (*os.File, func() (bool, error), er
 	var cleanupErr error
 	var removed bool
 	var file *os.File
+	var unprotect func()
 	cleanup := func() (bool, error) {
 		once.Do(func() {
 			var fileErr, closeErr error
@@ -641,6 +642,9 @@ func (fs *Filesystem) newCopyFile(dirfd int) (*os.File, func() (bool, error), er
 				dirErr = nil
 			}
 			cleanupErr = errors.Combine(closeErr, fileErr, dirErr, unix.Close(stagingfd))
+			if unprotect != nil {
+				unprotect()
+			}
 		})
 		return removed, cleanupErr
 	}
@@ -654,6 +658,10 @@ func (fs *Filesystem) newCopyFile(dirfd int) (*os.File, func() (bool, error), er
 	}
 	if directory.Uid != uint32(os.Geteuid()) || directory.Mode&0o077 != 0 {
 		return failed(errors.New("server/filesystem: copy staging directory is not private"))
+	}
+	unprotect, err = fs.unixFS.ProtectDirectory(stagingfd)
+	if err != nil {
+		return failed(err)
 	}
 	fd, err = unix.Openat(stagingfd, "copy", unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {

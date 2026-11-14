@@ -259,6 +259,11 @@ func (fs *UnixFS) readDir(fd int, name, relative string, b []byte) ([]DirEntry, 
 		}
 
 		childName := string(nameSlice)
+		if err := fs.checkPrivateAt(fd, childName); err == errPrivateDirectory {
+			continue
+		} else if err != nil {
+			return nil, ensurePathError(err, "readdir", childName)
+		}
 		mt, err := fs.modeTypeFromDirent(&sde, fd, childName)
 		if err != nil {
 			return nil, err

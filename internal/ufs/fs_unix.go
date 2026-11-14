@@ -90,23 +90,31 @@ func (fs *UnixFS) Chmodat(dirfd int, name string, mode FileMode) error {
 }
 
 func (fs *UnixFS) fchmodat(op string, dirfd int, name string, mode FileMode) error {
-	err := unix.Fchmodat(dirfd, name, uint32(mode), AT_SYMLINK_NOFOLLOW)
-	if err == unix.EOPNOTSUPP {
-		// Kernels before 6.6 do not support fchmodat2, which is needed to pass
-		// AT_SYMLINK_NOFOLLOW.
-		err = fchmodNoFollow(dirfd, name, uint32(mode))
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, name, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, op, name)
 	}
-	return ensurePathError(err, op, name)
+	if len(privateDirectories.entries) == 0 {
+		err := unix.Fchmodat(dirfd, name, uint32(mode), AT_SYMLINK_NOFOLLOW)
+		if err != unix.EOPNOTSUPP {
+			return ensurePathError(err, op, name)
+		}
+	}
+	return ensurePathError(fs.fchmodNoFollow(dirfd, name, uint32(mode)), op, name)
 }
 
 // fchmodNoFollow changes the mode of name without following it if it is a
 // symbolic link, without needing fchmodat2.
-func fchmodNoFollow(dirfd int, name string, mode uint32) error {
+func (fs *UnixFS) fchmodNoFollow(dirfd int, name string, mode uint32) error {
 	fd, err := unix.Openat(dirfd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
+	if err := fs.checkPrivateFDLocked(fd); err != nil {
+		return err
+	}
 
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -154,19 +162,43 @@ func (fs *UnixFS) fchown(name string, uid, gid, flags int) error {
 	if err != nil {
 		return err
 	}
-	return unix.Fchownat(dirfd, name, uid, gid, flags)
+	return fs.chownat(dirfd, name, uid, gid, flags)
 }
 
 // Chownat is like Chown but allows passing an existing directory file
 // descriptor rather than needing to resolve one.
 func (fs *UnixFS) Chownat(dirfd int, name string, uid, gid int) error {
-	return ensurePathError(unix.Fchownat(dirfd, name, uid, gid, 0), "chownat", name)
+	return ensurePathError(fs.chownat(dirfd, name, uid, gid, 0), "chownat", name)
 }
 
 // Lchownat is like Lchown but allows passing an existing directory file
 // descriptor rather than needing to resolve one.
 func (fs *UnixFS) Lchownat(dirfd int, name string, uid, gid int) error {
-	return ensurePathError(unix.Fchownat(dirfd, name, uid, gid, AT_SYMLINK_NOFOLLOW), "lchownat", name)
+	return ensurePathError(fs.chownat(dirfd, name, uid, gid, AT_SYMLINK_NOFOLLOW), "lchownat", name)
+}
+
+func (fs *UnixFS) chownat(dirfd int, name string, uid, gid, flags int) error {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, name, flags); err != nil {
+		return err
+	}
+	if len(privateDirectories.entries) == 0 {
+		return unix.Fchownat(dirfd, name, uid, gid, flags)
+	}
+	openFlags := unix.O_PATH | unix.O_CLOEXEC
+	if flags&AT_SYMLINK_NOFOLLOW != 0 {
+		openFlags |= unix.O_NOFOLLOW
+	}
+	fd, err := unix.Openat(dirfd, name, openFlags, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := fs.checkPrivateFDLocked(fd); err != nil {
+		return err
+	}
+	return unix.Fchownat(fd, "", uid, gid, unix.AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW)
 }
 
 // Chtimes changes the access and modification times of the named
@@ -188,6 +220,11 @@ func (fs *UnixFS) Chtimes(name string, atime, mtime time.Time) error {
 // Chtimesat is like Chtimes but allows passing an existing directory file
 // descriptor rather than needing to resolve one.
 func (fs *UnixFS) Chtimesat(dirfd int, name string, atime, mtime time.Time) error {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, name, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, "chtimes", name)
+	}
 	var utimes [2]unix.Timespec
 	set := func(i int, t time.Time) {
 		if t.IsZero() {
@@ -231,6 +268,11 @@ func (fs *UnixFS) Mkdirat(dirfd int, name string, mode FileMode) error {
 }
 
 func (fs *UnixFS) mkdirat(op string, dirfd int, name string, mode FileMode) error {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, name, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, op, name)
+	}
 	return ensurePathError(unix.Mkdirat(dirfd, name, uint32(mode)), op, name)
 }
 
@@ -451,6 +493,11 @@ func (fs *UnixFS) RemoveContents(name string) error {
 }
 
 func (fs *UnixFS) unlinkat(dirfd int, name string, flags int) error {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, name, AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
 	return ignoringEINTR(func() error {
 		return unix.Unlinkat(dirfd, name, flags)
 	})
@@ -553,6 +600,14 @@ func (fs *UnixFS) rename(oldpath, newpath string, replace bool, mkdirAll func(st
 	case err != nil && !errors.Is(err, ErrNotExist):
 		return err
 	}
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(olddirfd, oldname, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, "rename", oldpath)
+	}
+	if err := fs.checkPrivateAtLocked(newdirfd, newname, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, "rename", newpath)
+	}
 	if err := unix.Renameat(olddirfd, oldname, newdirfd, newname); err != nil {
 		return &LinkError{Op: "rename", Old: oldpath, New: newpath, Err: err}
 	}
@@ -647,6 +702,11 @@ func (fs *UnixFS) _fstat(op string, name string, flags int) (FileInfo, error) {
 }
 
 func (fs *UnixFS) _fstatat(op string, dirfd int, name string, flags int) (FileInfo, error) {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, name, flags); err != nil {
+		return nil, ensurePathError(err, op, name)
+	}
 	var s fileStat
 	if err := ignoringEINTR(func() error {
 		return unix.Fstatat(dirfd, name, &s.sys, flags)
@@ -668,6 +728,11 @@ func (fs *UnixFS) Symlink(oldpath, newpath string) error {
 	defer closeFd()
 	if err != nil {
 		return err
+	}
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(dirfd, newpath, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, "symlink", newpath)
 	}
 	if err := ignoringEINTR(func() error {
 		// We aren't concerned with oldpath here as a symlink can point anywhere
@@ -864,6 +929,16 @@ func checkOpenedType(fd int, name string) error {
 // _openat is a wrapper around unix.Openat. This method should never be directly
 // called, use `openat` instead.
 func (fs *UnixFS) _openat(dirfd int, name string, flag int, mode uint32) (int, error) {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	privateFlags := 0
+	if flag&unix.O_NOFOLLOW != 0 {
+		privateFlags = AT_SYMLINK_NOFOLLOW
+	}
+	if err := fs.checkPrivateAtLocked(dirfd, name, privateFlags); err != nil {
+		return 0, ensurePathError(err, "openat", name)
+	}
+
 	// Ensure the O_CLOEXEC flag is set.
 	// Go sets this in the os package, but since we are directly using unix
 	// we need to set it ourselves.
@@ -874,6 +949,10 @@ func (fs *UnixFS) _openat(dirfd int, name string, flag int, mode uint32) (int, e
 	fd, err := unix.Openat(dirfd, name, flag, mode)
 	switch err {
 	case nil:
+		if err := fs.checkPrivateFDLocked(fd); err != nil {
+			_ = unix.Close(fd)
+			return 0, ensurePathError(err, "openat", name)
+		}
 		return fd, nil
 	case unix.EINTR:
 		return fd, err
@@ -891,6 +970,16 @@ func (fs *UnixFS) _openat(dirfd int, name string, flag int, mode uint32) (int, e
 //
 // This method should never be directly called, use `openat` instead.
 func (fs *UnixFS) _openat2(dirfd int, name string, flag, mode uint64) (int, error) {
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	privateFlags := 0
+	if flag&unix.O_NOFOLLOW != 0 {
+		privateFlags = AT_SYMLINK_NOFOLLOW
+	}
+	if err := fs.checkPrivateAtLocked(dirfd, name, privateFlags); err != nil {
+		return 0, ensurePathError(err, "openat", name)
+	}
+
 	// Ensure the O_CLOEXEC flag is set.
 	// Go sets this when using the os package, but since we are directly using
 	// the unix package we need to set it ourselves.
@@ -913,6 +1002,10 @@ func (fs *UnixFS) _openat2(dirfd int, name string, flag, mode uint64) (int, erro
 	})
 	switch err {
 	case nil:
+		if err := fs.checkPrivateFDLocked(fd); err != nil {
+			_ = unix.Close(fd)
+			return 0, ensurePathError(err, "openat", name)
+		}
 		return fd, nil
 	case unix.EINTR:
 		return fd, err
@@ -1041,6 +1134,14 @@ func (fs *UnixFS) Link(oldpath, newpath string) error {
 	defer closeNew()
 	if err != nil {
 		return err
+	}
+	privateDirectories.RLock()
+	defer privateDirectories.RUnlock()
+	if err := fs.checkPrivateAtLocked(oldfd, oldname, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, "link", oldpath)
+	}
+	if err := fs.checkPrivateAtLocked(newfd, newname, AT_SYMLINK_NOFOLLOW); err != nil {
+		return ensurePathError(err, "link", newpath)
 	}
 	if err := ignoringEINTR(func() error { return unix.Linkat(oldfd, oldname, newfd, newname, 0) }); err != nil {
 		return &LinkError{Op: "link", Old: oldpath, New: newpath, Err: convertErrorType(err)}

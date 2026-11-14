@@ -31,14 +31,15 @@ func TestChmodWithoutFchmodat2(t *testing.T) {
 	}
 	defer unix.Close(dirfd)
 
-	if err := fchmodNoFollow(dirfd, "file.txt", 0o600); err != nil {
+	fs := &UnixFS{}
+	if err := fs.fchmodNoFollow(dirfd, "file.txt", 0o600); err != nil {
 		t.Fatalf("expected the mode to be changed, got %v", err)
 	}
 	if st, err := os.Stat(filepath.Join(root, "file.txt")); err != nil || st.Mode().Perm() != 0o600 {
 		t.Fatalf("expected mode 0600, got %v (%v)", st.Mode().Perm(), err)
 	}
 
-	if err := fchmodNoFollow(dirfd, "link", 0o600); err == nil {
+	if err := fs.fchmodNoFollow(dirfd, "link", 0o600); err == nil {
 		t.Fatal("expected changing the mode of a symlink to fail")
 	}
 	if st, err := os.Stat(outside); err != nil || st.Mode().Perm() != 0o644 {

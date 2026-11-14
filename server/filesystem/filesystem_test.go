@@ -944,6 +944,91 @@ func TestCopyFallbackStagingReplacementAndAccounting(t *testing.T) {
 		return
 	}
 	rejectUnnamedCopyFiles(t)
+	t.Run("deletion preserves copy reservation", func(t *testing.T) {
+		fs, rfs := NewFs()
+		t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+		const size = int64(128)
+		if err := fs.Write("source.txt", bytes.NewReader(bytes.Repeat([]byte("x"), int(size))), size, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(fs.Path(), "parent"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fs.SetDiskLimit(2 * size)
+		if err := fs.reserveDisk(size); err != nil {
+			t.Fatal(err)
+		}
+		dirfd, _, closeFd, err := fs.unixFS.SafePath("parent/output.txt")
+		defer closeFd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, cleanup, err := fs.newCopyFile(dirfd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _, _ = cleanup() }()
+		if _, err := file.Write(bytes.Repeat([]byte("p"), int(size/2))); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(fs.Path(), "parent"))
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("staging entries: %v, %v", entries, err)
+		}
+		for _, path := range []string{filepath.Join("parent", entries[0].Name(), "copy"), "parent"} {
+			if err := fs.Delete(path); err == nil {
+				t.Fatalf("deletion accessed private copy: %s", path)
+			}
+			if fs.CachedUsage() != 2*size || fs.reserved != size {
+				t.Fatalf("deletion credited copy reservation: usage=%d reserved=%d", fs.CachedUsage(), fs.reserved)
+			}
+		}
+		if _, err := cleanup(); err != nil {
+			t.Fatal(err)
+		}
+		fs.releaseDisk(size, 0)
+		if fs.CachedUsage() != size || fs.reserved != 0 {
+			t.Fatalf("failed copy accounting: usage=%d reserved=%d", fs.CachedUsage(), fs.reserved)
+		}
+		if err := fs.Write("over-quota.txt", bytes.NewReader(bytes.Repeat([]byte("x"), int(size+1))), size+1, 0o600); !IsErrorCode(err, ErrCodeDiskSpace) {
+			t.Fatalf("write beyond remaining quota: %v", err)
+		}
+	})
+	t.Run("API replacement inside staging directory", func(t *testing.T) {
+		fs, rfs := NewFs()
+		t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })
+		dirfd, _, closeFd, err := fs.unixFS.SafePath("output.txt")
+		defer closeFd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, cleanup, err := fs.newCopyFile(dirfd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := file.WriteString("partial"); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(fs.Path())
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("staging entries: %v, %v", entries, err)
+		}
+		staged := filepath.Join(entries[0].Name(), "copy")
+		if err := rfs.CreateServerFileFromString("sentinel.txt", "preserve"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fs.Rename(staged, "moved-partial.txt"); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("API accessed staging output: %v", err)
+		}
+		if err := fs.Rename("sentinel.txt", staged); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("API inserted a file into staging: %v", err)
+		}
+		_, _ = cleanup()
+		if data, err := os.ReadFile(filepath.Join(fs.Path(), "sentinel.txt")); err != nil || string(data) != "preserve" {
+			t.Fatalf("copy cleanup removed an API replacement: %q, %v", data, err)
+		}
+	})
 	t.Run("replaced staging directory", func(t *testing.T) {
 		fs, rfs := NewFs()
 		t.Cleanup(func() { _ = os.RemoveAll(rfs.root) })

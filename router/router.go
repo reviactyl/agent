@@ -147,7 +147,7 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 
 			files.GET("/pull", middleware.RemoteDownloadEnabled(), getServerPullingFiles)
 			files.POST("/pull", middleware.RemoteDownloadEnabled(), postServerPullRemoteFile)
-			files.DELETE("/pull/:download", middleware.RemoteDownloadEnabled(), deleteServerPullRemoteFile)
+			files.DELETE("/pull/:download", deleteServerPullRemoteFile)
 		}
 
 		backup := server.Group("/backup")

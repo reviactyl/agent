@@ -92,12 +92,12 @@ func CaptureErrors() gin.HandlerFunc {
 // SetAccessControlHeaders sets the access request control headers on all of
 // the requests.
 func SetAccessControlHeaders() gin.HandlerFunc {
-	cfg := config.Get()
-	origins := cfg.AllowedOrigins
-	location := cfg.PanelLocation
-	allowPrivateNetwork := cfg.AllowCORSPrivateNetwork
-
 	return func(c *gin.Context) {
+		cfg := config.Get()
+		origins := cfg.AllowedOrigins
+		location := cfg.PanelLocation
+		allowPrivateNetwork := cfg.AllowCORSPrivateNetwork
+
 		c.Header("Access-Control-Allow-Origin", location)
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
@@ -150,6 +150,15 @@ func ServerExists() gin.HandlerFunc {
 				return c.Param("server") == s.ID()
 			})
 		}
+		if s == nil && ((c.Request.Method == http.MethodPost && c.FullPath() == "/api/servers/:server/reinstall") ||
+			(c.Request.Method == http.MethodDelete && c.FullPath() == "/api/servers/:server")) {
+			var err error
+			s, err = ExtractManager(c).RecoverFailedInstallation(c.Param("server"))
+			if err != nil {
+				CaptureAndAbort(c, err)
+				return
+			}
+		}
 		if s == nil {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "The requested resource does not exist on this instance."})
 			return
@@ -200,9 +209,8 @@ func ClearDeadlines(c *gin.Context) {
 // RemoteDownloadEnabled checks if remote downloads are enabled for this instance
 // and if not aborts the request.
 func RemoteDownloadEnabled() gin.HandlerFunc {
-	disabled := config.Get().Api.DisableRemoteDownload
 	return func(c *gin.Context) {
-		if disabled {
+		if config.Get().Api.DisableRemoteDownload {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "This functionality is not currently enabled on this instance."})
 			return
 		}

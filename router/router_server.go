@@ -215,6 +215,7 @@ func deleteServer(c *gin.Context) {
 	}
 	s.Events().Publish(server.DeletedEvent, nil)
 
+	middleware.ExtractManager(c).PrepareForDeletion(s)
 	s.CleanupForDestroy()
 
 	// Remove any pending remote file downloads for the server.
@@ -245,9 +246,7 @@ func deleteServer(c *gin.Context) {
 		}
 	}(s)
 
-	middleware.ExtractManager(c).Remove(func(server *server.Server) bool {
-		return server.ID() == s.ID()
-	})
+	middleware.ExtractManager(c).RemoveByID(s.ID())
 
 	c.Status(http.StatusNoContent)
 }

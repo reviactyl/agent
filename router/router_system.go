@@ -69,6 +69,8 @@ var restartAfterSystemUpdate = system.RestartAfterUpdate
 
 var systemUpdateInProgress atomic.Bool
 
+var failedSystemUpdate atomic.Pointer[system.InstalledUpdate]
+
 var systemUpdateTimeout = 2 * time.Minute
 
 var systemUpdateRestartTimeout = 20 * time.Second
@@ -99,6 +101,14 @@ func postSystemUpdate(c *gin.Context) {
 	operationContext := context.Background()
 	ctx, cancel := context.WithTimeout(operationContext, systemUpdateTimeout)
 	defer cancel()
+	if previous := failedSystemUpdate.Load(); previous != nil {
+		if err := system.RecoverInterruptedUpdate(ctx, previous); err != nil {
+			systemUpdateInProgress.Store(false)
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		failedSystemUpdate.Store(nil)
+	}
 	installed, err := installSystemUpdate(ctx, request.Version, request.Channel)
 	if err != nil {
 		systemUpdateInProgress.Store(false)
@@ -113,15 +123,17 @@ func postSystemUpdate(c *gin.Context) {
 	restartContext, restartCancel := context.WithTimeout(operationContext, systemUpdateRestartTimeout)
 	defer restartCancel()
 	rollbackSafe, err := restartAfterSystemUpdate(restartContext, installed)
-	if err != nil {
-		if rollbackSafe {
-			if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
-				err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
-			}
-			systemUpdateInProgress.Store(false)
+	if err != nil && rollbackSafe {
+		if rollbackErr := system.RollbackInstalledUpdate(installed); rollbackErr != nil {
+			err = fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
 		}
+		systemUpdateInProgress.Store(false)
 		middleware.CaptureAndAbort(c, err)
 		return
+	}
+
+	if err != nil {
+		failedSystemUpdate.Store(installed)
 	}
 
 	// The transient supervisor should replace this process almost immediately.
@@ -130,6 +142,11 @@ func postSystemUpdate(c *gin.Context) {
 	scheduleSystemUpdateLockRelease(systemUpdateLockRelease, func() {
 		systemUpdateInProgress.Store(false)
 	})
+
+	if err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
 
 	c.JSON(http.StatusAccepted, postSystemUpdateResponse{
 		Version: request.Version,
@@ -193,8 +210,23 @@ func postCreateServer(c *gin.Context) {
 	// cycle. If there are any errors they will be logged and communicated back
 	// to the Panel where a reinstall may take place.
 	go func(i *installer.Installer) {
+		installed := false
+		defer func() {
+			if !installed {
+				if err := manager.FailInstallation(i.Server()); err != nil {
+					i.Server().Log().WithError(err).Error("failed to retain installation recovery configuration")
+					manager.Remove(func(match *server.Server) bool { return match == i.Server() })
+				}
+				i.Server().CleanupForDestroy()
+				_ = i.Server().Filesystem().UnixFS().Close()
+			}
+		}()
+
 		if err := i.Server().CreateEnvironment(); err != nil {
 			i.Server().Log().WithField("error", err).Error("failed to create server environment during install process")
+			if err := i.Server().SyncInstallState(false, false); err != nil {
+				i.Server().Log().WithField("error", err).Warn("failed to notify panel of server install state")
+			}
 			return
 		}
 
@@ -202,6 +234,7 @@ func postCreateServer(c *gin.Context) {
 			log.WithFields(log.Fields{"server": i.Server().ID(), "error": err}).Error("failed to run install process for server")
 			return
 		}
+		installed = true
 
 		if i.StartOnCompletion {
 			log.WithField("server_id", i.Server().ID()).Debug("starting server after successful installation")
