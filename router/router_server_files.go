@@ -201,29 +201,32 @@ func postServerDeleteFiles(c *gin.Context) {
 		return
 	}
 
-	g, ctx := errgroup.WithContext(context.Background())
-
-	// Loop over the array of files passed in and delete them. If any of the file deletions
-	// fail just abort the process entirely.
-	for _, p := range data.Files {
-		pi := path.Join(data.Root, p)
-
-		g.Go(func() error {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				return s.Filesystem().Delete(pi)
-			}
-		})
-	}
-
-	if err := g.Wait(); err != nil {
+	if err := deleteFiles(c.Request.Context(), data.Root, data.Files, s.Filesystem().Delete); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+func deleteFiles(requestCtx context.Context, root string, files []string, remove func(string) error) error {
+	g, ctx := errgroup.WithContext(requestCtx)
+	g.SetLimit(4)
+	for _, p := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return remove(path.Join(root, p))
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return requestCtx.Err()
 }
 
 // Writes the contents of the request to a file on a server.
